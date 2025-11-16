@@ -828,13 +828,14 @@ def run_data_diagnostics(
         if depth_heatmap_enabled and time_axis is not None:
             try:
                 target_rows_all = target_book.get("rows") or []
-                if target_rows_all and snapshot_timestamps:
-                    # Map raw snapshot timestamp keys to numeric time coordinates.
+                if target_rows_all and timestamps_array is not None and timestamps_array.size > 0:
+                    # Map normalized snapshot timestamps to numeric time coordinates
+                    # derived from the sampled records.
                     ts_to_timecoord: Dict[Any, float] = {}
                     for record, t_coord in zip(records, time_axis):
                         idx_int = record["index"]
-                        if 0 <= idx_int < len(snapshot_timestamps):
-                            ts_key = snapshot_timestamps[idx_int]
+                        if 0 <= idx_int < timestamps_array.shape[0]:
+                            ts_key = timestamps_array[idx_int]
                             ts_to_timecoord[ts_key] = t_coord
 
                     if ts_to_timecoord:
@@ -849,10 +850,15 @@ def run_data_diagnostics(
                                 continue
 
                             ts_raw = row[0]
-                            if ts_raw not in sample_ts_keys:
+                            try:
+                                ts_norm = normalize_timestamp_array([ts_raw])[0]
+                            except Exception:  # noqa: BLE001
                                 continue
 
-                            t_coord = ts_to_timecoord.get(ts_raw)
+                            if ts_norm not in sample_ts_keys:
+                                continue
+
+                            t_coord = ts_to_timecoord.get(ts_norm)
                             if t_coord is None:
                                 continue
 
@@ -947,6 +953,126 @@ def run_data_diagnostics(
                                 depth_heatmap_path = tmp_dir / f"depth_volume_heatmap_{asset_suffix}.png"
                                 fig.tight_layout()
                                 fig.savefig(depth_heatmap_path)
+
+                                # Optional label-check overlay on top of the depth heatmap.
+                                if label_checks_enabled and labels_array is not None:
+                                    try:
+                                        ts_full = np.asarray(timestamps_array, dtype="datetime64[ns]")
+                                        n_snapshots_full = min(len(snapshot_features), ts_full.shape[0])
+                                        n_labels_full = int(labels_array.shape[0])
+
+                                        horizon_steps_overlay = prediction_horizon_seconds // cadence_seconds
+                                        visible_steps_overlay = visible_window_seconds // cadence_seconds
+
+                                        if horizon_steps_overlay > 0 and visible_steps_overlay > 0:
+                                            mid_full_overlay: list[float] = []
+                                            for features in snapshot_features[:n_snapshots_full]:
+                                                if not isinstance(features, (list, tuple)) or len(features) < 4:
+                                                    mid_full_overlay.append(float("nan"))
+                                                    continue
+
+                                                bid_p, _, ask_p, _ = features[:4]
+                                                try:
+                                                    bid_p_f = float(bid_p)
+                                                    ask_p_f = float(ask_p)
+                                                except (TypeError, ValueError):
+                                                    mid_full_overlay.append(float("nan"))
+                                                    continue
+
+                                                if bid_p_f <= 0.0 or ask_p_f <= 0.0:
+                                                    mid_full_overlay.append(float("nan"))
+                                                    continue
+
+                                                mid_full_overlay.append(0.5 * (bid_p_f + ask_p_f))
+
+                                            mid_full_overlay_arr = np.asarray(mid_full_overlay, dtype="float64")
+
+                                            train_indices_arr = np.asarray(list(train_idx), dtype="int64")
+                                            valid_anchors_overlay: list[int] = []
+                                            for idx_anchor in train_indices_arr:
+                                                if idx_anchor < 0 or idx_anchor >= n_labels_full:
+                                                    continue
+
+                                                start_idx_overlay = idx_anchor - visible_steps_overlay
+                                                end_idx_overlay = idx_anchor + horizon_steps_overlay
+
+                                                if start_idx_overlay < 0 or end_idx_overlay >= n_snapshots_full:
+                                                    continue
+
+                                                if not math.isfinite(mid_full_overlay_arr[idx_anchor]):
+                                                    continue
+
+                                                valid_anchors_overlay.append(int(idx_anchor))
+
+                                            if valid_anchors_overlay:
+                                                rng_overlay = np.random.default_rng(random_seed)
+                                                idx_anchor_overlay = int(
+                                                    rng_overlay.choice(
+                                                        np.asarray(valid_anchors_overlay, dtype="int64"),
+                                                    ),
+                                                )
+
+                                                mid_anchor_overlay = float(
+                                                    mid_full_overlay_arr[idx_anchor_overlay],
+                                                )
+                                                if math.isfinite(mid_anchor_overlay) and mid_anchor_overlay > 0.0:
+                                                    ts_anchor_overlay = ts_full[idx_anchor_overlay]
+                                                    t_anchor_coord = (
+                                                        ts_anchor_overlay - base_time
+                                                    ) / np.timedelta64(1, "s")
+                                                    t_anchor_coord = float(t_anchor_coord)
+
+                                                    x_start = t_anchor_coord
+                                                    x_end = t_anchor_coord + float(prediction_horizon_seconds)
+
+                                                    y_min_hm, y_max_hm = ax.get_ylim()
+
+                                                    box_overlay = mpatches.Rectangle(
+                                                        (x_start, y_min_hm),
+                                                        x_end - x_start,
+                                                        y_max_hm - y_min_hm,
+                                                        linewidth=1.0,
+                                                        edgecolor="red",
+                                                        facecolor="none",
+                                                    )
+                                                    ax.add_patch(box_overlay)
+
+                                                    price_levels_overlay = [
+                                                        mid_anchor_overlay * (1.0 + b / 100.0)
+                                                        for b in price_boundaries_pct
+                                                    ]
+                                                    for level in price_levels_overlay:
+                                                        if y_min_hm <= level <= y_max_hm:
+                                                            ax.hlines(
+                                                                level,
+                                                                x_start,
+                                                                x_end,
+                                                                colors="red",
+                                                                linestyles="dashed",
+                                                                linewidth=0.8,
+                                                            )
+
+                                                    label_depth_heatmap_path = (
+                                                        tmp_dir
+                                                        / f"label_checks_depth_volume_heatmap_{asset_suffix}.png"
+                                                    )
+                                                    fig.tight_layout()
+                                                    fig.savefig(label_depth_heatmap_path)
+
+                                                    mlflow.log_artifact(
+                                                        str(label_depth_heatmap_path),
+                                                        artifact_path="diagnostics",
+                                                    )
+                                                    logger.info(
+                                                        "Logged label-check depth volume heatmap artifact to MLFlow at %s",
+                                                        label_depth_heatmap_path,
+                                                    )
+                                    except Exception as exc:  # noqa: BLE001
+                                        logger.warning(
+                                            "Failed to generate/log label-check depth volume heatmap: %s",
+                                            exc,
+                                        )
+
                                 plt.close(fig)
 
                                 mlflow.log_artifact(str(depth_heatmap_path), artifact_path="diagnostics")
@@ -1189,12 +1315,10 @@ def _plot_label_check_for_anchor(
     # Anchor marker at t=0.
     ax.axvline(0.0, color="black", linestyle="--", linewidth=0.8)
 
-    # Axis labels and minor ticks on the primary y-axis.
     ax.set_ylabel("Mid price")
     ax.xaxis.set_minor_locator(AutoMinorLocator())
     ax.yaxis.set_minor_locator(AutoMinorLocator())
 
-    # Secondary y-axis expressing price in percentage relative to the anchor.
     pct_min = (y_min / mid_anchor - 1.0) * 100.0
     pct_max = (y_max / mid_anchor - 1.0) * 100.0
     sec_ax = ax.twinx()
@@ -1203,5 +1327,28 @@ def _plot_label_check_for_anchor(
     sec_ax.yaxis.set_major_formatter(FuncFormatter(lambda v, pos: f"{v:.2f}"))
     sec_ax.yaxis.set_minor_locator(AutoMinorLocator())
 
-    # Title indicates the anchor timestamp.
+    try:
+        top_ax = ax.twiny()
+        top_ax.set_xlim(ax.get_xlim())
+
+        major_ticks = ax.get_xticks()
+        datetime_labels = []
+        for t_val in major_ticks:
+            dt_val = ts_anchor + np.timedelta64(int(t_val), "s")
+            datetime_labels.append(str(dt_val)[:16])
+
+        top_ax.set_xticks(major_ticks)
+        top_ax.set_xticklabels(datetime_labels)
+
+        for label in top_ax.get_xticklabels():
+            label.set_rotation(45)
+            label.set_fontsize(6)
+
+        top_ax.xaxis.set_minor_locator(AutoMinorLocator())
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Failed to construct secondary datetime x-axis for label-check plot: %s",
+            exc,
+        )
+
     ax.set_title(f"Label check around anchor t0={str(ts_anchor)[:19]}")
