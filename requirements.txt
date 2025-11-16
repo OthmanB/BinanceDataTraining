@@ -1,0 +1,21 @@
+# Core dependencies for Binance ML Training Platform
+# Versions chosen for compatibility with the current environment (TensorFlow 2.20.0 + bundled Keras)
+
+# YAML and utilities
+pyyaml==6.0.2
+termcolor==2.4.0
+requests==2.32.3
+
+# MLFlow for experiment tracking
+mlflow==2.16.0
+
+# TensorFlow + Keras (GPU/CPU variant can be adjusted if needed)
+# For your current environment (macOS arm, Python 3.13), pip reports TensorFlow 2.20.0
+# as the available version, so we pin to that here. This uses tf.keras bundled with
+# TensorFlow and does not install the standalone keras package.
+tensorflow==2.20.0
+
+# Optional: if you later use numpy/pandas explicitly, they will be pulled in by TF/MLflow,
+# but you can pin them here if you want deterministic versions.
+# numpy==1.26.4
+# pandas==2.2.2

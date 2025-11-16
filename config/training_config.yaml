@@ -1,0 +1,297 @@
+# Binance ML Training Platform - Training Configuration (Phase 1 baseline)
+
+# Data Source Configuration
+data:
+  source_type: "database"  # or "file"
+  connection:
+    database_uri: "${DATABASE_URI}"  # Resolved from environment
+    table_prefix: "orderbook_"
+
+  asset_pairs:
+    target_asset: "BTCUSDT"
+    correlated_assets:
+      - "ETHUSDT"
+      - "BNBUSDT"
+      - "ADAUSDT"
+      - "ETHBTC"
+      - "BNBBTC"
+      - "ADABTC"
+
+  time_range:
+    start_date: "2024-01-01"
+    end_date: "2024-01-01"
+    cadence_seconds: 10
+
+  ingestion:
+    chunk_hours: 12
+
+  order_book:
+    depth_levels: 1000
+    representation: "hybrid"  # "full", "aggregated", or "hybrid"
+    schema:
+      timestamp_column: "ts"
+      bid_price_column: "bid_price"
+      bid_quantity_column: "bid_quantity"
+      ask_price_column: "ask_price"
+      ask_quantity_column: "ask_quantity"
+      batch_id_column: "batch_id"
+
+  temporal_features:
+    local:
+      - "hour_of_day"
+      - "day_of_week"
+      - "minute_of_hour"
+    global:
+      - "days_since_start"
+      - "market_session"  # Asian/European/American
+
+  validation:
+    check_missing_data: true
+    max_gap_seconds: 60
+    fail_on_invalid: true
+
+# Target Configuration
+targets:
+  prediction_horizon_seconds: 1800  # 30 minutes
+  visible_window_seconds: 3600
+
+  price_classes:
+    definition_type: "percentage"  # or "absolute", "adaptive"
+    boundaries: [-10, -5, -2, 0, 2, 5, 10]
+
+  labeling:
+    use_midpoint: true   # Use mid-price or last trade price
+    handle_gaps: "interpolate"  # or "skip", "forward_fill"
+
+# Preprocessing Configuration
+preprocessing:
+  normalization:
+    method: "min_max"  # or "standard", "robust"
+    per_asset: true
+    fit_on_train_only: true
+
+  feature_engineering:
+    order_book_features:
+      - "bid_ask_spread"
+      - "volume_imbalance"
+      - "depth_imbalance"
+      - "weighted_mid_price"
+
+    derived_features:
+      - "price_momentum"
+      - "volume_momentum"
+
+  train_test_split:
+    method: "chronological"
+    train_ratio: 0.70
+    validation_ratio: 0.15
+    test_ratio: 0.15
+
+  class_balancing:
+    enabled: true
+    method: "class_weights"  # or "oversampling", "undersampling"
+
+# Model Architecture Configuration
+model:
+  framework: "keras"  # tensorflow.keras
+  backend: "tensorflow"
+  architecture: "CNN_LSTM_MultiClass"
+
+  input_representation:
+    strategy: "stacked_channels"  # or "separate_branches", "attention"
+
+  cnn:
+    num_layers: 2
+    filters: [64, 128]
+    kernel_sizes: [[3, 3], [3, 3]]
+    pooling: "max"
+    pool_sizes: [[2, 2], [2, 2]]
+    activation: "relu"
+    dropout_rates: [0.2, 0.3]
+
+  lstm:
+    units: 96
+    dropout: 0.3
+    recurrent_dropout: 0.2
+
+  dense:
+    layers: [64]
+    dropout_rates: [0.2]
+
+  output:
+    num_classes: 8  # Based on price_classes definition
+    activation: "softmax"
+
+  compilation:
+    optimizer: "adam"
+    learning_rate: 0.001
+    loss: "categorical_crossentropy"
+    metrics: ["accuracy", "precision", "recall"]
+
+# Training Configuration
+training:
+  epochs: 50
+  batch_size: 32
+  validation_split: 0.1  # Using explicit validation set from preprocessing
+  debug_max_samples: 2000
+
+  callbacks:
+    early_stopping:
+      enabled: true
+      monitor: "val_loss"
+      patience: 10
+      restore_best_weights: true
+
+    reduce_lr:
+      enabled: true
+      monitor: "val_loss"
+      factor: 0.5
+      patience: 5
+      min_lr: 0.00001
+
+  class_weights:
+    compute_from_train: true
+
+  fine_tuning:
+    enabled: false              # When true, resume from a previous model instead of training from scratch
+    base_model_run_id: null     # Required when enabled: MLFlow run_id or model identifier to load
+    base_model_stage: "binance-model-training"  # MLFlow experiment/stage where the base model is stored
+
+# Hyperparameter Optimization Configuration
+hyperparameter_optimization:
+  enabled: false
+  framework: "optuna"
+  n_trials: 30
+  direction: "maximize"
+  metric: "val_accuracy"
+
+  search_space:
+    cnn_filters_1: [16, 128]
+    cnn_filters_2: [64, 256]
+    lstm_units: [32, 256]
+    learning_rate: [0.0001, 0.01]
+    batch_size: [16, 32, 64]
+
+# MLFlow Configuration
+mlflow:
+  tracking_uri: "${MLFLOW_TRACKING_URI}"  # Environment variable
+  experiment_name: "binance-price-prediction"
+  local_tmp_dir: "tmp/mlflow"
+
+  run_naming:
+    pattern: "{asset}_{model}_{timestamp}"
+
+  artifact_logging:
+    trained_model: true
+    model_architecture_plot: true
+    training_plots: true
+    confusion_matrix: true
+    class_distribution: true
+    feature_importance: false  # Placeholder for future
+
+  model_registry:
+    register_model: true
+    model_name_pattern: "{asset}_predictor"
+
+# Evaluation Configuration
+evaluation:
+  metrics:
+    - "accuracy"
+    - "precision_per_class"
+    - "recall_per_class"
+    - "f1_per_class"
+    - "confusion_matrix"
+
+  calibration_analysis:
+    enabled: true
+    n_bins: 10
+
+  backtesting:
+    enabled: false
+    initial_capital: 10000
+    transaction_cost: 0.001
+
+# Data Diagnostics Configuration
+diagnostics:
+  enabled: true
+
+  sampling:
+    method: "uniform"        # "uniform" grid or "random" over training indices
+    num_samples: 500
+    random_seed: 42
+
+  spread_checks:
+    suspicious_threshold_pct: 1.0
+    high_spread_threshold_pct: 5.0
+    max_high_spread_fraction: 0.05
+
+  quantity_checks:
+    enable_negative_checks: true
+    enable_zero_stats: true
+
+  outlier_checks:
+    enabled: true
+    z_score_threshold: 3.0
+    min_nonzero_points: 10
+
+  anomaly_export:
+    enabled: true
+    max_samples: 100
+
+  visualization:
+    enabled: true
+    time_series: true
+    histograms: true
+    histogram_bins: 50
+    heatmaps:
+      enabled: true
+      types:
+        - "spread_vs_time"
+        - "spread_vs_label"
+      num_time_bins: 50
+      num_spread_bins: 50
+
+    spread_clipping:
+      enabled: true
+      num_sigma: 5.0
+
+    depth_heatmap:
+      enabled: true
+      num_price_bins: 50
+
+  label_checks:
+    enabled: true
+    num_examples: 3
+    max_examples_per_figure: 5
+
+  gap_checks:
+    enabled: true
+    large_gap_multiplier: 2.0
+    very_large_gap_multiplier: 6.0
+
+# Logging Configuration
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  colored_output: true
+  log_function_names: true
+
+  colors:
+    function_names: "cyan"
+    parameter_names: "yellow"
+    parameter_values: "green"
+    info: "green"
+    warning: "yellow"
+    error: "red"
+    debug: "blue"
+
+# Security Configuration
+security:
+  environment_variables:
+    - "DATABASE_URI"
+    - "MLFLOW_TRACKING_URI"
+    - "MLFLOW_TRACKING_USERNAME"
+    - "MLFLOW_TRACKING_PASSWORD"
+
+  validation:
+    check_env_vars_at_startup: true
+    fail_if_missing: true

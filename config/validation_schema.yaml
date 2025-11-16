@@ -1,0 +1,295 @@
+# Validation schema for training_config.yaml (Phase 1)
+
+required_sections:
+  - data
+  - targets
+  - preprocessing
+  - model
+  - training
+  - hyperparameter_optimization
+  - mlflow
+  - evaluation
+  - logging
+  - security
+  - diagnostics
+
+sections:
+  data:
+    type: dict
+    required_keys:
+      source_type:
+        type: string
+      connection.database_uri:
+        type: string
+      connection.table_prefix:
+        type: string
+      asset_pairs.target_asset:
+        type: string
+      asset_pairs.correlated_assets:
+        type: list
+      ingestion.chunk_hours:
+        type: integer
+      time_range.start_date:
+        type: string
+      time_range.end_date:
+        type: string
+      time_range.cadence_seconds:
+        type: integer
+      order_book.depth_levels:
+        type: integer
+      order_book.representation:
+        type: string
+      order_book.schema.timestamp_column:
+        type: string
+      order_book.schema.bid_price_column:
+        type: string
+      order_book.schema.bid_quantity_column:
+        type: string
+      order_book.schema.ask_price_column:
+        type: string
+      order_book.schema.ask_quantity_column:
+        type: string
+      order_book.schema.batch_id_column:
+        type: string
+      validation.check_missing_data:
+        type: boolean
+      validation.max_gap_seconds:
+        type: integer
+      validation.fail_on_invalid:
+        type: boolean
+
+  targets:
+    type: dict
+    required_keys:
+      prediction_horizon_seconds:
+        type: integer
+      visible_window_seconds:
+        type: integer
+      price_classes.definition_type:
+        type: string
+      price_classes.boundaries:
+        type: list
+      labeling.use_midpoint:
+        type: boolean
+      labeling.handle_gaps:
+        type: string
+
+  preprocessing:
+    type: dict
+    required_keys:
+      normalization.method:
+        type: string
+      normalization.per_asset:
+        type: boolean
+      normalization.fit_on_train_only:
+        type: boolean
+      train_test_split.method:
+        type: string
+      train_test_split.train_ratio:
+        type: number
+      train_test_split.validation_ratio:
+        type: number
+      train_test_split.test_ratio:
+        type: number
+      class_balancing.enabled:
+        type: boolean
+      class_balancing.method:
+        type: string
+
+  model:
+    type: dict
+    required_keys:
+      framework:
+        type: string
+      backend:
+        type: string
+      architecture:
+        type: string
+      input_representation.strategy:
+        type: string
+      cnn.num_layers:
+        type: integer
+      lstm.units:
+        type: integer
+      output.num_classes:
+        type: integer
+      output.activation:
+        type: string
+      compilation.optimizer:
+        type: string
+      compilation.learning_rate:
+        type: number
+      compilation.loss:
+        type: string
+
+  training:
+    type: dict
+    required_keys:
+      epochs:
+        type: integer
+      batch_size:
+        type: integer
+      debug_max_samples:
+        type: integer
+      callbacks.early_stopping.enabled:
+        type: boolean
+      callbacks.early_stopping.monitor:
+        type: string
+      callbacks.early_stopping.patience:
+        type: integer
+      callbacks.early_stopping.restore_best_weights:
+        type: boolean
+      callbacks.reduce_lr.enabled:
+        type: boolean
+      callbacks.reduce_lr.monitor:
+        type: string
+      callbacks.reduce_lr.factor:
+        type: number
+      callbacks.reduce_lr.patience:
+        type: integer
+      callbacks.reduce_lr.min_lr:
+        type: number
+      class_weights.compute_from_train:
+        type: boolean
+      fine_tuning.enabled:
+        type: boolean
+      fine_tuning.base_model_run_id:
+        type: any
+      fine_tuning.base_model_stage:
+        type: string
+
+  hyperparameter_optimization:
+    type: dict
+    required_keys:
+      enabled:
+        type: boolean
+      framework:
+        type: string
+      n_trials:
+        type: integer
+      direction:
+        type: string
+      metric:
+        type: string
+
+  mlflow:
+    type: dict
+    required_keys:
+      tracking_uri:
+        type: string
+      experiment_name:
+        type: string
+      local_tmp_dir:
+        type: string
+      artifact_logging.trained_model:
+        type: boolean
+
+  evaluation:
+    type: dict
+    required_keys:
+      metrics:
+        type: list
+      calibration_analysis.enabled:
+        type: boolean
+
+  logging:
+    type: dict
+    required_keys:
+      level:
+        type: string
+      colored_output:
+        type: boolean
+      log_function_names:
+        type: boolean
+      colors.function_names:
+        type: string
+      colors.parameter_names:
+        type: string
+      colors.parameter_values:
+        type: string
+      colors.info:
+        type: string
+      colors.warning:
+        type: string
+      colors.error:
+        type: string
+      colors.debug:
+        type: string
+
+  security:
+    type: dict
+    required_keys:
+      environment_variables:
+        type: list
+      validation.check_env_vars_at_startup:
+        type: boolean
+      validation.fail_if_missing:
+        type: boolean
+
+  diagnostics:
+    type: dict
+    required_keys:
+      enabled:
+        type: boolean
+      sampling.method:
+        type: string
+      sampling.num_samples:
+        type: integer
+      sampling.random_seed:
+        type: integer
+      spread_checks.suspicious_threshold_pct:
+        type: number
+      spread_checks.high_spread_threshold_pct:
+        type: number
+      spread_checks.max_high_spread_fraction:
+        type: number
+      quantity_checks.enable_negative_checks:
+        type: boolean
+      quantity_checks.enable_zero_stats:
+        type: boolean
+      outlier_checks.enabled:
+        type: boolean
+      outlier_checks.z_score_threshold:
+        type: number
+      outlier_checks.min_nonzero_points:
+        type: integer
+      anomaly_export.enabled:
+        type: boolean
+      anomaly_export.max_samples:
+        type: integer
+      visualization.enabled:
+        type: boolean
+      visualization.time_series:
+        type: boolean
+      visualization.histograms:
+        type: boolean
+      visualization.histogram_bins:
+        type: integer
+      visualization.heatmaps.enabled:
+        type: boolean
+      visualization.heatmaps.types:
+        type: list
+      visualization.heatmaps.num_time_bins:
+        type: integer
+      visualization.heatmaps.num_spread_bins:
+        type: integer
+      visualization.spread_clipping.enabled:
+        type: boolean
+      visualization.spread_clipping.num_sigma:
+        type: number
+      visualization.depth_heatmap.enabled:
+        type: boolean
+      visualization.depth_heatmap.num_price_bins:
+        type: integer
+      label_checks.enabled:
+        type: boolean
+      label_checks.num_examples:
+        type: integer
+      label_checks.max_examples_per_figure:
+        type: integer
+      gap_checks.enabled:
+        type: boolean
+      gap_checks.large_gap_multiplier:
+        type: number
+      gap_checks.very_large_gap_multiplier:
+        type: number
