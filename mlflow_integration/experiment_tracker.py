@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional
 import logging
 import os
 from pathlib import Path
+import yaml
 
 
 logger = logging.getLogger(__name__)
@@ -84,6 +85,23 @@ def start_run(config: Dict[str, Any], run_name: Optional[str] = None):
     )
 
     run = mlflow.start_run(run_name=run_name)
+
+    try:
+        snapshot_path = tmp_path / "training_config_effective.yaml"
+        with snapshot_path.open("w", encoding="utf-8") as f:
+            yaml.safe_dump(config, f, sort_keys=False)
+
+        try:
+            mlflow.log_artifact(str(snapshot_path), artifact_path="config")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to log configuration snapshot artifact to MLFlow: %s", exc)
+        else:
+            logger.info(
+                "Configuration snapshot written to %s and logged to MLFlow under artifact path 'config'.",
+                snapshot_path,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to write configuration snapshot for MLFlow logging: %s", exc)
 
     # Log a few high-level configuration parameters for convenience.
     data_cfg = config.get("data", {})
