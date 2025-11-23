@@ -74,8 +74,8 @@ def main() -> int:
     # Phase 2: execute data pipeline skeleton inside the MLFlow run
     try:
         data_object = load_order_book_data(config)
-        data_object = attach_temporal_features(config, data_object)
         data_object = run_preprocessing_pipeline(config, data_object)
+        data_object = attach_temporal_features(config, data_object)
     except Exception as exc:  # noqa: BLE001
         logger.error("Data pipeline (Phase 2 skeleton) failed: %s", exc)
         end_run()
