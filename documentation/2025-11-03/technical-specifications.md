@@ -585,6 +585,7 @@ BinanceBot/
 - Loss functions and metrics
 - Training pipeline with tf.keras.Model
 - MLFlow integration (mlflow.tensorflow.autolog)
+- Core training strategy features (e.g., configuration-driven sample weighting)
 
 ### Phase 4: Evaluation and Optimization (Weeks 7-8)
 - Evaluation metrics

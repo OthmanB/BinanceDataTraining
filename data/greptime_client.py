@@ -14,7 +14,7 @@ whether the endpoint is reachable but does **not** yet fetch real training
 samples into the DataObject.
 """
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 import logging
 
 import requests
@@ -38,13 +38,8 @@ def check_greptime_connectivity(config: Dict[str, Any]) -> None:
     defined in code.
     """
 
-    # Strict access to required configuration fields (no code-level defaults)
     data_cfg = config["data"]
-    conn_cfg = data_cfg["connection"]
     asset_pairs_cfg = data_cfg["asset_pairs"]
-
-    base_uri = conn_cfg["database_uri"]
-    table_prefix = conn_cfg["table_prefix"]
 
     target_asset = asset_pairs_cfg["target_asset"]
     correlated_assets = asset_pairs_cfg["correlated_assets"]
@@ -55,6 +50,32 @@ def check_greptime_connectivity(config: Dict[str, Any]) -> None:
         logger.warning("Greptime connectivity check skipped: no asset pairs configured.")
         return
 
+    multi_db_cfg = data_cfg.get("multi_database")
+    if isinstance(multi_db_cfg, dict) and multi_db_cfg.get("enabled"):
+        connections = multi_db_cfg["connections"]
+        if not isinstance(connections, list) or not connections:
+            raise ValueError(
+                "data.multi_database.connections must be a non-empty list when multi_database.enabled is true",
+            )
+
+        for conn in connections:
+            base_uri = conn["database_uri"]
+            table_prefix = conn["table_prefix"]
+
+            _check_greptime_connectivity_for_connection(str(base_uri), str(table_prefix), assets)
+    else:
+        conn_cfg = data_cfg["connection"]
+        base_uri = conn_cfg["database_uri"]
+        table_prefix = conn_cfg["table_prefix"]
+
+        _check_greptime_connectivity_for_connection(str(base_uri), str(table_prefix), assets)
+
+
+def _check_greptime_connectivity_for_connection(
+    base_uri: str,
+    table_prefix: str,
+    assets: List[str],
+) -> None:
     url = base_uri.rstrip("/") + "/v1/sql"
 
     for asset in assets:
@@ -119,23 +140,102 @@ def fetch_order_book_rows(config: Dict[str, Any]) -> Dict[str, List[List[Any]]]:
     """
 
     data_cfg = config["data"]
-    conn_cfg = data_cfg["connection"]
     asset_pairs_cfg = data_cfg["asset_pairs"]
     time_range_cfg = data_cfg["time_range"]
     order_book_cfg = data_cfg["order_book"]
     schema_cfg = order_book_cfg["schema"]
-
-    base_uri = conn_cfg["database_uri"]
-    table_prefix = conn_cfg["table_prefix"]
 
     target_asset = asset_pairs_cfg["target_asset"]
     correlated_assets = asset_pairs_cfg["correlated_assets"]
 
     assets: List[str] = [str(target_asset)] + [str(a) for a in correlated_assets]
 
-    start_date = time_range_cfg["start_date"]
-    end_date = time_range_cfg["end_date"]
+    if not assets:
+        return {}
 
+    global_start_date = str(time_range_cfg["start_date"])
+    global_end_date = str(time_range_cfg["end_date"])
+
+    rows_by_asset: Dict[str, List[List[Any]]] = {asset: [] for asset in assets}
+
+    multi_db_cfg = data_cfg.get("multi_database")
+    if isinstance(multi_db_cfg, dict) and multi_db_cfg.get("enabled"):
+        connections = multi_db_cfg["connections"]
+        if not isinstance(connections, list) or not connections:
+            raise ValueError(
+                "data.multi_database.connections must be a non-empty list when multi_database.enabled is true",
+            )
+
+        intervals: List[Tuple[str, str, Dict[str, Any]]] = []
+        for conn in connections:
+            conn_time_range = conn["time_range"]
+            conn_start = str(conn_time_range["start_date"])
+            conn_end = str(conn_time_range["end_date"])
+
+            if conn_start > conn_end:
+                raise ValueError(
+                    "Connection-level time_range.start_date must be <= time_range.end_date for data.multi_database.connections; "
+                    f"got start_date={conn_start!r}, end_date={conn_end!r}",
+                )
+
+            intervals.append((conn_start, conn_end, conn))
+
+        intervals.sort(key=lambda item: item[0])
+
+        prev_end = None
+        for conn_start, conn_end, _ in intervals:
+            if prev_end is not None and conn_start < prev_end:
+                raise ValueError(
+                    "Overlapping time ranges are not supported for data.multi_database.connections; "
+                    "ensure per-connection time_range intervals are ordered and do not have interior overlap.",
+                )
+            prev_end = conn_end
+
+        for conn_start, conn_end, conn in intervals:
+            constrained_start = max(global_start_date, conn_start)
+            constrained_end = min(global_end_date, conn_end)
+            if constrained_start > constrained_end:
+                continue
+
+            base_uri = conn["database_uri"]
+            table_prefix = conn["table_prefix"]
+
+            _fetch_order_book_rows_for_connection(
+                str(base_uri),
+                str(table_prefix),
+                assets,
+                constrained_start,
+                constrained_end,
+                schema_cfg,
+                rows_by_asset,
+            )
+    else:
+        conn_cfg = data_cfg["connection"]
+        base_uri = conn_cfg["database_uri"]
+        table_prefix = conn_cfg["table_prefix"]
+
+        _fetch_order_book_rows_for_connection(
+            str(base_uri),
+            str(table_prefix),
+            assets,
+            global_start_date,
+            global_end_date,
+            schema_cfg,
+            rows_by_asset,
+        )
+
+    return rows_by_asset
+
+
+def _fetch_order_book_rows_for_connection(
+    base_uri: str,
+    table_prefix: str,
+    assets: List[str],
+    start_date: str,
+    end_date: str,
+    schema_cfg: Dict[str, Any],
+    rows_by_asset: Dict[str, List[List[Any]]],
+) -> None:
     ts_col = schema_cfg["timestamp_column"]
     bid_price_col = schema_cfg["bid_price_column"]
     bid_qty_col = schema_cfg["bid_quantity_column"]
@@ -145,12 +245,9 @@ def fetch_order_book_rows(config: Dict[str, Any]) -> Dict[str, List[List[Any]]]:
 
     url = base_uri.rstrip("/") + "/v1/sql"
 
-    rows_by_asset: Dict[str, List[List[Any]]] = {}
-
     for asset in assets:
         table_name = f"{table_prefix}{asset.lower()}"
 
-        # Time window based on physical units (dates) from configuration
         start_ts_literal = f"{start_date} 00:00:00"
         end_ts_literal = f"{end_date} 23:59:59"
 
@@ -184,7 +281,6 @@ def fetch_order_book_rows(config: Dict[str, Any]) -> Dict[str, List[List[Any]]]:
                 asset,
                 exc,
             )
-            rows_by_asset[asset] = []
             continue
 
         if not resp.ok:
@@ -195,7 +291,6 @@ def fetch_order_book_rows(config: Dict[str, Any]) -> Dict[str, List[List[Any]]]:
                 resp.status_code,
                 resp.text,
             )
-            rows_by_asset[asset] = []
             continue
 
         try:
@@ -207,7 +302,6 @@ def fetch_order_book_rows(config: Dict[str, Any]) -> Dict[str, List[List[Any]]]:
                 asset,
                 resp.status_code,
             )
-            rows_by_asset[asset] = []
             continue
 
         output = payload.get("output")
@@ -217,7 +311,6 @@ def fetch_order_book_rows(config: Dict[str, Any]) -> Dict[str, List[List[Any]]]:
                 table_name,
                 asset,
             )
-            rows_by_asset[asset] = []
             continue
 
         records = output[0].get("records") if isinstance(output, list) and output else None
@@ -227,11 +320,18 @@ def fetch_order_book_rows(config: Dict[str, Any]) -> Dict[str, List[List[Any]]]:
                 table_name,
                 asset,
             )
-            rows_by_asset[asset] = []
             continue
 
         rows = records.get("rows") or []
-        rows_by_asset[asset] = rows
+        if not rows:
+            logger.warning(
+                "GreptimeDB data fetch returned an empty rows array for table %s (asset=%s).",
+                table_name,
+                asset,
+            )
+            continue
+
+        rows_by_asset[asset].extend(rows)
 
         logger.info(
             "Fetched %s rows from GreptimeDB for table %s (asset=%s). execution_time_ms=%s",
@@ -240,8 +340,6 @@ def fetch_order_book_rows(config: Dict[str, Any]) -> Dict[str, List[List[Any]]]:
             asset,
             payload.get("execution_time_ms"),
         )
-
-    return rows_by_asset
 
 
 __all__ = ["check_greptime_connectivity", "fetch_order_book_rows"]

@@ -377,6 +377,116 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Dict[str, Any]) -
         y_down_val = np.eye(num_classes, dtype="float32")[labels_down_arr[val_indices]]
         y_val = [y_up_val, y_down_val]
 
+    # Optional time-weighted sampling using exponential decay based on sample age
+    # in days, configured via training.sample_weighting.
+    sample_weight_train = None
+    try:
+        sw_cfg = training_cfg["sample_weighting"]
+    except KeyError:
+        sw_cfg = None
+
+    if isinstance(sw_cfg, dict):
+        sw_enabled = bool(sw_cfg["enabled"])
+        if sw_enabled:
+            method = str(sw_cfg["method"])
+            if method != "exponential_decay":
+                raise ValueError(
+                    "training.sample_weighting.method must be 'exponential_decay' when enabled; "
+                    f"got {method!r}",
+                )
+
+            apply_to = str(sw_cfg["apply_to"])
+            if apply_to != "loss_function":
+                raise ValueError(
+                    "training.sample_weighting.apply_to must be 'loss_function' when sample weighting is enabled; "
+                    f"got {apply_to!r}",
+                )
+
+            half_life_days = int(sw_cfg["half_life_days"])
+            if half_life_days <= 0:
+                raise ValueError("training.sample_weighting.half_life_days must be a positive integer when enabled")
+
+            anchor_indices_all = metadata.get("anchor_indices") or []
+            if not anchor_indices_all:
+                raise ValueError(
+                    "training.sample_weighting.enabled is true but metadata.anchor_indices is missing or empty; "
+                    "temporal feature preprocessing must populate anchor_indices before training.",
+                )
+
+            if len(anchor_indices_all) != n_samples:
+                raise ValueError(
+                    "Length of metadata.anchor_indices must match metadata.num_samples when sample weighting is enabled; "
+                    f"got len(anchor_indices)={len(anchor_indices_all)}, num_samples={n_samples}",
+                )
+
+            data_cfg = config["data"]
+            asset_pairs_cfg = data_cfg["asset_pairs"]
+            target_asset_sw = str(asset_pairs_cfg["target_asset"])
+
+            order_books_sw = data_object.get("order_books", {})
+            target_book_sw = order_books_sw.get(target_asset_sw, {})
+            snapshot_timestamps_sw = target_book_sw.get("snapshot_timestamps") or []
+
+            if not snapshot_timestamps_sw:
+                raise ValueError(
+                    "training.sample_weighting.enabled is true but order_books[target_asset].snapshot_timestamps is missing "
+                    "or empty; snapshot_timestamps must be populated before training.",
+                )
+
+            ts_array = np.asarray(snapshot_timestamps_sw, dtype="datetime64[D]")
+            if ts_array.ndim != 1:
+                raise ValueError(
+                    "order_books[target_asset].snapshot_timestamps must be a one-dimensional sequence when sample weighting is enabled",
+                )
+
+            anchor_arr = np.asarray(anchor_indices_all, dtype="int64")
+            if anchor_arr.ndim != 1:
+                raise ValueError("metadata.anchor_indices must be a one-dimensional list of integers when sample weighting is enabled")
+
+            if anchor_arr.min() < 0 or anchor_arr.max() >= ts_array.shape[0]:
+                raise ValueError(
+                    "metadata.anchor_indices must reference valid snapshot indices when sample weighting is enabled; "
+                    f"got min={anchor_arr.min()}, max={anchor_arr.max()}, num_snapshots={ts_array.shape[0]}",
+                )
+
+            anchor_ts = ts_array[anchor_arr]
+            days = anchor_ts.astype("datetime64[D]").astype("int64")
+            current_day = int(days.max())
+            age_days = (current_day - days).astype("float64")
+
+            decay_const = np.log(2.0) / float(half_life_days)
+            weights_all = np.exp(-age_days * decay_const).astype("float32")
+
+            sample_weight_train = weights_all[train_indices]
+            if sample_weight_train.shape[0] != effective_train_n:
+                raise ValueError(
+                    "Sample weight vector length must match effective_train_n; "
+                    f"got sample_weight_train.shape[0]={sample_weight_train.shape[0]}, effective_train_n={effective_train_n}",
+                )
+
+            logger.info(
+                "Sample weighting enabled (method=exponential_decay, half_life_days=%s). "
+                "train_weight_stats=(min=%s, max=%s, mean=%s, std=%s)",
+                half_life_days,
+                float(sample_weight_train.min()),
+                float(sample_weight_train.max()),
+                float(sample_weight_train.mean()),
+                float(sample_weight_train.std()),
+            )
+
+            try:
+                import mlflow  # type: ignore[import]
+            except Exception:  # noqa: BLE001
+                pass
+            else:
+                try:
+                    mlflow.log_metric("sample_weight_min", float(sample_weight_train.min()))
+                    mlflow.log_metric("sample_weight_max", float(sample_weight_train.max()))
+                    mlflow.log_metric("sample_weight_mean", float(sample_weight_train.mean()))
+                    mlflow.log_metric("sample_weight_std", float(sample_weight_train.std()))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Failed to log sample weight diagnostics to MLFlow: %s", exc)
+
     dataset_hash = compute_dataset_hash(x_train, y_train, x_val, y_val)
     dataset_cache_path = cache_dataset_to_npz(
         config=config,
@@ -460,6 +570,9 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Dict[str, Any]) -
         "callbacks": callbacks,
         "verbose": 1,
     }
+
+    if sample_weight_train is not None:
+        fit_kwargs["sample_weight"] = [sample_weight_train, sample_weight_train]
 
     if x_val is not None and y_val is not None:
         fit_kwargs["validation_data"] = (x_val, y_val)

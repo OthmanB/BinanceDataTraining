@@ -7,6 +7,23 @@ data:
     database_uri: "${DATABASE_URI}"  # Resolved from environment
     table_prefix: "orderbook_"
 
+  multi_database:
+    enabled: false
+    strategy: "time_split"
+    connections:
+      - name: "historical"
+        database_uri: "${DATABASE_URI_HIST}"
+        table_prefix: "orderbook_"
+        time_range:
+          start_date: "2021-04-01"
+          end_date:   "2025-06-04"
+      - name: "recent"
+        database_uri: "${DATABASE_URI_LIVE}"
+        table_prefix: "orderbook_"
+        time_range:
+          start_date: "2025-06-04"
+          end_date:   "2025-10-20"
+
   asset_pairs:
     target_asset: "BTCUSDT"
     correlated_assets:
@@ -44,6 +61,18 @@ data:
     global:
       - "days_since_start"
       - "market_session"  # Asian/European/American
+    market_session:
+      utc_offset_hours: 0
+      sessions:
+        - name: "asian"
+          start_hour: 0
+          end_hour: 8
+        - name: "european"
+          start_hour: 8
+          end_hour: 16
+        - name: "american"
+          start_hour: 16
+          end_hour: 24
 
   validation:
     check_missing_data: true
@@ -164,6 +193,12 @@ training:
 
   class_weights:
     compute_from_train: true
+
+  sample_weighting:
+    enabled: false
+    method: "exponential_decay"
+    half_life_days: 90
+    apply_to: "loss_function"
 
   fine_tuning:
     enabled: false              # When true, resume from a previous model instead of training from scratch

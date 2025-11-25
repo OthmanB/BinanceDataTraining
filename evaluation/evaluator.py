@@ -177,6 +177,90 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
     if x_eval is None:
         raise ValueError("Evaluation inputs could not be constructed; x_eval is None")
 
+    # Optionally integrate temporal features into the evaluation input channels
+    # according to the model.input_representation.temporal_features
+    # configuration.
+    ir_cfg = model_cfg.get("input_representation")
+    if ir_cfg is None:
+        raise ValueError("model.input_representation must be defined in configuration")
+    tf_cfg = ir_cfg.get("temporal_features")
+    if tf_cfg is None:
+        raise ValueError("model.input_representation.temporal_features must be defined in configuration")
+
+    integration_mode = str(tf_cfg["integration_mode"])
+    use_local = bool(tf_cfg["use_local_features"])
+    use_global = bool(tf_cfg["use_global_features"])
+
+    if integration_mode not in ("none", "concat_channels"):
+        raise ValueError(
+            "model.input_representation.temporal_features.integration_mode must be one of 'none' or 'concat_channels'; "
+            f"got {integration_mode!r}",
+        )
+
+    if integration_mode == "concat_channels":
+        temporal_features = data_object.get("temporal_features")
+        if not isinstance(temporal_features, dict):
+            raise ValueError(
+                "data_object.temporal_features must be a dict when temporal feature integration is enabled; "
+                f"got {type(temporal_features)!r}",
+            )
+
+        local_arr = temporal_features.get("local")
+        global_arr = temporal_features.get("global")
+
+        if use_local:
+            if local_arr is None:
+                raise ValueError(
+                    "Temporal feature integration is configured to use_local_features=True but "
+                    "data_object.temporal_features.local is missing.",
+                )
+        if use_global:
+            if global_arr is None:
+                raise ValueError(
+                    "Temporal feature integration is configured to use_global_features=True but "
+                    "data_object.temporal_features.global is missing.",
+                )
+
+        feature_matrices = []
+        if use_local and local_arr is not None:
+            local_np = np.asarray(local_arr, dtype="float32")
+            feature_matrices.append(local_np)
+        if use_global and global_arr is not None:
+            global_np = np.asarray(global_arr, dtype="float32")
+            feature_matrices.append(global_np)
+
+        if feature_matrices:
+            tf_all = np.concatenate(feature_matrices, axis=1)
+            if tf_all.shape[0] != n_samples:
+                raise ValueError(
+                    "Temporal feature matrices must have one row per sample; "
+                    f"got tf_all.shape={tf_all.shape}, num_samples={n_samples}",
+                )
+
+            tf_eval = tf_all[eval_indices]
+            tf_eval = np.asarray(tf_eval, dtype="float32")
+
+            if x_eval.ndim != 5:
+                raise ValueError(
+                    "Evaluation input tensor must have rank 5 before temporal feature integration; "
+                    f"got x_eval.ndim={x_eval.ndim}, shape={x_eval.shape!r}",
+                )
+
+            _, t_steps, h_dim, w_dim, _ = x_eval.shape
+            tf_eval_exp = tf_eval[:, None, None, None, :]
+            tf_eval_broadcast = np.broadcast_to(
+                tf_eval_exp,
+                (tf_eval.shape[0], t_steps, h_dim, w_dim, tf_eval.shape[1]),
+            )
+            x_eval = np.concatenate([x_eval, tf_eval_broadcast.astype("float32")], axis=-1)
+
+            logger.info(
+                "Integrated temporal features into evaluation inputs via concat_channels: "
+                "eval_n=%s, feature_dim=%s",
+                eval_n,
+                tf_all.shape[1],
+            )
+
     if x_eval.ndim != 5:
         raise ValueError(
             "Evaluation input tensor must have shape (N, T, H, W, C); "

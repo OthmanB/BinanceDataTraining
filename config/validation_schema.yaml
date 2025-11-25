@@ -23,6 +23,12 @@ sections:
         type: string
       connection.table_prefix:
         type: string
+      multi_database.enabled:
+        type: boolean
+      multi_database.strategy:
+        type: string
+      multi_database.connections:
+        type: list
       asset_pairs.target_asset:
         type: string
       asset_pairs.correlated_assets:
@@ -51,6 +57,17 @@ sections:
         type: string
       order_book.schema.batch_id_column:
         type: string
+      temporal_features.local:
+        type: list
+      temporal_features.global:
+        type: list
+      temporal_features.market_session:
+        type: dict
+        required_keys:
+          utc_offset_hours:
+            type: integer
+          sessions:
+            type: list
       validation.check_missing_data:
         type: boolean
       validation.max_gap_seconds:
@@ -163,6 +180,14 @@ sections:
         type: number
       class_weights.compute_from_train:
         type: boolean
+      sample_weighting.enabled:
+        type: boolean
+      sample_weighting.method:
+        type: string
+      sample_weighting.half_life_days:
+        type: integer
+      sample_weighting.apply_to:
+        type: string
       fine_tuning.enabled:
         type: boolean
       fine_tuning.base_model_run_id:

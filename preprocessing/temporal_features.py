@@ -27,11 +27,19 @@ def _compute_anchor_timestamps(
     """
 
     metadata = data_object.get("metadata", {})
-    anchor_indices: List[int] = metadata.get("anchor_indices") or []
+    anchor_indices = metadata.get("anchor_indices")
 
-    if not anchor_indices:
+    if anchor_indices is None:
         raise ValueError(
             "metadata.anchor_indices must be populated by the preprocessing pipeline before attaching temporal features",
+        )
+
+    anchor_arr = np.asarray(anchor_indices, dtype="int64")
+    if anchor_arr.ndim != 1:
+        raise ValueError("metadata.anchor_indices must be a one-dimensional list or array of integers")
+    if anchor_arr.size == 0:
+        raise ValueError(
+            "metadata.anchor_indices must be non-empty when attaching temporal features",
         )
 
     n_samples = int(metadata.get("num_samples", 0))
@@ -40,10 +48,10 @@ def _compute_anchor_timestamps(
             "metadata.num_samples must be positive when anchor_indices are present for temporal feature construction",
         )
 
-    if len(anchor_indices) != n_samples:
+    if anchor_arr.size != n_samples:
         raise ValueError(
             "Length of metadata.anchor_indices must match metadata.num_samples for temporal feature construction; "
-            f"got len(anchor_indices)={len(anchor_indices)}, num_samples={n_samples}",
+            f"got len(anchor_indices)={anchor_arr.size}, num_samples={n_samples}",
         )
 
     data_cfg = config["data"]
@@ -52,9 +60,9 @@ def _compute_anchor_timestamps(
 
     order_books = data_object.get("order_books", {})
     target_book = order_books.get(target_asset, {})
-    snapshot_timestamps = target_book.get("snapshot_timestamps") or []
+    snapshot_timestamps = target_book.get("snapshot_timestamps")
 
-    if not snapshot_timestamps:
+    if snapshot_timestamps is None:
         raise ValueError(
             "order_books[target_asset].snapshot_timestamps must be populated before attaching temporal features",
         )
@@ -62,10 +70,10 @@ def _compute_anchor_timestamps(
     ts_array = np.asarray(snapshot_timestamps, dtype="datetime64[ns]")
     if ts_array.ndim != 1:
         raise ValueError("snapshot_timestamps must be a one-dimensional sequence of timestamps")
-
-    anchor_arr = np.asarray(anchor_indices, dtype="int64")
-    if anchor_arr.ndim != 1:
-        raise ValueError("metadata.anchor_indices must be a one-dimensional list of integers")
+    if ts_array.size == 0:
+        raise ValueError(
+            "order_books[target_asset].snapshot_timestamps must be non-empty before attaching temporal features",
+        )
 
     if anchor_arr.min() < 0 or anchor_arr.max() >= ts_array.shape[0]:
         raise ValueError(
@@ -135,6 +143,7 @@ def _build_local_temporal_features(
 
 
 def _build_global_temporal_features(
+    config: Dict[str, Any],
     global_cfg: List[str],
     anchor_timestamps: np.ndarray,
 ) -> np.ndarray:
@@ -142,15 +151,16 @@ def _build_global_temporal_features(
 
     Supported feature names in global_cfg:
     - "days_since_start"  -> scalar days since first anchor timestamp
-
-    Unsupported names (e.g., "market_session") will trigger a warning and be
-    ignored until the corresponding configuration and design are finalized.
+    - "market_session"     -> one-hot encoding of configured market sessions
     """
 
     if anchor_timestamps.size == 0:
         return np.zeros((0, 0), dtype="float32")
 
     feature_columns: List[np.ndarray] = []
+
+    data_cfg = config["data"]
+    tf_cfg_all = data_cfg.get("temporal_features", {})
 
     for name in global_cfg:
         key = str(name)
@@ -160,14 +170,81 @@ def _build_global_temporal_features(
             days_since_start = (days - first_day).astype("float64")
             feature_columns.append(days_since_start)
         elif key == "market_session":
-            logger.warning(
-                "Global temporal feature 'market_session' is listed in configuration "
-                "but is not yet implemented; it will be ignored in this phase.",
-            )
+            ms_cfg = tf_cfg_all.get("market_session")
+            if not isinstance(ms_cfg, dict):
+                raise ValueError(
+                    "data.temporal_features.market_session must be a mapping in configuration when "
+                    "'market_session' is listed in data.temporal_features.global",
+                )
+
+            try:
+                utc_offset_hours = int(ms_cfg["utc_offset_hours"])
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError(
+                    "data.temporal_features.market_session.utc_offset_hours must be an integer in configuration",
+                ) from exc
+
+            sessions_cfg = ms_cfg.get("sessions")
+            if not isinstance(sessions_cfg, list) or not sessions_cfg:
+                raise ValueError(
+                    "data.temporal_features.market_session.sessions must be a non-empty list in configuration",
+                )
+
+            num_sessions = len(sessions_cfg)
+
+            # Validate session definitions and check for overlapping hour ranges.
+            hour_coverage = np.zeros(24, dtype="int64")
+            session_ranges: List[Tuple[int, int]] = []
+
+            for sess in sessions_cfg:
+                if not isinstance(sess, dict):
+                    raise ValueError(
+                        "Each entry in data.temporal_features.market_session.sessions must be a mapping",
+                    )
+
+                try:
+                    start_hour = int(sess["start_hour"])
+                    end_hour = int(sess["end_hour"])
+                except Exception as exc:  # noqa: BLE001
+                    raise ValueError(
+                        "Each session in data.temporal_features.market_session.sessions must define "
+                        "integer start_hour and end_hour values",
+                    ) from exc
+
+                if start_hour < 0 or start_hour >= 24 or end_hour <= 0 or end_hour > 24 or start_hour >= end_hour:
+                    raise ValueError(
+                        "Session hour ranges in data.temporal_features.market_session.sessions must satisfy "
+                        "0 <= start_hour < end_hour <= 24; "
+                        f"got start_hour={start_hour}, end_hour={end_hour}",
+                    )
+
+                hour_coverage[start_hour:end_hour] += 1
+                session_ranges.append((start_hour, end_hour))
+
+            if np.any(hour_coverage > 1):
+                raise ValueError(
+                    "Session hour ranges in data.temporal_features.market_session.sessions must not overlap.",
+                )
+
+            # Compute local hour-of-day in the configured time zone using a
+            # simple integer UTC offset.
+            ts_sec = anchor_timestamps.astype("datetime64[s]").astype("int64")
+            seconds_per_day = 24 * 60 * 60
+            seconds_in_day = ts_sec % seconds_per_day
+            hours_utc = (seconds_in_day // 3600).astype("int64")
+            hours_local = (hours_utc + utc_offset_hours) % 24
+
+            session_matrix = np.zeros((anchor_timestamps.shape[0], num_sessions), dtype="float64")
+            for idx, (start_hour, end_hour) in enumerate(session_ranges):
+                mask = (hours_local >= start_hour) & (hours_local < end_hour)
+                session_matrix[mask, idx] = 1.0
+
+            for idx in range(num_sessions):
+                feature_columns.append(session_matrix[:, idx])
         else:
             raise ValueError(
                 "Unsupported global temporal feature name in data.temporal_features.global: "
-                f"{key!r}. Supported values currently include 'days_since_start' and 'market_session' (ignored).",
+                f"{key!r}. Supported values currently include 'days_since_start' and 'market_session'.",
             )
 
     if not feature_columns:
@@ -216,7 +293,7 @@ def attach_temporal_features(config: Dict[str, Any], data_object: Dict[str, Any]
         raise ValueError("data.temporal_features.local and data.temporal_features.global must be lists in configuration")
 
     local_matrix = _build_local_temporal_features(local_cfg, anchor_ts)
-    global_matrix = _build_global_temporal_features(global_cfg, anchor_ts)
+    global_matrix = _build_global_temporal_features(config, global_cfg, anchor_ts)
 
     if local_matrix.shape[0] != n_samples or global_matrix.shape[0] != n_samples:
         raise ValueError(
