@@ -17,6 +17,7 @@ import numpy as np
 from preprocessing.train_test_split import chronological_split_indices
 from preprocessing.snapshot_sequence_builder import build_top_of_book_sequence_tensor
 from mlflow_integration.model_registry import register_model
+from .dataset_cache import compute_dataset_hash, cache_dataset_to_npz
 from .callbacks import create_callbacks
 
 
@@ -278,6 +279,36 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Dict[str, Any]) -
         y_up_val = np.eye(num_classes, dtype="float32")[labels_up_arr[val_indices]]
         y_down_val = np.eye(num_classes, dtype="float32")[labels_down_arr[val_indices]]
         y_val = [y_up_val, y_down_val]
+
+    dataset_hash = compute_dataset_hash(x_train, y_train, x_val, y_val)
+    dataset_cache_path = cache_dataset_to_npz(
+        config=config,
+        dataset_hash=dataset_hash,
+        x_train=x_train,
+        y_train=y_train,
+        x_val=x_val,
+        y_val=y_val,
+    )
+
+    try:
+        import mlflow  # type: ignore[import]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to import MLFlow for dataset hash logging: %s", exc)
+    else:
+        try:
+            training_cfg = config["training"]
+            cache_cfg = training_cfg["dataset_cache"]
+            dataset_version = str(cache_cfg["version"])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to read training.dataset_cache.version for dataset logging: %s", exc)
+        else:
+            try:
+                mlflow.log_param("dataset_version", dataset_version)
+                mlflow.log_param("dataset_hash", dataset_hash)
+                if dataset_cache_path is not None:
+                    mlflow.log_param("dataset_cache_path", dataset_cache_path)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to log dataset hash/version parameters to MLFlow: %s", exc)
 
     from models.cnn_lstm_multiclass import build_cnn_lstm_model
 

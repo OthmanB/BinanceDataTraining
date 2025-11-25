@@ -57,9 +57,10 @@ targets:
 
   price_classes:
     definition_type: "percentage"  # or "absolute", "adaptive"
-    boundaries: [-10, -5, -2, 0, 2, 5, 10]
+    boundaries: [2.0, 5.0, 10.0]
 
   labeling:
+    scheme: "two_head_intensity"
     use_midpoint: true   # Use mid-price or last trade price
     handle_gaps: "interpolate"  # or "skip", "forward_fill"
 
@@ -112,14 +113,15 @@ model:
   lstm:
     units: 96
     dropout: 0.3
-    recurrent_dropout: 0.2
+    recurrent_dropout: 0.0 # Keep 0.0 if using cuDNN ==> Otherwise it is 10x slower
 
   dense:
     layers: [64]
     dropout_rates: [0.2]
 
   output:
-    num_classes: 8  # Based on price_classes definition
+    type: "two_head_intensity"
+    num_classes: 4  # Per-head classes = len(targets.price_classes.boundaries) + 1
     activation: "softmax"
 
   compilation:
@@ -131,9 +133,16 @@ model:
 # Training Configuration
 training:
   epochs: 50
-  batch_size: 32
-  validation_split: 0.1  # Using explicit validation set from preprocessing
+  batch_size: 128
+  validation_split: 0.15  # Using explicit validation set from preprocessing
   debug_max_samples: 2000
+  missing_snapshot_strategy: "fail"  # "fail", "skip", or "synthetic" when snapshot features are unavailable
+
+  dataset_cache:
+    enabled: false
+    directory: "cache/datasets"
+    filename_pattern: "{asset}_{model}_{dataset_version}_{dataset_hash}.npz"
+    version: "v1"
 
   callbacks:
     early_stopping:
@@ -205,6 +214,8 @@ evaluation:
   calibration_analysis:
     enabled: true
     n_bins: 10
+
+  missing_snapshot_strategy: "fail"  # "fail", "skip", or "synthetic" when snapshot features are unavailable
 
   backtesting:
     enabled: false

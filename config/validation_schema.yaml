@@ -69,6 +69,8 @@ sections:
         type: string
       price_classes.boundaries:
         type: list
+      labeling.scheme:
+        type: string
       labeling.use_midpoint:
         type: boolean
       labeling.handle_gaps:
@@ -111,6 +113,8 @@ sections:
         type: integer
       lstm.units:
         type: integer
+      output.type:
+        type: string
       output.num_classes:
         type: integer
       output.activation:
@@ -131,6 +135,8 @@ sections:
         type: integer
       debug_max_samples:
         type: integer
+      missing_snapshot_strategy:
+        type: string
       callbacks.early_stopping.enabled:
         type: boolean
       callbacks.early_stopping.monitor:
@@ -156,6 +162,14 @@ sections:
       fine_tuning.base_model_run_id:
         type: any
       fine_tuning.base_model_stage:
+        type: string
+      dataset_cache.enabled:
+        type: boolean
+      dataset_cache.directory:
+        type: string
+      dataset_cache.filename_pattern:
+        type: string
+      dataset_cache.version:
         type: string
 
   hyperparameter_optimization:
@@ -191,6 +205,8 @@ sections:
         type: list
       calibration_analysis.enabled:
         type: boolean
+      missing_snapshot_strategy:
+        type: string
 
   logging:
     type: dict
