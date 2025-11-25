@@ -1,4 +1,4 @@
-from typing import Any, Dict, Sequence
+from typing import Any, Dict, List, Sequence
 import logging
 from pathlib import Path
 import tempfile
@@ -99,6 +99,18 @@ def run_data_diagnostics(
         logger.info("Data diagnostics skipped: num_samples=0.")
         return
 
+    anchor_indices = metadata.get("anchor_indices")
+    anchor_arr = None
+    if anchor_indices is not None:
+        anchor_arr = np.asarray(anchor_indices, dtype="int64")
+        if anchor_arr.ndim != 1:
+            raise ValueError("metadata.anchor_indices must be a one-dimensional list of integers")
+        if int(anchor_arr.shape[0]) != n_samples:
+            raise ValueError(
+                "metadata.anchor_indices length must equal metadata.num_samples; "
+                f"got len(anchor_indices)={anchor_arr.shape[0]}, num_samples={n_samples}",
+            )
+
     data_cfg = config["data"]
     asset_pairs_cfg = data_cfg["asset_pairs"]
     target_asset = str(asset_pairs_cfg["target_asset"])
@@ -184,10 +196,18 @@ def run_data_diagnostics(
 
     for idx in sampled_indices:
         idx_int = int(idx)
-        if idx_int < 0 or idx_int >= len(snapshot_features):
+        if idx_int < 0 or idx_int >= n_samples:
             continue
 
-        features_i = snapshot_features[idx_int]
+        if anchor_arr is not None:
+            snapshot_idx = int(anchor_arr[idx_int])
+        else:
+            snapshot_idx = idx_int
+
+        if snapshot_idx < 0 or snapshot_idx >= len(snapshot_features):
+            continue
+
+        features_i = snapshot_features[snapshot_idx]
         if not isinstance(features_i, (list, tuple)) or len(features_i) < 4:
             continue
 
@@ -212,8 +232,9 @@ def run_data_diagnostics(
         if labels_array is not None and 0 <= idx_int < labels_array.shape[0]:
             record["label"] = labels_array[idx_int]
 
-        if timestamps_array is not None and 0 <= idx_int < timestamps_array.shape[0]:
-            record["timestamp"] = timestamps_array[idx_int]
+        if timestamps_array is not None:
+            if snapshot_idx >= 0 and snapshot_idx < timestamps_array.shape[0]:
+                record["timestamp"] = timestamps_array[snapshot_idx]
 
         # Flags for anomalies and quality checks.
         flags = {
@@ -965,7 +986,7 @@ def run_data_diagnostics(
                                         visible_steps_overlay = visible_window_seconds // cadence_seconds
 
                                         if horizon_steps_overlay > 0 and visible_steps_overlay > 0:
-                                            mid_full_overlay: list[float] = []
+                                            mid_full_overlay: List[float] = []
                                             for features in snapshot_features[:n_snapshots_full]:
                                                 if not isinstance(features, (list, tuple)) or len(features) < 4:
                                                     mid_full_overlay.append(float("nan"))
@@ -988,7 +1009,7 @@ def run_data_diagnostics(
                                             mid_full_overlay_arr = np.asarray(mid_full_overlay, dtype="float64")
 
                                             train_indices_arr = np.asarray(list(train_idx), dtype="int64")
-                                            valid_anchors_overlay: list[int] = []
+                                            valid_anchors_overlay: List[int] = []
                                             for idx_anchor in train_indices_arr:
                                                 if idx_anchor < 0 or idx_anchor >= n_labels_full:
                                                     continue

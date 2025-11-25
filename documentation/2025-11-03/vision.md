@@ -90,6 +90,7 @@ The platform architecture is inspired by the proven `training-core` system, adop
 4. **Extensible Inputs:** Support for multiple input streams with plugin-like architecture
 5. **Reproducibility:** Full MLFlow logging of parameters, metrics, and artifacts
 6. **Security-First:** Environment variables for sensitive data (API keys, credentials)
+7. **Memory-Aware Training:** Design data pipelines and model training to operate under explicit RAM/VRAM budgets specified in YAML, favouring streaming or chunked dataset loading (e.g., `tf.data`, memory-mapped caches) instead of assuming that full datasets or full sequence tensors fit in memory.
 
 ### 4.3 Modular Multi-Stage Pipeline and Multi-Model Support
 
@@ -114,6 +115,8 @@ Each stage is:
 ## 5. Canonical Model Architecture and Multi-Model Strategy
 
 ### 5.1 Multi-Input CNN+LSTM Model
+
+The canonical model processes **temporal windows of order book snapshots** rather than isolated snapshots. For a given asset and anchor time, the input consists of the last \(T\) snapshots within a visible window of length `targets.visible_window_seconds`, sampled at cadence `data.time_range.cadence_seconds` such that \(T = \texttt{visible_window_seconds} / \texttt{cadence_seconds}\). Within each snapshot, the order book state is represented as a 2D grid of features as described in the technical specifications and in the dedicated feature representation note. A convolutional block is applied to each snapshot to encode its spatial microstructure, and an LSTM layer then operates along the true time axis over the sequence of frame embeddings, learning how these spatial patterns evolve across the visible window.
 
 The model will accept multiple input channels:
 

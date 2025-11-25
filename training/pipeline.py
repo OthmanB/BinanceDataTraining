@@ -229,6 +229,103 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Dict[str, Any]) -
     if x_train is None:
         raise ValueError("Training inputs could not be constructed; x_train is None")
 
+    # Optionally integrate temporal features into the input channels according
+    # to the model.input_representation.temporal_features configuration.
+    ir_cfg = model_cfg.get("input_representation")
+    if ir_cfg is None:
+        raise ValueError("model.input_representation must be defined in configuration")
+    tf_cfg = ir_cfg.get("temporal_features")
+    if tf_cfg is None:
+        raise ValueError("model.input_representation.temporal_features must be defined in configuration")
+    integration_mode = str(tf_cfg["integration_mode"])
+    use_local = bool(tf_cfg["use_local_features"])
+    use_global = bool(tf_cfg["use_global_features"])
+
+    if integration_mode not in ("none", "concat_channels"):
+        raise ValueError(
+            "model.input_representation.temporal_features.integration_mode must be one of 'none' or 'concat_channels'; "
+            f"got {integration_mode!r}",
+        )
+
+    if integration_mode == "concat_channels":
+        temporal_features = data_object.get("temporal_features")
+        if not isinstance(temporal_features, dict):
+            raise ValueError(
+                "data_object.temporal_features must be a dict when temporal feature integration is enabled; "
+                f"got {type(temporal_features)!r}",
+            )
+
+        local_arr = temporal_features.get("local")
+        global_arr = temporal_features.get("global")
+
+        if use_local:
+            if local_arr is None:
+                raise ValueError(
+                    "Temporal feature integration is configured to use_local_features=True but "
+                    "data_object.temporal_features.local is missing.",
+                )
+        if use_global:
+            if global_arr is None:
+                raise ValueError(
+                    "Temporal feature integration is configured to use_global_features=True but "
+                    "data_object.temporal_features.global is missing.",
+                )
+
+        feature_matrices = []
+        if use_local and local_arr is not None:
+            local_np = np.asarray(local_arr, dtype="float32")
+            feature_matrices.append(local_np)
+        if use_global and global_arr is not None:
+            global_np = np.asarray(global_arr, dtype="float32")
+            feature_matrices.append(global_np)
+
+        if feature_matrices:
+            tf_all = np.concatenate(feature_matrices, axis=1)
+            if tf_all.shape[0] != n_samples:
+                raise ValueError(
+                    "Temporal feature matrices must have one row per sample; "
+                    f"got tf_all.shape={tf_all.shape}, num_samples={n_samples}",
+                )
+
+            tf_train = tf_all[train_indices]
+            tf_train = np.asarray(tf_train, dtype="float32")
+            if val_indices:
+                tf_val = tf_all[val_indices]
+                tf_val = np.asarray(tf_val, dtype="float32")
+            else:
+                tf_val = None
+
+            # Broadcast temporal features across time and spatial dimensions and
+            # concatenate them along the channel axis.
+            if x_train.ndim != 5:
+                raise ValueError(
+                    "Training input tensor must have rank 5 before temporal feature integration; "
+                    f"got x_train.ndim={x_train.ndim}, shape={x_train.shape!r}",
+                )
+
+            _, t_steps, h_dim, w_dim, _ = x_train.shape
+            tf_train_exp = tf_train[:, None, None, None, :]
+            tf_train_broadcast = np.broadcast_to(
+                tf_train_exp,
+                (tf_train.shape[0], t_steps, h_dim, w_dim, tf_train.shape[1]),
+            )
+            x_train = np.concatenate([x_train, tf_train_broadcast.astype("float32")], axis=-1)
+
+            if x_val is not None and tf_val is not None:
+                tf_val_exp = tf_val[:, None, None, None, :]
+                tf_val_broadcast = np.broadcast_to(
+                    tf_val_exp,
+                    (tf_val.shape[0], t_steps, h_dim, w_dim, tf_val.shape[1]),
+                )
+                x_val = np.concatenate([x_val, tf_val_broadcast.astype("float32")], axis=-1)
+
+            logger.info(
+                "Integrated temporal features into training inputs via concat_channels: "
+                "n_samples=%s, feature_dim=%s",
+                n_samples,
+                tf_all.shape[1],
+            )
+
     # Infer the model input shape from the constructed training tensor. This
     # must have rank 5: (N, T, H, W, C), so input_shape=(T, H, W, C).
     if x_train.ndim != 5:
@@ -374,6 +471,25 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Dict[str, Any]) -
         loss_values = history.history.get("loss") or []
         if loss_values:
             final_loss = loss_values[-1]
+
+    hpo_metric_value = None
+    try:
+        hpo_cfg = config.get("hyperparameter_optimization", {})
+        if isinstance(hpo_cfg, dict) and hpo_cfg.get("enabled"):
+            metric_name = str(hpo_cfg["metric"])
+            if hasattr(history, "history") and isinstance(history.history, dict):
+                series = history.history.get(metric_name)
+                if series:
+                    try:
+                        hpo_metric_value = float(series[-1])
+                    except (TypeError, ValueError):  # noqa: BLE001
+                        hpo_metric_value = None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to compute hyperparameter optimization metric from training history: %s", exc)
+
+    if hpo_metric_value is not None:
+        metadata["last_hpo_metric"] = hpo_metric_value
+        data_object["metadata"] = metadata
 
     logger.info(
         "Training pipeline completed (Phase 3 minimal). effective_train_n=%s, final_loss=%s",

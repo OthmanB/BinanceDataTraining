@@ -100,6 +100,10 @@ model:
 
   input_representation:
     strategy: "stacked_channels"  # or "separate_branches", "attention"
+    temporal_features:
+      integration_mode: "concat_channels"  # "none" or "concat_channels"
+      use_local_features: true
+      use_global_features: true
 
   cnn:
     num_layers: 2
@@ -168,11 +172,11 @@ training:
 
 # Hyperparameter Optimization Configuration
 hyperparameter_optimization:
-  enabled: false
+  enabled: true
   framework: "optuna"
-  n_trials: 30
+  n_trials: 1
   direction: "maximize"
-  metric: "val_accuracy"
+  metric: "val_up_intensity_accuracy"
 
   search_space:
     cnn_filters_1: [16, 128]

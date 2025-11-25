@@ -41,6 +41,12 @@ def build_cnn_lstm_model(config: Dict[str, Any], input_shape: Tuple[int, ...]):
             "TensorFlow is required to build the CNN+LSTM model but could not be imported."
         ) from exc
 
+    if len(input_shape) != 4:
+        raise ValueError(
+            "build_cnn_lstm_model expects input_shape=(T, H, W, C); "
+            f"got input_shape={input_shape!r}",
+        )
+
     cnn_cfg = model_cfg.get("cnn", {})
     lstm_cfg = model_cfg.get("lstm", {})
     dense_cfg = model_cfg.get("dense", {})
@@ -59,19 +65,25 @@ def build_cnn_lstm_model(config: Dict[str, Any], input_shape: Tuple[int, ...]):
     inputs = keras.Input(shape=input_shape, name="main_input")
     x = inputs
 
+    # Apply the convolutional block independently to each temporal slice using
+    # TimeDistributed wrappers, so that spatial microstructure is encoded per
+    # snapshot while weights are shared across time.
     for i in range(num_layers):
         f = int(filters[i])
         k = kernel_sizes[i]
         p = pool_sizes[i]
         dr = float(dropout_rates[i]) if dropout_rates and i < len(dropout_rates) else 0.0
 
-        x = layers.Conv2D(filters=f, kernel_size=tuple(k), activation=activation, padding="same")(x)
-        x = layers.MaxPooling2D(pool_size=tuple(p))(x)
+        x = layers.TimeDistributed(
+            layers.Conv2D(filters=f, kernel_size=tuple(k), activation=activation, padding="same"),
+        )(x)
+        x = layers.TimeDistributed(layers.MaxPooling2D(pool_size=tuple(p)))(x)
         if dr > 0:
-            x = layers.Dropout(dr)(x)
+            x = layers.TimeDistributed(layers.Dropout(dr))(x)
 
-    # Flatten spatial dimensions before LSTM; exact reshaping will be refined later
-    x = layers.Reshape((-1, x.shape[-1]))(x)
+    # Flatten spatial dimensions within each temporal slice to obtain a
+    # sequence of frame-level embeddings of shape (T, D).
+    x = layers.TimeDistributed(layers.Flatten())(x)
 
     lstm_units = int(lstm_cfg.get("units"))
     lstm_dropout = float(lstm_cfg.get("dropout", 0.0))
@@ -93,20 +105,59 @@ def build_cnn_lstm_model(config: Dict[str, Any], input_shape: Tuple[int, ...]):
         if dr > 0:
             x = layers.Dropout(dr)(x)
 
+    output_type = str(output_cfg.get("type"))
+    if output_type != "two_head_intensity":
+        raise ValueError("Only model.output.type='two_head_intensity' is supported in this model builder")
+
     num_classes = int(output_cfg.get("num_classes"))
-    output_activation = output_cfg.get("activation", "softmax")
+    output_activation = output_cfg["activation"]
 
-    outputs = layers.Dense(num_classes, activation=output_activation, name="class_probabilities")(x)
+    up_head = layers.Dense(num_classes, activation=output_activation, name="up_intensity")(x)
+    down_head = layers.Dense(num_classes, activation=output_activation, name="down_intensity")(x)
 
-    model = keras.Model(inputs=inputs, outputs=outputs, name="cnn_lstm_multiclass")
+    model = keras.Model(inputs=inputs, outputs=[up_head, down_head], name="cnn_lstm_two_head_intensity")
 
     compilation_cfg = model_cfg.get("compilation", {})
     optimizer_name = compilation_cfg.get("optimizer")
     learning_rate = float(compilation_cfg.get("learning_rate"))
     loss = compilation_cfg.get("loss")
-    metrics = compilation_cfg.get("metrics", []) or []
+    metrics_cfg = compilation_cfg.get("metrics")
 
     optimizer = keras.optimizers.get({"class_name": optimizer_name, "config": {"learning_rate": learning_rate}})
+
+    def _build_metrics_for_head(metric_specs):
+        if isinstance(metric_specs, (list, tuple)):
+            metrics_list = list(metric_specs)
+        else:
+            metrics_list = [metric_specs]
+
+        metric_objects = []
+        for m in metrics_list:
+            if isinstance(m, str):
+                name_lower = m.lower()
+                if name_lower in {"accuracy", "acc", "categorical_accuracy"}:
+                    metric_objects.append(keras.metrics.CategoricalAccuracy(name=m))
+                elif name_lower == "precision":
+                    metric_objects.append(keras.metrics.Precision(name=m))
+                elif name_lower == "recall":
+                    metric_objects.append(keras.metrics.Recall(name=m))
+                else:
+                    metric_objects.append(keras.metrics.get(m))
+            else:
+                metric_objects.append(keras.metrics.get(m))
+
+        return metric_objects
+
+    metrics = None
+    if isinstance(metrics_cfg, dict):
+        metrics = metrics_cfg
+    elif metrics_cfg is None:
+        metrics = None
+    else:
+        metrics = {
+            "up_intensity": _build_metrics_for_head(metrics_cfg),
+            "down_intensity": _build_metrics_for_head(metrics_cfg),
+        }
 
     model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
 

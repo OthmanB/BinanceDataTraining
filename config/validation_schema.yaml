@@ -109,6 +109,12 @@ sections:
         type: string
       input_representation.strategy:
         type: string
+      input_representation.temporal_features.integration_mode:
+        type: string
+      input_representation.temporal_features.use_local_features:
+        type: boolean
+      input_representation.temporal_features.use_global_features:
+        type: boolean
       cnn.num_layers:
         type: integer
       lstm.units:
@@ -185,6 +191,8 @@ sections:
         type: string
       metric:
         type: string
+      search_space:
+        type: dict
 
   mlflow:
     type: dict

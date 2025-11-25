@@ -1,5 +1,7 @@
 """Model evaluation skeleton."""
 
+from __future__ import annotations
+
 from typing import Any, Dict
 import logging
 from pathlib import Path
@@ -8,6 +10,8 @@ import tempfile
 import numpy as np
 
 from preprocessing.train_test_split import chronological_split_indices
+from preprocessing.snapshot_sequence_builder import build_top_of_book_sequence_tensor
+from .calibration import compute_calibration_metrics
 
 
 logger = logging.getLogger(__name__)
@@ -25,6 +29,13 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
     if n_samples <= 0:
         logger.info("evaluate_model invoked with num_samples=0, skipping evaluation.")
         return
+
+    eval_cfg = config["evaluation"]
+    missing_snapshot_strategy = str(eval_cfg["missing_snapshot_strategy"])
+    if missing_snapshot_strategy not in ("fail", "skip", "synthetic"):
+        raise ValueError(
+            "evaluation.missing_snapshot_strategy must be one of 'fail', 'skip', or 'synthetic'",
+        )
 
     # Recompute chronological train/validation/test splits from configuration.
     split_cfg = config["preprocessing"]["train_test_split"]
@@ -50,6 +61,11 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
     eval_n = min(len(test_idx), debug_max_samples)
 
     model_cfg = config["model"]
+    output_cfg = model_cfg["output"]
+    output_type = str(output_cfg["type"])
+    if output_type != "two_head_intensity":
+        raise ValueError("Only model.output.type='two_head_intensity' is supported in the evaluation pipeline")
+
     cnn_cfg = model_cfg["cnn"]
     kernel_sizes = cnn_cfg["kernel_sizes"]
     pool_sizes = cnn_cfg["pool_sizes"]
@@ -77,8 +93,6 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
     width = max(max(widths), min_width)
     channels = 1
 
-    x_eval = np.zeros((eval_n, height, width, channels), dtype="float32")
-
     # Map snapshot-level top-of-book features for the target asset into the
     # evaluation tensor, using the same snapshot index space as the labels.
     try:
@@ -91,6 +105,9 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
     except KeyError:
         snapshot_features = []
 
+    eval_indices = test_idx[:eval_n]
+    x_eval = None
+
     if snapshot_features:
         logger.info(
             "Building evaluation inputs from snapshot_features (target_asset=%s). test_samples=%s, eval_n=%s",
@@ -98,121 +115,243 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
             len(test_idx),
             eval_n,
         )
-        for i in range(eval_n):
-            idx = test_idx[i]
-            if idx >= len(snapshot_features):
-                break
 
-            features_i = snapshot_features[idx]
-            if not isinstance(features_i, (list, tuple)) or len(features_i) < 4:
-                continue
+        anchor_indices = metadata.get("anchor_indices")
+        if anchor_indices is None:
+            raise ValueError(
+                "metadata.anchor_indices must be populated by the preprocessing pipeline when snapshot_features are present",
+            )
 
-            bid_price, bid_qty, ask_price, ask_qty = features_i[:4]
-
-            try:
-                bid_price_f = float(bid_price)
-                bid_qty_f = float(bid_qty)
-                ask_price_f = float(ask_price)
-                ask_qty_f = float(ask_qty)
-            except (TypeError, ValueError):
-                continue
-
-            x_eval[i, 0, 0, 0] = bid_price_f
-            if width > 1:
-                x_eval[i, 0, 1, 0] = bid_qty_f
-            if height > 1:
-                x_eval[i, 1, 0, 0] = ask_price_f
-            if height > 1 and width > 1:
-                x_eval[i, 1, 1, 0] = ask_qty_f
+        x_eval = build_top_of_book_sequence_tensor(
+            config=config,
+            snapshot_features=snapshot_features,
+            anchor_indices=list(anchor_indices),
+            sample_indices=eval_indices,
+            height=height,
+            width=width,
+            channels=channels,
+        )
     else:
-        logger.info("No snapshot_features available for evaluation; using synthetic evaluation inputs.")
-        x_eval = np.random.randn(eval_n, height, width, channels).astype("float32")
+        if missing_snapshot_strategy == "fail":
+            raise ValueError(
+                "No snapshot_features available for evaluation inputs for target asset; "
+                "set evaluation.missing_snapshot_strategy to 'skip' or 'synthetic' to change this behavior.",
+            )
 
-    num_classes = int(model_cfg["output"]["num_classes"])
+        if missing_snapshot_strategy == "skip":
+            logger.info(
+                "No snapshot_features available for evaluation inputs; skipping evaluation stage because "
+                "evaluation.missing_snapshot_strategy='skip'.",
+            )
+            return
+
+        data_cfg = config["data"]
+        time_range_cfg = data_cfg["time_range"]
+        cadence_seconds = int(time_range_cfg["cadence_seconds"])
+        if cadence_seconds <= 0:
+            raise ValueError("data.time_range.cadence_seconds must be positive")
+
+        targets_cfg = config["targets"]
+        visible_window_seconds = int(targets_cfg["visible_window_seconds"])
+        if visible_window_seconds <= 0:
+            raise ValueError("targets.visible_window_seconds must be positive")
+        if visible_window_seconds % cadence_seconds != 0:
+            raise ValueError(
+                "targets.visible_window_seconds must be an integer multiple of data.time_range.cadence_seconds",
+            )
+
+        window_steps = visible_window_seconds // cadence_seconds
+        if window_steps <= 0:
+            raise ValueError(
+                "Derived visible window length in steps must be at least one snapshot; "
+                f"visible_window_seconds={visible_window_seconds}, cadence_seconds={cadence_seconds}",
+            )
+
+        # missing_snapshot_strategy == "synthetic"
+        logger.info(
+            "No snapshot_features available for evaluation inputs; using synthetic inputs because "
+            "evaluation.missing_snapshot_strategy='synthetic'.",
+        )
+        x_eval = np.random.randn(eval_n, window_steps, height, width, channels).astype("float32")
+
+    if x_eval is None:
+        raise ValueError("Evaluation inputs could not be constructed; x_eval is None")
+
+    if x_eval.ndim != 5:
+        raise ValueError(
+            "Evaluation input tensor must have shape (N, T, H, W, C); "
+            f"got x_eval.ndim={x_eval.ndim}, shape={x_eval.shape!r}",
+        )
+
+    num_classes = int(output_cfg["num_classes"])
 
     # Labels are built during preprocessing and stored in the DataObject.
     targets = data_object.get("targets")
     if targets is None:
         raise ValueError("data_object.targets must be populated by the preprocessing pipeline")
 
-    labels_list = targets.get("labels")
-    if labels_list is None:
-        raise ValueError("data_object.targets.labels must be populated by the preprocessing pipeline")
-
-    if len(labels_list) < len(test_idx):
+    labels_up_list = targets.get("labels_up_intensity")
+    labels_down_list = targets.get("labels_down_intensity")
+    if labels_up_list is None or labels_down_list is None:
         raise ValueError(
-            "data_object.targets.labels length must be at least the number of samples used for splitting; "
-            f"got labels={len(labels_list)}, n_samples={len(test_idx)}",
+            "data_object.targets.labels_up_intensity and labels_down_intensity must be populated by the preprocessing pipeline",
         )
 
-    labels_arr = np.asarray(labels_list, dtype="int64")
-
-    if labels_arr.min() < 0 or labels_arr.max() >= num_classes:
+    if len(labels_up_list) < len(test_idx) or len(labels_down_list) < len(test_idx):
         raise ValueError(
-            "Target label values must be in the range [0, num_classes-1]; "
-            f"observed min={labels_arr.min()}, max={labels_arr.max()}, num_classes={num_classes}",
+            "Intensity label arrays must have length at least the number of samples used for splitting; "
+            f"got labels_up={len(labels_up_list)}, labels_down={len(labels_down_list)}, n_samples={len(test_idx)}",
+        )
+
+    labels_up_arr = np.asarray(labels_up_list, dtype="int64")
+    labels_down_arr = np.asarray(labels_down_list, dtype="int64")
+
+    if labels_up_arr.min() < 0 or labels_up_arr.max() >= num_classes:
+        raise ValueError(
+            "labels_up_intensity values must be in the range [0, num_classes-1]; "
+            f"observed min={labels_up_arr.min()}, max={labels_up_arr.max()}, num_classes={num_classes}",
+        )
+    if labels_down_arr.min() < 0 or labels_down_arr.max() >= num_classes:
+        raise ValueError(
+            "labels_down_intensity values must be in the range [0, num_classes-1]; "
+            f"observed min={labels_down_arr.min()}, max={labels_down_arr.max()}, num_classes={num_classes}",
         )
 
     # Restrict to the evaluation subset defined by the test indices and debug_max_samples.
-    eval_indices = test_idx[:eval_n]
-    y_true_int = labels_arr[eval_indices]
+    y_true_up = labels_up_arr[eval_indices]
+    y_true_down = labels_down_arr[eval_indices]
 
-    # Run model predictions on the evaluation set.
     try:
-        y_prob = model.predict(x_eval, verbose=0)
+        y_pred = model.predict(x_eval, verbose=0)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Model prediction failed during evaluation: %s", exc)
         return
 
-    if y_prob.ndim != 2 or y_prob.shape[1] != num_classes:
+    if not isinstance(y_pred, (list, tuple)) or len(y_pred) != 2:
+        logger.warning("Expected model.predict to return two outputs for two_head_intensity, got %r", type(y_pred))
+        return
+
+    y_prob_up, y_prob_down = y_pred
+
+    if (
+        y_prob_up.ndim != 2
+        or y_prob_up.shape[1] != num_classes
+        or y_prob_down.ndim != 2
+        or y_prob_down.shape[1] != num_classes
+    ):
         logger.warning(
-            "Unexpected prediction shape during evaluation. expected=(eval_n,%s), got=%s",
+            "Unexpected prediction shapes during evaluation. expected=(eval_n,%s) for each head, got up=%s, down=%s",
             num_classes,
-            y_prob.shape,
+            getattr(y_prob_up, "shape", None),
+            getattr(y_prob_down, "shape", None),
         )
         return
 
-    y_pred_int = np.argmax(y_prob, axis=1)
+    # Up-intensity head metrics.
+    y_pred_up = np.argmax(y_prob_up, axis=1)
+    accuracy_up = float(np.mean(y_pred_up == y_true_up)) if eval_n > 0 else 0.0
 
-    # Compute evaluation metrics.
-    accuracy = float(np.mean(y_pred_int == y_true_int)) if eval_n > 0 else 0.0
+    per_class_precision_up = []
+    per_class_recall_up = []
+    per_class_f1_up = []
 
-    per_class_precision = []
-    per_class_recall = []
-    per_class_f1 = []
-
-    confusion = np.zeros((num_classes, num_classes), dtype=int)
-    for t, p in zip(y_true_int, y_pred_int):
+    confusion_up = np.zeros((num_classes, num_classes), dtype=int)
+    for t, p in zip(y_true_up, y_pred_up):
         if 0 <= t < num_classes and 0 <= p < num_classes:
-            confusion[t, p] += 1
+            confusion_up[t, p] += 1
 
     for cls in range(num_classes):
-        tp = float(confusion[cls, cls])
-        fp = float(confusion[:, cls].sum() - tp)
-        fn = float(confusion[cls, :].sum() - tp)
+        tp = float(confusion_up[cls, cls])
+        fp = float(confusion_up[:, cls].sum() - tp)
+        fn = float(confusion_up[cls, :].sum() - tp)
 
         precision = tp / (tp + fp) if (tp + fp) > 0.0 else 0.0
         recall = tp / (tp + fn) if (tp + fn) > 0.0 else 0.0
         f1 = (2.0 * precision * recall / (precision + recall)) if (precision + recall) > 0.0 else 0.0
 
-        per_class_precision.append(precision)
-        per_class_recall.append(recall)
-        per_class_f1.append(f1)
+        per_class_precision_up.append(precision)
+        per_class_recall_up.append(recall)
+        per_class_f1_up.append(f1)
 
-    macro_precision = float(np.mean(per_class_precision)) if per_class_precision else 0.0
-    macro_recall = float(np.mean(per_class_recall)) if per_class_recall else 0.0
-    macro_f1 = float(np.mean(per_class_f1)) if per_class_f1 else 0.0
+    macro_precision_up = float(np.mean(per_class_precision_up)) if per_class_precision_up else 0.0
+    macro_recall_up = float(np.mean(per_class_recall_up)) if per_class_recall_up else 0.0
+    macro_f1_up = float(np.mean(per_class_f1_up)) if per_class_f1_up else 0.0
+
+    # Down-intensity head metrics.
+    y_pred_down = np.argmax(y_prob_down, axis=1)
+    accuracy_down = float(np.mean(y_pred_down == y_true_down)) if eval_n > 0 else 0.0
+
+    per_class_precision_down = []
+    per_class_recall_down = []
+    per_class_f1_down = []
+
+    confusion_down = np.zeros((num_classes, num_classes), dtype=int)
+    for t, p in zip(y_true_down, y_pred_down):
+        if 0 <= t < num_classes and 0 <= p < num_classes:
+            confusion_down[t, p] += 1
+
+    for cls in range(num_classes):
+        tp = float(confusion_down[cls, cls])
+        fp = float(confusion_down[:, cls].sum() - tp)
+        fn = float(confusion_down[cls, :].sum() - tp)
+
+        precision = tp / (tp + fp) if (tp + fp) > 0.0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0.0 else 0.0
+        f1 = (2.0 * precision * recall / (precision + recall)) if (precision + recall) > 0.0 else 0.0
+
+        per_class_precision_down.append(precision)
+        per_class_recall_down.append(recall)
+        per_class_f1_down.append(f1)
+
+    macro_precision_down = float(np.mean(per_class_precision_down)) if per_class_precision_down else 0.0
+    macro_recall_down = float(np.mean(per_class_recall_down)) if per_class_recall_down else 0.0
+    macro_f1_down = float(np.mean(per_class_f1_down)) if per_class_f1_down else 0.0
+
+    calib_cfg = eval_cfg["calibration_analysis"]
+    calib_enabled = bool(calib_cfg["enabled"])
+    calibration_results_up: Dict[str, Any] | None = None
+    calibration_results_down: Dict[str, Any] | None = None
+
+    if calib_enabled:
+        n_bins = int(calib_cfg["n_bins"])
+        if n_bins <= 0:
+            raise ValueError("evaluation.calibration_analysis.n_bins must be a positive integer")
+
+        try:
+            y_true_up_onehot = np.eye(num_classes, dtype="float64")[y_true_up]
+            calibration_results_up = compute_calibration_metrics(
+                y_true=y_true_up_onehot,
+                y_prob=y_prob_up,
+                num_bins=n_bins,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to compute up-head calibration metrics during evaluation: %s", exc)
+            calibration_results_up = None
+
+        try:
+            y_true_down_onehot = np.eye(num_classes, dtype="float64")[y_true_down]
+            calibration_results_down = compute_calibration_metrics(
+                y_true=y_true_down_onehot,
+                y_prob=y_prob_down,
+                num_bins=n_bins,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to compute down-head calibration metrics during evaluation: %s", exc)
+            calibration_results_down = None
 
     logger.info(
-        "Evaluation metrics (Phase 4 minimal). eval_n=%s, accuracy=%s, macro_precision=%s, macro_recall=%s, macro_f1=%s",
+        "Evaluation metrics (two_head_intensity). eval_n=%s, up_accuracy=%s, down_accuracy=%s, up_macro_precision=%s, down_macro_precision=%s, up_macro_recall=%s, down_macro_recall=%s, up_macro_f1=%s, down_macro_f1=%s",
         eval_n,
-        accuracy,
-        macro_precision,
-        macro_recall,
-        macro_f1,
+        accuracy_up,
+        accuracy_down,
+        macro_precision_up,
+        macro_precision_down,
+        macro_recall_up,
+        macro_recall_down,
+        macro_f1_up,
+        macro_f1_down,
     )
 
-    # Log evaluation metrics and optional confusion matrix to MLFlow.
     try:
         import mlflow  # type: ignore[import]
     except Exception as exc:  # noqa: BLE001
@@ -220,18 +359,43 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
         return
 
     metrics = {
-        "eval_accuracy": accuracy,
-        "eval_macro_precision": macro_precision,
-        "eval_macro_recall": macro_recall,
-        "eval_macro_f1": macro_f1,
+        "eval_up_accuracy": accuracy_up,
+        "eval_up_macro_precision": macro_precision_up,
+        "eval_up_macro_recall": macro_recall_up,
+        "eval_up_macro_f1": macro_f1_up,
+        "eval_down_accuracy": accuracy_down,
+        "eval_down_macro_precision": macro_precision_down,
+        "eval_down_macro_recall": macro_recall_down,
+        "eval_down_macro_f1": macro_f1_down,
     }
 
     for cls, (prec, rec, f1) in enumerate(
-        zip(per_class_precision, per_class_recall, per_class_f1),
+        zip(per_class_precision_up, per_class_recall_up, per_class_f1_up),
     ):
-        metrics[f"eval_precision_class_{cls}"] = prec
-        metrics[f"eval_recall_class_{cls}"] = rec
-        metrics[f"eval_f1_class_{cls}"] = f1
+        metrics[f"eval_up_precision_class_{cls}"] = prec
+        metrics[f"eval_up_recall_class_{cls}"] = rec
+        metrics[f"eval_up_f1_class_{cls}"] = f1
+
+    for cls, (prec, rec, f1) in enumerate(
+        zip(per_class_precision_down, per_class_recall_down, per_class_f1_down),
+    ):
+        metrics[f"eval_down_precision_class_{cls}"] = prec
+        metrics[f"eval_down_recall_class_{cls}"] = rec
+        metrics[f"eval_down_f1_class_{cls}"] = f1
+
+    if calibration_results_up is not None:
+        try:
+            metrics["eval_up_brier_score"] = float(calibration_results_up["brier_score"])
+            metrics["eval_up_ece"] = float(calibration_results_up["ece"])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to extract up-head calibration metrics for MLFlow logging: %s", exc)
+
+    if calibration_results_down is not None:
+        try:
+            metrics["eval_down_brier_score"] = float(calibration_results_down["brier_score"])
+            metrics["eval_down_ece"] = float(calibration_results_down["ece"])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to extract down-head calibration metrics for MLFlow logging: %s", exc)
 
     for name, value in metrics.items():
         try:
@@ -249,13 +413,68 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
 
     if log_confusion:
         tmp_dir = Path(tempfile.mkdtemp())
-        cm_path = tmp_dir / "confusion_matrix.csv"
+        cm_up_path = tmp_dir / "confusion_matrix_up.csv"
+        cm_down_path = tmp_dir / "confusion_matrix_down.csv"
         try:
-            np.savetxt(cm_path, confusion, fmt="%d", delimiter=",")
-            mlflow.log_artifact(str(cm_path), artifact_path="evaluation")
-            logger.info("Logged evaluation confusion matrix artifact to MLFlow at %s", cm_path)
+            np.savetxt(cm_up_path, confusion_up, fmt="%d", delimiter=",")
+            np.savetxt(cm_down_path, confusion_down, fmt="%d", delimiter=",")
+            mlflow.log_artifact(str(cm_up_path), artifact_path="evaluation")
+            mlflow.log_artifact(str(cm_down_path), artifact_path="evaluation")
+            logger.info("Logged evaluation up/down confusion matrix artifacts to MLFlow at %s and %s", cm_up_path, cm_down_path)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to log confusion matrix artifact to MLFlow: %s", exc)
+            logger.warning("Failed to log confusion matrix artifacts to MLFlow: %s", exc)
+
+    if calib_enabled and (calibration_results_up is not None or calibration_results_down is not None):
+        try:
+            tmp_dir = Path(tempfile.mkdtemp())
+
+            if calibration_results_up is not None:
+                calib_up_path = tmp_dir / "calibration_curve_up.csv"
+                edges = calibration_results_up["bin_edges"]
+                conf = calibration_results_up["bin_confidence"]
+                acc = calibration_results_up["bin_accuracy"]
+                count = calibration_results_up["bin_count"]
+
+                left_edges = edges[:-1]
+                right_edges = edges[1:]
+                data = np.column_stack([left_edges, right_edges, conf, acc, count])
+                header = "left_edge,right_edge,bin_confidence,bin_accuracy,bin_count"
+                np.savetxt(
+                    calib_up_path,
+                    data,
+                    fmt=["%.6f", "%.6f", "%.6f", "%.6f", "%d"],
+                    delimiter=",",
+                    header=header,
+                    comments="",
+                )
+
+                mlflow.log_artifact(str(calib_up_path), artifact_path="evaluation")
+                logger.info("Logged evaluation up-head calibration curve artifact to MLFlow at %s", calib_up_path)
+
+            if calibration_results_down is not None:
+                calib_down_path = tmp_dir / "calibration_curve_down.csv"
+                edges = calibration_results_down["bin_edges"]
+                conf = calibration_results_down["bin_confidence"]
+                acc = calibration_results_down["bin_accuracy"]
+                count = calibration_results_down["bin_count"]
+
+                left_edges = edges[:-1]
+                right_edges = edges[1:]
+                data = np.column_stack([left_edges, right_edges, conf, acc, count])
+                header = "left_edge,right_edge,bin_confidence,bin_accuracy,bin_count"
+                np.savetxt(
+                    calib_down_path,
+                    data,
+                    fmt=["%.6f", "%.6f", "%.6f", "%.6f", "%d"],
+                    delimiter=",",
+                    header=header,
+                    comments="",
+                )
+
+                mlflow.log_artifact(str(calib_down_path), artifact_path="evaluation")
+                logger.info("Logged evaluation down-head calibration curve artifact to MLFlow at %s", calib_down_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to log calibration curve artifacts to MLFlow: %s", exc)
 
 
 __all__ = ["evaluate_model"]

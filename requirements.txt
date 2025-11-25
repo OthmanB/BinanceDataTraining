@@ -7,13 +7,18 @@ termcolor==2.4.0
 requests==2.32.3
 
 # MLFlow for experiment tracking
-mlflow==2.16.0
+mlflow==2.6.0
+
+# Optuna for hyperparameter optimization
+optuna==3.6.1
 
 # TensorFlow + Keras (GPU/CPU variant can be adjusted if needed)
 # For your current environment (macOS arm, Python 3.13), pip reports TensorFlow 2.20.0
 # as the available version, so we pin to that here. This uses tf.keras bundled with
 # TensorFlow and does not install the standalone keras package.
-tensorflow==2.20.0
+tensorflow==2.20.0; sys_platform == "darwin"
+tensorflow==2.20.0; sys_platform == "linux" and python_version >= "3.9"
+tensorflow==2.13.1; sys_platform == "linux" and python_version < "3.9"
 
 # Optional: if you later use numpy/pandas explicitly, they will be pulled in by TF/MLflow,
 # but you can pin them here if you want deterministic versions.

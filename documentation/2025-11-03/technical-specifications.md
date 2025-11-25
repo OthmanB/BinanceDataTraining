@@ -721,7 +721,8 @@ export DATABASE_URI="postgresql://user:pass@host:port/dbname"
    **Decision (v1):**  
    - At training time, use mini-batch training with batch size treated as a hyperparameter defined in YAML.  
    - During preprocessing and dataset construction, control chunk sizes (e.g., number of days per run, number of samples per cached file) via YAML parameters.  
-   **Open Point:** Future versions may introduce auto-tuning of batch size and chunk size based on available physical memory.  
+   - For large datasets, require streaming or chunked dataset loading (e.g., via `tf.data` pipelines or equivalent generators) so that host RAM and device memory usage remain bounded by explicit YAML configuration parameters (for example, a future `training.memory` and `evaluation.memory` section). If a projected allocation would exceed these budgets, the pipeline must fail fast with a clear error instead of relying on operating-system swap or uncontrolled out-of-memory conditions.  
+   **Open Point:** Future versions may introduce auto-tuning of batch size, chunk size, and streaming buffer sizes based on available physical memory and configured budgets.  
 
 2. **GPU Utilization**  
    **Decision (v1):** Target CPU and single-GPU training only. Multi-GPU or distributed training strategies are considered future enhancements. Early tests may run entirely on CPU, with appropriately small batch sizes and model configurations.  

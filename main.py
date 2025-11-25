@@ -29,6 +29,7 @@ from diagnostics import run_data_diagnostics
 from training import run_training_pipeline
 from evaluation import evaluate_model
 from mlflow_integration import start_run, end_run
+from models.hyperparameter_tuning import run_hyperparameter_search
 
 
 def main() -> int:
@@ -117,9 +118,23 @@ def main() -> int:
 
     logger.info("Data diagnostics stage complete. Invoking training pipeline (Phase 3 minimal).")
 
+    config_for_training = config
+
+    hpo_cfg = config.get("hyperparameter_optimization")
+    if isinstance(hpo_cfg, dict) and hpo_cfg.get("enabled"):
+        logger.info("Hyperparameter optimization is enabled; running search before final training.")
+        try:
+            best_config = run_hyperparameter_search(config, data_object)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Hyperparameter optimization failed: %s", exc)
+            end_run()
+            return 1
+        if best_config is not None:
+            config_for_training = best_config
+
     # Phase 3: minimal training pipeline (runs inside the same MLFlow run)
     try:
-        model = run_training_pipeline(config, data_object)
+        model = run_training_pipeline(config_for_training, data_object)
     except Exception as exc:  # noqa: BLE001
         logger.error("Training pipeline (Phase 3 minimal) failed: %s", exc)
         end_run()
@@ -134,7 +149,7 @@ def main() -> int:
 
     # Phase 4: evaluation pipeline (runs inside the same MLFlow run)
     try:
-        evaluate_model(config, model, data_object)
+        evaluate_model(config_for_training, model, data_object)
     except Exception as exc:  # noqa: BLE001
         logger.error("Evaluation pipeline (Phase 4 minimal) failed: %s", exc)
         end_run()

@@ -21,6 +21,17 @@ if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   exit 1
 fi
 
+"${PYTHON_BIN}" - << 'EOF'
+import sys
+
+required = (3, 8)
+if sys.version_info < required:
+    raise SystemExit(
+        f"Error: Python {required[0]}.{required[1]} or higher is required, "
+        f"but found {sys.version_info.major}.{sys.version_info.minor}.",
+    )
+EOF
+
 if [ ! -d "${VENV_DIR}" ]; then
   echo "Creating virtual environment in ${VENV_DIR}..."
   "${PYTHON_BIN}" -m venv "${VENV_DIR}"
