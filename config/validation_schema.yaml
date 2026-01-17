@@ -12,6 +12,7 @@ required_sections:
   - logging
   - security
   - diagnostics
+  - run_mode
 
 sections:
   data:
@@ -218,6 +219,8 @@ sections:
         type: string
       search_space:
         type: dict
+      trial_model_logging.enabled:
+        type: boolean
 
   mlflow:
     type: dict
@@ -342,3 +345,9 @@ sections:
         type: number
       gap_checks.very_large_gap_multiplier:
         type: number
+
+  run_mode:
+    type: dict
+    required_keys:
+      mode:
+        type: string

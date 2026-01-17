@@ -123,6 +123,9 @@ def run_hyperparameter_search(
     direction = str(hpo_cfg["direction"])
     metric_name = str(hpo_cfg["metric"])
 
+    trial_logging_cfg = hpo_cfg["trial_model_logging"]
+    trial_log_models = bool(trial_logging_cfg["enabled"])
+
     if direction not in {"minimize", "maximize"}:
         raise ValueError(
             "hyperparameter_optimization.direction must be either 'minimize' or 'maximize'; "
@@ -135,6 +138,31 @@ def run_hyperparameter_search(
     def objective(trial: Any) -> float:
         params = _sample_hyperparameters(trial, hpo_cfg)
         trial_config = _apply_hyperparameters(config, params)
+
+        # Adjust MLFlow model logging behavior for this trial without
+        # affecting the base configuration used for the final production run.
+        try:
+            mlflow_cfg = trial_config["mlflow"]
+        except Exception:  # noqa: BLE001
+            mlflow_cfg = None
+        else:
+            if not trial_log_models and isinstance(mlflow_cfg, dict):
+                try:
+                    artifact_logging_cfg = mlflow_cfg.get("artifact_logging", {})
+                    artifact_logging_cfg["trained_model"] = False
+                    mlflow_cfg["artifact_logging"] = artifact_logging_cfg
+
+                    model_registry_cfg = mlflow_cfg.get("model_registry")
+                    if isinstance(model_registry_cfg, dict):
+                        model_registry_cfg["register_model"] = False
+                        mlflow_cfg["model_registry"] = model_registry_cfg
+
+                    trial_config["mlflow"] = mlflow_cfg
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Failed to adjust MLFlow logging configuration for HPO trial: %s",
+                        exc,
+                    )
 
         from training.pipeline import run_training_pipeline
 

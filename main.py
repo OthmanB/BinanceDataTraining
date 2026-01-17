@@ -50,6 +50,13 @@ def main() -> int:
         logger.error(f"Environment validation failed: {exc}")
         return 1
 
+    # Determine run mode (production vs trial) from configuration.
+    run_mode_cfg = config.get("run_mode", {})
+    mode = str(run_mode_cfg.get("mode"))
+    if mode not in ("production", "trial"):
+        logger.error("Invalid run_mode.mode in configuration: %r (expected 'production' or 'trial')", mode)
+        return 1
+
     # Start MLFlow run
     mlflow_cfg = config.get("mlflow", {})
     run_pattern = (
@@ -131,6 +138,13 @@ def main() -> int:
             return 1
         if best_config is not None:
             config_for_training = best_config
+
+    if mode == "trial":
+        logger.info(
+            "run_mode.mode='trial'; skipping final production training and evaluation after hyperparameter search.",
+        )
+        end_run()
+        return 0
 
     # Phase 3: minimal training pipeline (runs inside the same MLFlow run)
     try:
