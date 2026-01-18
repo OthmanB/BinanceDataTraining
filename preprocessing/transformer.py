@@ -427,6 +427,9 @@ def _build_targets_from_order_book(config: Dict[str, Any], data_object: Dict[str
     mid_prices = np.asarray(mid_price_values, dtype="float64")
     num_snapshots = int(mid_prices.shape[0])
 
+    # Store mid_prices for feature engineering (P2.1)
+    target_book["mid_prices"] = mid_prices.tolist()
+
     target_book["snapshot_features"] = snapshot_features
     target_book["snapshot_timestamps"] = snapshot_timestamps
     if collect_full_depth and snapshot_depth_data:

@@ -135,11 +135,12 @@ def build_hybrid_depth_sequence_tensor(
 ) -> np.ndarray:
     """Build a temporal sequence tensor using hybrid depth representation.
 
-    The returned array has shape (N, T, L, 4), where:
+    The returned array has shape (N, T, L, 4, 1), where:
     - N is the number of samples (len(sample_indices)),
     - T is derived from targets.visible_window_seconds and data.time_range.cadence_seconds,
     - L is the effective number of levels (raw_levels + aggregated_bins),
-    - 4 channels: [bid_price, bid_quantity, ask_price, ask_quantity].
+    - 4 = order book features [bid_price, bid_quantity, ask_price, ask_quantity],
+    - 1 = single channel (for CNN compatibility).
 
     Each snapshot in snapshot_depth_data is a dict with keys:
     - 'bid_prices': np.ndarray of shape (depth_levels,)
@@ -161,7 +162,7 @@ def build_hybrid_depth_sequence_tensor(
     Returns
     -------
     x_seq:
-        Array of shape (N, T, L, 4) with hybrid depth representation.
+        Array of shape (N, T, L, 4, 1) with hybrid depth representation.
     """
     data_cfg = config["data"]
     time_range_cfg = data_cfg["time_range"]
@@ -201,7 +202,7 @@ def build_hybrid_depth_sequence_tensor(
         raise ValueError("sample_indices must be a one-dimensional iterable of integers")
 
     if sample_idx_arr.size == 0:
-        return np.zeros((0, window_steps, effective_levels, 4), dtype="float32")
+        return np.zeros((0, window_steps, effective_levels, 4, 1), dtype="float32")
 
     if anchor_arr.min() < 0 or anchor_arr.max() >= num_snapshots:
         raise ValueError(
@@ -216,7 +217,7 @@ def build_hybrid_depth_sequence_tensor(
         )
 
     n_samples = int(sample_idx_arr.shape[0])
-    x_seq = np.zeros((n_samples, window_steps, effective_levels, 4), dtype="float32")
+    x_seq = np.zeros((n_samples, window_steps, effective_levels, 4, 1), dtype="float32")
 
     for s_idx, sample_i in enumerate(sample_idx_arr):
         anchor_snapshot_idx = int(anchor_arr[int(sample_i)])
@@ -250,7 +251,7 @@ def build_hybrid_depth_sequence_tensor(
                 config=config,
             )
 
-            x_seq[s_idx, tau, :, :] = hybrid_snapshot
+            x_seq[s_idx, tau, :, :, 0] = hybrid_snapshot
 
     return x_seq
 
