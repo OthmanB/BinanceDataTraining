@@ -117,6 +117,20 @@ sections:
         type: boolean
       normalization.fit_on_train_only:
         type: boolean
+      feature_engineering.enabled:
+        type: boolean
+      feature_engineering.order_book_features:
+        type: list
+      feature_engineering.derived_features:
+        type: list
+      feature_engineering.momentum_window_seconds:
+        type: integer
+      feature_engineering.volume_proxy_method:
+        type: string
+      feature_engineering.edge_decay.enabled:
+        type: boolean
+      feature_engineering.edge_decay.method:
+        type: string
       train_test_split.method:
         type: string
       train_test_split.train_ratio:

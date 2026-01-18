@@ -20,9 +20,11 @@ from preprocessing.snapshot_sequence_builder import (
     build_hybrid_depth_sequence_tensor,
 )
 from preprocessing.normalizer import create_normalizer_from_config
+from preprocessing.feature_engineering import FeatureEngineer
 from mlflow_integration.model_registry import register_model
 from .dataset_cache import compute_dataset_hash, cache_dataset_to_npz
 from .callbacks import create_callbacks
+from .class_weights import compute_class_weights
 
 
 logger = logging.getLogger(__name__)
@@ -269,6 +271,81 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Dict[str, Any]) -
     if x_train is None:
         raise ValueError("Training inputs could not be constructed; x_train is None")
 
+    # Optionally integrate feature engineering derived features into the input.
+    # This computes momentum features using anchor indices and mid_prices/volumes,
+    # then broadcasts and concatenates along the channel dimension.
+    fe_cfg = config["preprocessing"].get("feature_engineering", {})
+    if isinstance(fe_cfg, dict) and fe_cfg.get("enabled"):
+        try:
+            feature_engineer = FeatureEngineer(config)
+
+            # Retrieve precomputed order book features and volume proxy from transformer
+            snapshot_derived_features = target_book.get("snapshot_derived_features")
+            volume_proxy = target_book.get("volume_proxy")
+            mid_prices_list = target_book.get("mid_prices")
+
+            if snapshot_derived_features and volume_proxy and mid_prices_list:
+                mid_prices_arr = np.asarray(mid_prices_list, dtype="float64")
+                volumes_arr = np.asarray(volume_proxy, dtype="float64")
+                anchor_indices_list = list(anchor_indices)
+                cadence_seconds = int(data_cfg["time_range"]["cadence_seconds"])
+
+                # Compute all features for all samples
+                all_features = feature_engineer.compute_all_features(
+                    snapshot_depth_data=snapshot_depth_data,
+                    mid_prices=mid_prices_arr,
+                    anchor_indices=anchor_indices_list,
+                    cadence_seconds=cadence_seconds,
+                )
+
+                if all_features is not None and all_features.shape[0] > 0:
+                    n_features = all_features.shape[1]
+
+                    # Extract features for train and val indices
+                    fe_train = all_features[train_indices].astype("float32")
+                    fe_val = None
+                    if val_indices:
+                        fe_val = all_features[val_indices].astype("float32")
+
+                    # Broadcast across time and spatial dimensions and concatenate
+                    if x_train.ndim == 5:
+                        _, t_steps, h_dim, w_dim, _ = x_train.shape
+                        fe_train_exp = fe_train[:, None, None, None, :]
+                        fe_train_broadcast = np.broadcast_to(
+                            fe_train_exp,
+                            (fe_train.shape[0], t_steps, h_dim, w_dim, n_features),
+                        )
+                        x_train = np.concatenate(
+                            [x_train, fe_train_broadcast.astype("float32")], axis=-1
+                        )
+
+                        if x_val is not None and fe_val is not None:
+                            fe_val_exp = fe_val[:, None, None, None, :]
+                            fe_val_broadcast = np.broadcast_to(
+                                fe_val_exp,
+                                (fe_val.shape[0], t_steps, h_dim, w_dim, n_features),
+                            )
+                            x_val = np.concatenate(
+                                [x_val, fe_val_broadcast.astype("float32")], axis=-1
+                            )
+
+                        logger.info(
+                            "Integrated feature engineering features into training inputs: "
+                            "n_features=%s, x_train.shape=%s",
+                            n_features,
+                            x_train.shape,
+                        )
+            else:
+                logger.info(
+                    "Feature engineering skipped: missing snapshot_derived_features, "
+                    "volume_proxy, or mid_prices from preprocessing."
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Feature engineering integration failed: %s. Continuing without derived features.",
+                exc,
+            )
+
     # Optionally integrate temporal features into the input channels according
     # to the model.input_representation.temporal_features configuration.
     ir_cfg = model_cfg.get("input_representation")
@@ -446,6 +523,28 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Dict[str, Any]) -
         y_up_val = np.eye(num_classes, dtype="float32")[labels_up_arr[val_indices]]
         y_down_val = np.eye(num_classes, dtype="float32")[labels_down_arr[val_indices]]
         y_val = [y_up_val, y_down_val]
+
+    # Compute class weights for handling imbalanced labels.
+    # Weights are computed on training indices only to avoid data leakage.
+    class_weight_dict = None
+    class_weights_cfg = training_cfg.get("class_weights", {})
+    if isinstance(class_weights_cfg, dict) and class_weights_cfg.get("compute_from_train"):
+        train_labels_up = labels_up_arr[train_indices]
+        train_labels_down = labels_down_arr[train_indices]
+
+        up_weights = compute_class_weights(train_labels_up, num_classes)
+        down_weights = compute_class_weights(train_labels_down, num_classes)
+
+        class_weight_dict = {
+            "up_intensity": up_weights,
+            "down_intensity": down_weights,
+        }
+
+        logger.info(
+            "Class weights computed from training data: up_weights=%s, down_weights=%s",
+            {c: round(w, 4) for c, w in sorted(up_weights.items())},
+            {c: round(w, 4) for c, w in sorted(down_weights.items())},
+        )
 
     # Optional time-weighted sampling using exponential decay based on sample age
     # in days, configured via training.sample_weighting.
@@ -643,6 +742,9 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Dict[str, Any]) -
 
     if sample_weight_train is not None:
         fit_kwargs["sample_weight"] = [sample_weight_train, sample_weight_train]
+
+    if class_weight_dict is not None:
+        fit_kwargs["class_weight"] = class_weight_dict
 
     if x_val is not None and y_val is not None:
         fit_kwargs["validation_data"] = (x_val, y_val)

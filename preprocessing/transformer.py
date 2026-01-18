@@ -13,6 +13,7 @@ import numpy as np
 
 from .validator import validate_data_object
 from .time_utils import normalize_timestamp_array
+from .feature_engineering import FeatureEngineer
 
 
 logger = logging.getLogger(__name__)
@@ -579,6 +580,47 @@ def _build_targets_from_order_book(config: Dict[str, Any], data_object: Dict[str
     targets["labels_down_intensity"] = labels_down_intensity.tolist()
     targets["delta_t_seconds"] = prediction_horizon_seconds
     data_object["targets"] = targets
+
+    # Feature engineering: compute order book features and volume proxy per snapshot
+    # if enabled in configuration. These are stored for use by the training pipeline.
+    fe_cfg = config["preprocessing"].get("feature_engineering", {})
+    if isinstance(fe_cfg, dict) and fe_cfg.get("enabled"):
+        if collect_full_depth and snapshot_depth_data:
+            try:
+                feature_engineer = FeatureEngineer(config)
+
+                # Compute order book features per snapshot
+                snapshot_derived_features = []
+                volume_proxy_values = []
+
+                for depth_dict in snapshot_depth_data:
+                    ob_features = feature_engineer.compute_order_book_features(depth_dict)
+                    snapshot_derived_features.append(ob_features)
+
+                    vol_proxy = feature_engineer.compute_volume_proxy(depth_dict)
+                    volume_proxy_values.append(vol_proxy)
+
+                target_book["snapshot_derived_features"] = snapshot_derived_features
+                target_book["volume_proxy"] = volume_proxy_values
+                order_books[target_asset] = target_book
+                data_object["order_books"] = order_books
+
+                logger.info(
+                    "Feature engineering completed: num_snapshots=%s, "
+                    "order_book_features=%s, volume_proxy_method=%s",
+                    len(snapshot_derived_features),
+                    feature_engineer._order_book_features,
+                    feature_engineer._volume_proxy_method,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Feature engineering failed: %s. Continuing without derived features.",
+                    exc,
+                )
+        else:
+            logger.info(
+                "Feature engineering skipped: snapshot_depth_data not available."
+            )
 
     logger.info(
         "Targets constructed for asset=%s. num_samples=%s, horizon_seconds=%s, num_classes=%s",

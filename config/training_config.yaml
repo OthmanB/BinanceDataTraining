@@ -140,15 +140,23 @@ preprocessing:  # Controls normalization, feature engineering, and dataset split
     fit_on_train_only: true   # When true, compute normalization statistics on the training split only and reuse for val/test.
 
   feature_engineering:
+    enabled: true                    # When true, compute derived features from order book data.
     order_book_features:
-      - "bid_ask_spread"   # Spread features derived from best bid/ask.
-      - "volume_imbalance" # Imbalance between bid and ask quantities.
-      - "depth_imbalance"  # Imbalance across multiple depth levels.
-      - "weighted_mid_price"  # Price feature combining bid/ask with volume weights.
+      - "bid_ask_spread"             # Spread features derived from best bid/ask.
+      - "volume_imbalance"           # Imbalance between bid and ask quantities.
+      - "depth_imbalance"            # Imbalance across multiple depth levels.
+      - "weighted_mid_price"         # Price feature combining bid/ask with volume weights.
 
     derived_features:
-      - "price_momentum"   # Past price change magnitudes used as additional signals.
-      - "volume_momentum"  # Past volume change magnitudes used as additional signals.
+      - "price_momentum"             # Past price change magnitudes used as additional signals.
+      - "volume_momentum"            # Past volume change magnitudes used as additional signals.
+
+    momentum_window_seconds: 300     # Window for momentum calculations; must be <= visible_window_seconds.
+    volume_proxy_method: "top_of_book"  # Volume proxy: "top_of_book" or "total_depth".
+
+    edge_decay:
+      enabled: true                  # When true, apply decay to momentum features near t_min.
+      method: "linear"               # Edge decay method: "linear" or "exponential".
 
   train_test_split:
     method: "chronological"  # Splitting strategy; "chronological" preserves time ordering (no leakage from future to past).

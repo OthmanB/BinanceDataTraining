@@ -54,6 +54,9 @@ class TestGreptimeClient(unittest.TestCase):
                     "start_date": "2024-01-01",
                     "end_date": "2024-01-10",
                 },
+                "ingestion": {
+                    "chunk_hours": 240,  # 10 days - larger than date range to avoid chunking in test
+                },
                 "order_book": {
                     "schema": self._build_base_schema(),
                 },
@@ -116,6 +119,9 @@ class TestGreptimeClient(unittest.TestCase):
                 "time_range": {
                     "start_date": "2024-01-01",
                     "end_date": "2024-01-10",
+                },
+                "ingestion": {
+                    "chunk_hours": 24,
                 },
                 "order_book": {
                     "schema": self._build_base_schema(),
