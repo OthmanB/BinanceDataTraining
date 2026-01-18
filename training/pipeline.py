@@ -15,7 +15,10 @@ import logging
 import numpy as np
 
 from preprocessing.train_test_split import chronological_split_indices
-from preprocessing.snapshot_sequence_builder import build_top_of_book_sequence_tensor
+from preprocessing.snapshot_sequence_builder import (
+    build_top_of_book_sequence_tensor,
+    build_hybrid_depth_sequence_tensor,
+)
 from preprocessing.normalizer import create_normalizer_from_config
 from mlflow_integration.model_registry import register_model
 from .dataset_cache import compute_dataset_hash, cache_dataset_to_npz
@@ -143,8 +146,10 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Dict[str, Any]) -
         order_books = data_object["order_books"]
         target_book = order_books.get(target_asset, {})
         snapshot_features = target_book.get("snapshot_features") or []
+        snapshot_depth_data = target_book.get("snapshot_depth_data") or []
     except KeyError:
         snapshot_features = []
+        snapshot_depth_data = []
 
     x_train = None
     x_val = None
@@ -162,26 +167,60 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Dict[str, Any]) -
                 "metadata.anchor_indices must be populated by the preprocessing pipeline when snapshot_features are present",
             )
 
-        x_train = build_top_of_book_sequence_tensor(
-            config=config,
-            snapshot_features=snapshot_features,
-            anchor_indices=list(anchor_indices),
-            sample_indices=train_indices,
-            height=height,
-            width=width,
-            channels=channels,
-        )
+        # Check representation type to decide which tensor builder to use
+        order_book_cfg = data_cfg.get("order_book", {})
+        representation = str(order_book_cfg.get("representation", "top_of_book"))
 
-        if val_indices:
-            x_val = build_top_of_book_sequence_tensor(
+        if representation == "hybrid":
+            # Use hybrid depth tensor builder
+            if not snapshot_depth_data:
+                raise ValueError(
+                    "data.order_book.representation is 'hybrid' but snapshot_depth_data is empty. "
+                    "Ensure the preprocessing pipeline collected full depth data.",
+                )
+
+            logger.info(
+                "Building hybrid depth tensors (representation='hybrid'). depth_snapshots=%s",
+                len(snapshot_depth_data),
+            )
+
+            x_train = build_hybrid_depth_sequence_tensor(
+                config=config,
+                snapshot_depth_data=snapshot_depth_data,
+                anchor_indices=list(anchor_indices),
+                sample_indices=train_indices,
+            )
+
+            if val_indices:
+                x_val = build_hybrid_depth_sequence_tensor(
+                    config=config,
+                    snapshot_depth_data=snapshot_depth_data,
+                    anchor_indices=list(anchor_indices),
+                    sample_indices=val_indices,
+                )
+
+        else:
+            # Use top-of-book tensor builder (default)
+            x_train = build_top_of_book_sequence_tensor(
                 config=config,
                 snapshot_features=snapshot_features,
                 anchor_indices=list(anchor_indices),
-                sample_indices=val_indices,
+                sample_indices=train_indices,
                 height=height,
                 width=width,
                 channels=channels,
             )
+
+            if val_indices:
+                x_val = build_top_of_book_sequence_tensor(
+                    config=config,
+                    snapshot_features=snapshot_features,
+                    anchor_indices=list(anchor_indices),
+                    sample_indices=val_indices,
+                    height=height,
+                    width=width,
+                    channels=channels,
+                )
 
     else:
         if missing_snapshot_strategy == "fail":

@@ -270,12 +270,22 @@ def _build_targets_from_order_book(config: Dict[str, Any], data_object: Dict[str
             f"visible_window_seconds={visible_window_seconds}, cadence_seconds={cadence_seconds}",
         )
 
+    # Determine if we need full depth data for hybrid representation
+    order_book_cfg = data_cfg["order_book"]
+    representation = str(order_book_cfg.get("representation", "top_of_book"))
+    collect_full_depth = representation in ("hybrid", "full")
+    depth_levels = int(order_book_cfg.get("depth_levels", 1000))
+
     # Build mid-prices at the snapshot level by aggregating rows that share the
     # same timestamp. The batch_id column encodes a coarse time bucket and must
     # not be used to define snapshot identity.
+    #
+    # When collect_full_depth is True, we also collect all bid/ask levels per
+    # timestamp to support hybrid depth representation.
     snapshots = {}
     snapshot_features = []
     snapshot_timestamps = []
+    snapshot_depth_data = []  # List of dicts with full depth arrays per snapshot
     for row_index, row in enumerate(target_rows):
         if len(row) < 6:
             raise ValueError(
@@ -293,6 +303,9 @@ def _build_targets_from_order_book(config: Dict[str, Any], data_object: Dict[str
                 "best_bid_qty": None,
                 "best_ask_price": None,
                 "best_ask_qty": None,
+                # Full depth arrays for hybrid representation
+                "bid_levels": [],  # List of (price, qty) tuples
+                "ask_levels": [],  # List of (price, qty) tuples
             }
             snapshots[key] = snapshot_state
 
@@ -309,12 +322,18 @@ def _build_targets_from_order_book(config: Dict[str, Any], data_object: Dict[str
             if current_bid_price is None or bid_price > current_bid_price:
                 snapshot_state["best_bid_price"] = bid_price
                 snapshot_state["best_bid_qty"] = bid_qty
+            # Collect for full depth if needed
+            if collect_full_depth:
+                snapshot_state["bid_levels"].append((bid_price, bid_qty))
 
         if ask_price > 0.0 and ask_qty >= 0.0:
             current_ask_price = snapshot_state["best_ask_price"]
             if current_ask_price is None or ask_price < current_ask_price:
                 snapshot_state["best_ask_price"] = ask_price
                 snapshot_state["best_ask_qty"] = ask_qty
+            # Collect for full depth if needed
+            if collect_full_depth:
+                snapshot_state["ask_levels"].append((ask_price, ask_qty))
 
     if not snapshots:
         logger.info(
@@ -355,6 +374,37 @@ def _build_targets_from_order_book(config: Dict[str, Any], data_object: Dict[str
         ])
         snapshot_timestamps.append(ts_norm)
 
+        # Build depth data dict for this snapshot if collecting full depth
+        if collect_full_depth:
+            bid_levels = snapshot_state["bid_levels"]
+            ask_levels = snapshot_state["ask_levels"]
+
+            # Sort bids descending by price (best bid first)
+            bid_levels_sorted = sorted(bid_levels, key=lambda x: -x[0])
+            # Sort asks ascending by price (best ask first)
+            ask_levels_sorted = sorted(ask_levels, key=lambda x: x[0])
+
+            # Initialize arrays with zeros, then fill from sorted levels
+            bid_prices = np.zeros(depth_levels, dtype="float64")
+            bid_quantities = np.zeros(depth_levels, dtype="float64")
+            ask_prices = np.zeros(depth_levels, dtype="float64")
+            ask_quantities = np.zeros(depth_levels, dtype="float64")
+
+            for i, (p, q) in enumerate(bid_levels_sorted[:depth_levels]):
+                bid_prices[i] = p
+                bid_quantities[i] = q
+
+            for i, (p, q) in enumerate(ask_levels_sorted[:depth_levels]):
+                ask_prices[i] = p
+                ask_quantities[i] = q
+
+            snapshot_depth_data.append({
+                "bid_prices": bid_prices,
+                "bid_quantities": bid_quantities,
+                "ask_prices": ask_prices,
+                "ask_quantities": ask_quantities,
+            })
+
     if not mid_price_values:
         logger.info(
             "Target construction skipped: no snapshots with valid mid-prices for target asset %s.",
@@ -379,6 +429,13 @@ def _build_targets_from_order_book(config: Dict[str, Any], data_object: Dict[str
 
     target_book["snapshot_features"] = snapshot_features
     target_book["snapshot_timestamps"] = snapshot_timestamps
+    if collect_full_depth and snapshot_depth_data:
+        target_book["snapshot_depth_data"] = snapshot_depth_data
+        logger.info(
+            "Collected full depth data for hybrid representation: num_snapshots=%s, depth_levels=%s",
+            len(snapshot_depth_data),
+            depth_levels,
+        )
     order_books[target_asset] = target_book
     data_object["order_books"] = order_books
 
