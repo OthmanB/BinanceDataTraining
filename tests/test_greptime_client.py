@@ -17,7 +17,7 @@ class TestGreptimeClient(unittest.TestCase):
 
     @mock.patch("data.greptime_client.requests.post")
     def test_fetch_order_book_rows_multi_database_time_split(self, mock_post) -> None:
-        def fake_post(url, data=None, headers=None):  # type: ignore[override]
+        def fake_post(url, data=None, headers=None, timeout=None):  # type: ignore[override]
             if "db1" in url:
                 rows = [["db1_row1"], ["db1_row2"]]
             else:
@@ -65,6 +65,10 @@ class TestGreptimeClient(unittest.TestCase):
                             "name": "historical",
                             "database_uri": "http://db1",
                             "table_prefix": "orderbook_",
+                            "request_timeout_seconds": 30,
+                            "connect_timeout_seconds": 10,
+                            "max_retries": 3,
+                            "retry_backoff_factor": 0.5,
                             "time_range": {
                                 "start_date": "2024-01-01",
                                 "end_date": "2024-01-05",
@@ -74,6 +78,10 @@ class TestGreptimeClient(unittest.TestCase):
                             "name": "recent",
                             "database_uri": "http://db2",
                             "table_prefix": "orderbook_",
+                            "request_timeout_seconds": 30,
+                            "connect_timeout_seconds": 10,
+                            "max_retries": 3,
+                            "retry_backoff_factor": 0.5,
                             "time_range": {
                                 "start_date": "2024-01-06",
                                 "end_date": "2024-01-10",
@@ -120,6 +128,10 @@ class TestGreptimeClient(unittest.TestCase):
                             "name": "db1",
                             "database_uri": "http://db1",
                             "table_prefix": "orderbook_",
+                            "request_timeout_seconds": 30,
+                            "connect_timeout_seconds": 10,
+                            "max_retries": 3,
+                            "retry_backoff_factor": 0.5,
                             "time_range": {
                                 "start_date": "2024-01-01",
                                 "end_date": "2024-01-08",
@@ -129,6 +141,10 @@ class TestGreptimeClient(unittest.TestCase):
                             "name": "db2",
                             "database_uri": "http://db2",
                             "table_prefix": "orderbook_",
+                            "request_timeout_seconds": 30,
+                            "connect_timeout_seconds": 10,
+                            "max_retries": 3,
+                            "retry_backoff_factor": 0.5,
                             "time_range": {
                                 "start_date": "2024-01-07",
                                 "end_date": "2024-01-10",
