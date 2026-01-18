@@ -20,10 +20,6 @@ logger = logging.getLogger(__name__)
 
 def run_preprocessing_pipeline(config: Dict[str, Any], data_object: Dict[str, Any]) -> Dict[str, Any]:
     """Run the preprocessing pipeline on a DataObject.
-
-    Phase 2 implementation only performs structural validation and returns the
-    DataObject unchanged. Future phases will add numeric transformations and
-    feature engineering steps informed by the configuration.
     """
 
     validate_data_object(data_object)

@@ -23,6 +23,19 @@ import requests
 logger = logging.getLogger(__name__)
 
 
+def _get_timeout_config(conn_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract HTTP timeout configuration from connection config.
+
+    All timeout parameters are required in YAML; no defaults are applied here.
+    """
+    return {
+        "request_timeout_seconds": int(conn_cfg["request_timeout_seconds"]),
+        "connect_timeout_seconds": int(conn_cfg["connect_timeout_seconds"]),
+        "max_retries": int(conn_cfg["max_retries"]),
+        "retry_backoff_factor": float(conn_cfg["retry_backoff_factor"]),
+    }
+
+
 def check_greptime_connectivity(config: Dict[str, Any]) -> None:
     """Check connectivity to GreptimeDB using the HTTP SQL API.
 
@@ -61,22 +74,27 @@ def check_greptime_connectivity(config: Dict[str, Any]) -> None:
         for conn in connections:
             base_uri = conn["database_uri"]
             table_prefix = conn["table_prefix"]
+            timeout_cfg = _get_timeout_config(conn)
 
-            _check_greptime_connectivity_for_connection(str(base_uri), str(table_prefix), assets)
+            _check_greptime_connectivity_for_connection(str(base_uri), str(table_prefix), assets, timeout_cfg)
     else:
         conn_cfg = data_cfg["connection"]
         base_uri = conn_cfg["database_uri"]
         table_prefix = conn_cfg["table_prefix"]
+        timeout_cfg = _get_timeout_config(conn_cfg)
 
-        _check_greptime_connectivity_for_connection(str(base_uri), str(table_prefix), assets)
+        _check_greptime_connectivity_for_connection(str(base_uri), str(table_prefix), assets, timeout_cfg)
 
 
 def _check_greptime_connectivity_for_connection(
     base_uri: str,
     table_prefix: str,
     assets: List[str],
+    timeout_cfg: Dict[str, Any],
 ) -> None:
     url = base_uri.rstrip("/") + "/v1/sql"
+    connect_timeout = timeout_cfg["connect_timeout_seconds"]
+    request_timeout = timeout_cfg["request_timeout_seconds"]
 
     for asset in assets:
         table_name = f"{table_prefix}{asset.lower()}"
@@ -93,6 +111,7 @@ def _check_greptime_connectivity_for_connection(
                 url,
                 data={"sql": sql},
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=(connect_timeout, request_timeout),
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("GreptimeDB connectivity check failed for table %s: %s", table_name, exc)
@@ -199,6 +218,7 @@ def fetch_order_book_rows(config: Dict[str, Any]) -> Dict[str, List[List[Any]]]:
 
             base_uri = conn["database_uri"]
             table_prefix = conn["table_prefix"]
+            timeout_cfg = _get_timeout_config(conn)
 
             _fetch_order_book_rows_for_connection(
                 str(base_uri),
@@ -208,11 +228,13 @@ def fetch_order_book_rows(config: Dict[str, Any]) -> Dict[str, List[List[Any]]]:
                 constrained_end,
                 schema_cfg,
                 rows_by_asset,
+                timeout_cfg,
             )
     else:
         conn_cfg = data_cfg["connection"]
         base_uri = conn_cfg["database_uri"]
         table_prefix = conn_cfg["table_prefix"]
+        timeout_cfg = _get_timeout_config(conn_cfg)
 
         _fetch_order_book_rows_for_connection(
             str(base_uri),
@@ -222,6 +244,7 @@ def fetch_order_book_rows(config: Dict[str, Any]) -> Dict[str, List[List[Any]]]:
             global_end_date,
             schema_cfg,
             rows_by_asset,
+            timeout_cfg,
         )
 
     return rows_by_asset
@@ -235,6 +258,7 @@ def _fetch_order_book_rows_for_connection(
     end_date: str,
     schema_cfg: Dict[str, Any],
     rows_by_asset: Dict[str, List[List[Any]]],
+    timeout_cfg: Dict[str, Any],
 ) -> None:
     ts_col = schema_cfg["timestamp_column"]
     bid_price_col = schema_cfg["bid_price_column"]
@@ -244,6 +268,8 @@ def _fetch_order_book_rows_for_connection(
     batch_id_col = schema_cfg["batch_id_column"]
 
     url = base_uri.rstrip("/") + "/v1/sql"
+    connect_timeout = timeout_cfg["connect_timeout_seconds"]
+    request_timeout = timeout_cfg["request_timeout_seconds"]
 
     for asset in assets:
         table_name = f"{table_prefix}{asset.lower()}"
@@ -273,6 +299,7 @@ def _fetch_order_book_rows_for_connection(
                 url,
                 data={"sql": sql},
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=(connect_timeout, request_timeout),
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(

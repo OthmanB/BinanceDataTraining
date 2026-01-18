@@ -1,8 +1,5 @@
 """Temporal feature construction stubs.
 
-Phase 2 defines a placeholder for attaching temporal features to DataObject
-instances. Detailed implementations will follow the temporal encoding
-configuration in later phases.
 """
 
 from typing import Any, Dict, List, Tuple

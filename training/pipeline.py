@@ -16,6 +16,7 @@ import numpy as np
 
 from preprocessing.train_test_split import chronological_split_indices
 from preprocessing.snapshot_sequence_builder import build_top_of_book_sequence_tensor
+from preprocessing.normalizer import create_normalizer_from_config
 from mlflow_integration.model_registry import register_model
 from .dataset_cache import compute_dataset_hash, cache_dataset_to_npz
 from .callbacks import create_callbacks
@@ -325,6 +326,36 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Dict[str, Any]) -
                 n_samples,
                 tf_all.shape[1],
             )
+
+    # Apply normalization to the input tensors based on preprocessing.normalization config.
+    # Normalization statistics are computed on training data only when fit_on_train_only is true.
+    normalization_cfg = config["preprocessing"]["normalization"]
+    fit_on_train_only = bool(normalization_cfg["fit_on_train_only"])
+
+    normalizer = create_normalizer_from_config(config)
+
+    if fit_on_train_only:
+        # Fit normalizer on training data only, then transform both train and val
+        x_train = normalizer.fit_transform(x_train)
+        if x_val is not None:
+            x_val = normalizer.transform(x_val)
+        logger.info(
+            "Applied normalization (method=%s, fit_on_train_only=True): x_train.shape=%s",
+            normalizer.method,
+            x_train.shape,
+        )
+    else:
+        # Fit and transform training data, fit and transform validation data separately
+        x_train = normalizer.fit_transform(x_train)
+        if x_val is not None:
+            # Create a new normalizer for validation data
+            val_normalizer = create_normalizer_from_config(config)
+            x_val = val_normalizer.fit_transform(x_val)
+        logger.info(
+            "Applied normalization (method=%s, fit_on_train_only=False): x_train.shape=%s",
+            normalizer.method,
+            x_train.shape,
+        )
 
     # Infer the model input shape from the constructed training tensor. This
     # must have rank 5: (N, T, H, W, C), so input_shape=(T, H, W, C).

@@ -24,6 +24,14 @@ sections:
         type: string
       connection.table_prefix:
         type: string
+      connection.request_timeout_seconds:
+        type: integer
+      connection.connect_timeout_seconds:
+        type: integer
+      connection.max_retries:
+        type: integer
+      connection.retry_backoff_factor:
+        type: number
       multi_database.enabled:
         type: boolean
       multi_database.strategy:
@@ -45,6 +53,12 @@ sections:
       order_book.depth_levels:
         type: integer
       order_book.representation:
+        type: string
+      order_book.hybrid.raw_levels:
+        type: integer
+      order_book.hybrid.aggregated_bins:
+        type: integer
+      order_book.hybrid.bin_strategy:
         type: string
       order_book.schema.timestamp_column:
         type: string

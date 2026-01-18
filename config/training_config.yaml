@@ -37,6 +37,10 @@ data:  # Controls where raw data come from and over which time windows.
   connection:
     database_uri: "${DATABASE_URI}"  # URI of the main GreptimeDB instance; resolved from DATABASE_URI env var.
     table_prefix: "orderbook_"  # Common table name prefix; full table names typically prefix + asset symbol.
+    request_timeout_seconds: 30     # Timeout for HTTP requests to GreptimeDB (seconds).
+    connect_timeout_seconds: 10     # Timeout for establishing HTTP connection (seconds).
+    max_retries: 3                  # Number of retry attempts on transient failures.
+    retry_backoff_factor: 0.5       # Exponential backoff multiplier between retries.
 
   multi_database:
     enabled: false  # When true, use multiple database connections below and split time by connection; when false, use single "connection" above.
@@ -76,6 +80,10 @@ data:  # Controls where raw data come from and over which time windows.
   order_book:
     depth_levels: 1000  # Maximum number of price levels per side to ingest for order-book snapshots.
     representation: "hybrid"  # Order-book representation strategy: "full", "aggregated", or "hybrid" (current model expects hybrid).
+    hybrid:
+      raw_levels: 50           # Keep top N levels as-is (must be < depth_levels).
+      aggregated_bins: 50      # Number of bins for deeper levels (must be > 0).
+      bin_strategy: "equal_width"  # Binning strategy: "equal_width" or "log_spaced" for bin distribution.
     schema:
       timestamp_column: "ts"           # Column name in the DB table containing snapshot timestamps.
       bid_price_column: "bid_price"    # Column storing best (or aggregated) bid prices.
