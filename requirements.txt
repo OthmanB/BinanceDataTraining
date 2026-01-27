@@ -26,3 +26,6 @@ tensorflow==2.15.0; sys_platform == "linux" and python_version >= "3.9" and pyth
 # but you can pin them here if you want deterministic versions.
 # numpy==1.26.4
 # pandas==2.2.2
+
+# tests
+pytest>=9.0.2
