@@ -43,6 +43,18 @@ sections:
         type: string
       asset_pairs.correlated_assets:
         type: list
+      asset_pairs.alignment.method:
+        type: string
+      asset_pairs.alignment.missing_policy_small:
+        type: string
+      asset_pairs.alignment.missing_policy_large:
+        type: string
+      asset_pairs.alignment.large_gap_seconds:
+        type: integer
+      asset_pairs.alignment.bucket_tolerance_seconds:
+        type: number
+      asset_pairs.alignment.include_mask_channel:
+        type: boolean
       ingestion.chunk_hours:
         type: integer
       ingestion.chunk_delay_seconds:

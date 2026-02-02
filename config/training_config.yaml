@@ -63,6 +63,13 @@ data:  # Controls where raw data come from and over which time windows.
   asset_pairs:
     target_asset: "BTCUSDT"  # Primary asset whose future price movement is being predicted.
     correlated_assets: []
+    alignment:
+      method: "interpolate"  # Alignment strategy: "interpolate" (default) or "bucket".
+      missing_policy_small: "interpolate"  # Small gap handling: "interpolate", "forward_fill", "skip", "error".
+      missing_policy_large: "zero_pad"  # Large gap handling: "zero_pad", "skip", "error".
+      large_gap_seconds: 600  # Large gap threshold in seconds for zero-padding.
+      bucket_tolerance_seconds: 2  # Alignment tolerance for bucket method (seconds).
+      include_mask_channel: true  # Append per-asset confidence mask channels (0..1) to inputs.
 
   time_range:
     start_date: "2024-01-01"  # Logical start of the dataset for this run (inclusive); used when querying raw rows.

@@ -49,6 +49,7 @@ def _snapshot_config_subset(config: Dict[str, Any]) -> Dict[str, Any]:
                 "hybrid": data_cfg.get("order_book", {}).get("hybrid"),
             },
             "temporal_features": data_cfg.get("temporal_features"),
+            "alignment": data_cfg.get("asset_pairs", {}).get("alignment"),
         },
         "targets": {
             "prediction_horizon_seconds": targets_cfg.get("prediction_horizon_seconds"),
