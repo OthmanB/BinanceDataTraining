@@ -1,7 +1,7 @@
 import unittest
 from unittest import mock
 
-from data.greptime_client import fetch_order_book_rows
+from data.greptime_client import fetch_order_book_rows, stream_order_book_chunks
 
 
 class TestGreptimeClient(unittest.TestCase):
@@ -56,6 +56,8 @@ class TestGreptimeClient(unittest.TestCase):
                 },
                 "ingestion": {
                     "chunk_hours": 240,  # 10 days - larger than date range to avoid chunking in test
+                    "chunk_delay_seconds": 0.0,
+                    "max_concurrent_chunk_fetches": 1,
                 },
                 "order_book": {
                     "schema": self._build_base_schema(),
@@ -122,6 +124,8 @@ class TestGreptimeClient(unittest.TestCase):
                 },
                 "ingestion": {
                     "chunk_hours": 24,
+                    "chunk_delay_seconds": 0.0,
+                    "max_concurrent_chunk_fetches": 1,
                 },
                 "order_book": {
                     "schema": self._build_base_schema(),
@@ -163,6 +167,42 @@ class TestGreptimeClient(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             fetch_order_book_rows(config)
+
+    def test_stream_order_book_chunks_rejects_concurrent(self) -> None:
+        config = {
+            "data": {
+                "asset_pairs": {
+                    "target_asset": "BTCUSDT",
+                    "correlated_assets": [],
+                },
+                "time_range": {
+                    "start_date": "2024-01-01",
+                    "end_date": "2024-01-02",
+                },
+                "ingestion": {
+                    "chunk_hours": 24,
+                    "chunk_delay_seconds": 0.0,
+                    "max_concurrent_chunk_fetches": 2,
+                },
+                "order_book": {
+                    "schema": self._build_base_schema(),
+                },
+                "connection": {
+                    "database_uri": "http://db",
+                    "table_prefix": "orderbook_",
+                    "request_timeout_seconds": 30,
+                    "connect_timeout_seconds": 10,
+                    "max_retries": 3,
+                    "retry_backoff_factor": 0.5,
+                },
+                "multi_database": {
+                    "enabled": False,
+                },
+            },
+        }
+
+        with self.assertRaises(ValueError):
+            next(stream_order_book_chunks(config))
 
 
 if __name__ == "__main__":  # pragma: no cover
