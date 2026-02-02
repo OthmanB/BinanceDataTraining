@@ -16,6 +16,7 @@ No model training is performed yet.
 """
 
 import sys
+from typing import Any, Dict
 from datetime import datetime
 
 from utils.config_loader import ConfigError, load_config
@@ -30,6 +31,21 @@ from training import run_training_pipeline
 from evaluation import evaluate_model
 from mlflow_integration import start_run, end_run
 from models.hyperparameter_tuning import run_hyperparameter_search
+
+
+def _enforce_production_sample_cap(config: Dict[str, Any], n_samples: int) -> None:
+    run_mode_cfg = config.get("run_mode", {})
+    mode = str(run_mode_cfg.get("mode"))
+    if mode != "production":
+        return
+
+    training_cfg = config.get("training", {})
+    debug_max_samples = int(training_cfg.get("debug_max_samples", 0))
+    if debug_max_samples < n_samples:
+        raise ConfigError(
+            "training.debug_max_samples must be >= metadata.num_samples when run_mode.mode='production'. "
+            f"debug_max_samples={debug_max_samples}, num_samples={n_samples}."
+        )
 
 
 def main() -> int:
@@ -79,56 +95,81 @@ def main() -> int:
         logger.error("Failed to start MLFlow run: %s", exc)
         return 1
 
-    # Phase 2: execute data pipeline skeleton inside the MLFlow run
-    try:
-        data_object = load_order_book_data(config)
-        data_object = run_preprocessing_pipeline(config, data_object)
-        data_object = attach_temporal_features(config, data_object)
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Data pipeline (Phase 2 skeleton) failed: %s", exc)
-        end_run()
-        return 1
+    snapshot_cfg = config.get("snapshot", {})
+    snapshot_enabled = bool(snapshot_cfg.get("enabled"))
 
-    metadata = data_object["metadata"]
-    n_samples = int(metadata["num_samples"])
+    data_object = None
 
-    split_cfg = config["preprocessing"]["train_test_split"]
-    train_ratio = float(split_cfg["train_ratio"])
-    validation_ratio = float(split_cfg["validation_ratio"])
-    test_ratio = float(split_cfg["test_ratio"])
+    if not snapshot_enabled:
+        # Phase 2: execute data pipeline skeleton inside the MLFlow run
+        try:
+            data_object = load_order_book_data(config)
+            data_object = run_preprocessing_pipeline(config, data_object)
+            data_object = attach_temporal_features(config, data_object)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Data pipeline (Phase 2 skeleton) failed: %s", exc)
+            end_run()
+            return 1
 
-    train_idx, val_idx, test_idx = chronological_split_indices(
-        n_samples,
-        train_ratio,
-        validation_ratio,
-        test_ratio,
-    )
+        metadata = data_object["metadata"]
+        n_samples = int(metadata["num_samples"])
 
-    logger.info(
-        "Configuration loaded and environment validated successfully. "
-        f"MLFlow tracking_uri={mlflow_cfg.get('tracking_uri')}, "
-        f"experiment_name={mlflow_cfg.get('experiment_name')}"
-    )
-    logger.info(
-        "Phase 2 data pipeline summary: n_samples=%d, train=%d, val=%d, test=%d",
-        n_samples,
-        len(train_idx),
-        len(val_idx),
-        len(test_idx),
-    )
-    logger.info("Phase 2 setup complete. Invoking data diagnostics stage before training.")
+        try:
+            _enforce_production_sample_cap(config, n_samples)
+        except ConfigError as exc:
+            logger.error("Production safety check failed: %s", exc)
+            end_run()
+            return 1
 
-    try:
-        run_data_diagnostics(config, data_object, train_idx, val_idx, test_idx)
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Data diagnostics stage failed: %s", exc)
+        split_cfg = config["preprocessing"]["train_test_split"]
+        train_ratio = float(split_cfg["train_ratio"])
+        validation_ratio = float(split_cfg["validation_ratio"])
+        test_ratio = float(split_cfg["test_ratio"])
 
-    logger.info("Data diagnostics stage complete. Invoking training pipeline (Phase 3 minimal).")
+        train_idx, val_idx, test_idx = chronological_split_indices(
+            n_samples,
+            train_ratio,
+            validation_ratio,
+            test_ratio,
+        )
+
+        logger.info(
+            "Configuration loaded and environment validated successfully. "
+            f"MLFlow tracking_uri={mlflow_cfg.get('tracking_uri')}, "
+            f"experiment_name={mlflow_cfg.get('experiment_name')}"
+        )
+        logger.info(
+            "Phase 2 data pipeline summary: n_samples=%d, train=%d, val=%d, test=%d",
+            n_samples,
+            len(train_idx),
+            len(val_idx),
+            len(test_idx),
+        )
+        logger.info("Phase 2 setup complete. Invoking data diagnostics stage before training.")
+
+        try:
+            run_data_diagnostics(config, data_object, train_idx, val_idx, test_idx)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Data diagnostics stage failed: %s", exc)
+
+        logger.info("Data diagnostics stage complete. Invoking training pipeline (Phase 3 minimal).")
+    else:
+        logger.info(
+            "Snapshot mode enabled; skipping Phase 2 in-memory data pipeline and diagnostics.",
+        )
 
     config_for_training = config
 
     hpo_cfg = config.get("hyperparameter_optimization")
     if isinstance(hpo_cfg, dict) and hpo_cfg.get("enabled"):
+        if snapshot_enabled:
+            logger.error("Hyperparameter optimization is not supported when snapshot.enabled is true.")
+            end_run()
+            return 1
+        if data_object is None:
+            logger.error("Hyperparameter optimization requires a populated data_object.")
+            end_run()
+            return 1
         logger.info("Hyperparameter optimization is enabled; running search before final training.")
         try:
             best_config = run_hyperparameter_search(config, data_object)
@@ -159,15 +200,22 @@ def main() -> int:
         end_run()
         return 0
 
-    logger.info("Phase 3 training complete. Invoking evaluation pipeline (Phase 4 minimal).")
+    if snapshot_enabled:
+        logger.info(
+            "Snapshot mode enabled; skipping evaluation pipeline until snapshot evaluation is implemented.",
+        )
+    else:
+        logger.info("Phase 3 training complete. Invoking evaluation pipeline (Phase 4 minimal).")
 
-    # Phase 4: evaluation pipeline (runs inside the same MLFlow run)
-    try:
-        evaluate_model(config_for_training, model, data_object)
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Evaluation pipeline (Phase 4 minimal) failed: %s", exc)
-        end_run()
-        return 1
+        # Phase 4: evaluation pipeline (runs inside the same MLFlow run)
+        try:
+            if data_object is None:
+                raise ValueError("Evaluation pipeline requires a populated data_object")
+            evaluate_model(config_for_training, model, data_object)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Evaluation pipeline (Phase 4 minimal) failed: %s", exc)
+            end_run()
+            return 1
 
     # Close MLFlow run
     end_run()

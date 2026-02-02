@@ -12,6 +12,7 @@
 #   - preprocessing: controls normalization, train/validation/test splitting, etc.
 #   - model: specifies the CNN+LSTM architecture and compilation options.
 #   - training: sets batch size, epochs, weighting, dataset caching, and callbacks.
+#   - snapshot: controls derived dataset snapshots for streaming training.
 #   - hyperparameter_optimization: Optuna search behaviour and search space.
 #   - mlflow: experiment tracking options and model registry settings.
 #   - evaluation: post-training evaluation and calibration analysis.
@@ -61,13 +62,7 @@ data:  # Controls where raw data come from and over which time windows.
 
   asset_pairs:
     target_asset: "BTCUSDT"  # Primary asset whose future price movement is being predicted.
-    correlated_assets:
-      - "ETHUSDT"  # Additional asset whose order-book data may be used as input features.
-      - "BNBUSDT"  # Additional correlated asset.
-      - "ADAUSDT"  # Additional correlated asset.
-      - "ETHBTC"   # Cross pair correlated with target.
-      - "BNBBTC"   # Cross pair correlated with target.
-      - "ADABTC"   # Cross pair correlated with target.
+    correlated_assets: []
 
   time_range:
     start_date: "2024-01-01"  # Logical start of the dataset for this run (inclusive); used when querying raw rows.
@@ -76,13 +71,15 @@ data:  # Controls where raw data come from and over which time windows.
 
   ingestion:
     chunk_hours: 12  # Physical time span per query chunk; trade-off between request size and number of round trips.
+    chunk_delay_seconds: 0.5  # Sleep between chunk fetches to reduce pressure on live writes.
+    max_concurrent_chunk_fetches: 1  # Concurrency cap for chunk fetches; keep at 1 for low DB load.
 
   order_book:
-    depth_levels: 1000  # Maximum number of price levels per side to ingest for order-book snapshots.
+    depth_levels: 50  # Maximum number of price levels per side to ingest for order-book snapshots.
     representation: "hybrid"  # Order-book representation strategy: "full", "aggregated", or "hybrid" (current model expects hybrid).
     hybrid:
-      raw_levels: 50           # Keep top N levels as-is (must be < depth_levels).
-      aggregated_bins: 50      # Number of bins for deeper levels (must be > 0).
+      raw_levels: 10           # Keep top N levels as-is (must be < depth_levels).
+      aggregated_bins: 10      # Number of bins for deeper levels (must be > 0).
       bin_strategy: "equal_width"  # Binning strategy: "equal_width" or "log_spaced" for bin distribution.
     schema:
       timestamp_column: "ts"           # Column name in the DB table containing snapshot timestamps.
@@ -121,7 +118,7 @@ data:  # Controls where raw data come from and over which time windows.
 # Target Configuration
 targets:  # Defines what future event the model predicts and how labels are constructed.
   prediction_horizon_seconds: 1800  # Prediction horizon in seconds (here: 30 minutes ahead price change).
-  visible_window_seconds: 3600      # Length of past window (in seconds) visible to the model when forming a prediction.
+  visible_window_seconds: 600      # Length of past window (in seconds) visible to the model when forming a prediction.
 
   price_classes:
     definition_type: "percentage"  # How price-move bins are defined: by percentage, absolute size, or adaptive rules.
@@ -212,10 +209,10 @@ model:  # Defines the neural network architecture and its compilation settings.
 
 # Training Configuration
 training:  # Controls how the model is fit on the prepared dataset.
-  epochs: 50                    # Maximum number of passes over the training data (early stopping may stop earlier).
-  batch_size: 128               # Number of samples per gradient update.
+  epochs: 3                    # Maximum number of passes over the training data (early stopping may stop earlier).
+  batch_size: 16               # Number of samples per gradient update.
   validation_split: 0.15        # Must match preprocessing.train_test_split.validation_ratio in this phase.
-  debug_max_samples: 40000      # Hard cap on chronological training samples; raise for full runs, lower for quick experiments.
+  debug_max_samples: 200      # Hard cap on chronological training samples; raise for full runs, lower for quick experiments.
   missing_snapshot_strategy: "fail"  # Behaviour when snapshot-based inputs are unavailable: "fail", "skip", or "synthetic".
 
   dataset_cache:
@@ -239,7 +236,7 @@ training:  # Controls how the model is fit on the prepared dataset.
       min_lr: 0.00001         # Lower bound on the learning rate.
 
   class_weights:
-    compute_from_train: true  # When true, compute class weights from the training data (not yet fully integrated into loss).
+    compute_from_train: false  # When true, compute class weights from the training data (not yet fully integrated into loss).
 
   sample_weighting:
     enabled: false                 # When true, apply time-based exponential decay weights to samples.
@@ -251,6 +248,15 @@ training:  # Controls how the model is fit on the prepared dataset.
     enabled: false              # When true, resume training from a previously saved model instead of starting from scratch.
     base_model_run_id: null     # Required when fine_tuning.enabled is true; identifies the MLflow run/model to load.
     base_model_stage: "binance-model-training"  # MLflow experiment/stage or registry naming context for the base model.
+
+# Snapshot Configuration
+snapshot:  # Derived dataset snapshots for streaming training/restarts.
+  enabled: false  # When true, build or reuse a snapshot dataset from GreptimeDB chunk streams.
+  directory: "snapshots"  # Root directory for snapshot datasets.
+  root_name: "baseline"  # Required root name for snapshot directories.
+  name: "auto"  # "auto" uses root_name + config hash + time range; or set a custom name.
+  on_config_mismatch: "create_new"  # "create_new" or "error" when a snapshot name already exists.
+  max_snapshots: 5  # Keep most recent N snapshots; <=0 keeps all snapshots.
 
 # Hyperparameter Optimization Configuration
 hyperparameter_optimization:  # Controls Optuna-based search over selected hyperparameters.

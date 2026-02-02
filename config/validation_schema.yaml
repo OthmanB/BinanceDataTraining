@@ -6,6 +6,7 @@ required_sections:
   - preprocessing
   - model
   - training
+  - snapshot
   - hyperparameter_optimization
   - mlflow
   - evaluation
@@ -43,6 +44,10 @@ sections:
       asset_pairs.correlated_assets:
         type: list
       ingestion.chunk_hours:
+        type: integer
+      ingestion.chunk_delay_seconds:
+        type: number
+      ingestion.max_concurrent_chunk_fetches:
         type: integer
       time_range.start_date:
         type: string
@@ -231,6 +236,22 @@ sections:
         type: string
       dataset_cache.version:
         type: string
+
+  snapshot:
+    type: dict
+    required_keys:
+      enabled:
+        type: boolean
+      directory:
+        type: string
+      root_name:
+        type: string
+      name:
+        type: string
+      on_config_mismatch:
+        type: string
+      max_snapshots:
+        type: integer
 
   hyperparameter_optimization:
     type: dict

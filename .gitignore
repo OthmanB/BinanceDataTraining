@@ -1,3 +1,5 @@
+tmp/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -156,3 +158,5 @@ dmypy.json
 
 # Profiling data
 *.prof
+
+.opencode

@@ -17,7 +17,7 @@ VENV_DIR=".venv"
 PYTHON_BIN="${PYTHON_BIN:-}"
 
 if [ -z "${PYTHON_BIN}" ]; then
-  for candidate in python3.11 python3.10 python3.9 python3; do
+  for candidate in python3.12 python3.11 python3.10 python3.9 python3; do
     if command -v "${candidate}" >/dev/null 2>&1; then
       PYTHON_BIN="${candidate}"
       break
@@ -27,7 +27,7 @@ fi
 
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   echo "Error: No suitable Python interpreter found in PATH." >&2
-  echo "Install Python 3.11 (recommended) and retry." >&2
+  echo "Install Python 3.11 or 3.12 (recommended) and retry." >&2
   echo "macOS (Homebrew): brew install python@3.11" >&2
   echo "Ubuntu: sudo apt-get install python3.11 python3.11-venv" >&2
   exit 1
@@ -37,7 +37,7 @@ fi
 import sys
 
 min_required = (3, 9)
-max_allowed = (3, 12)
+max_allowed = (3, 13)
 if sys.version_info < min_required:
     raise SystemExit(
         f"Error: Python {min_required[0]}.{min_required[1]} or higher is required, "
@@ -63,7 +63,7 @@ if [ -x "${VENV_DIR}/bin/python" ]; then
 import sys
 
 min_required = (3, 9)
-max_allowed = (3, 12)
+max_allowed = (3, 13)
 if sys.version_info < min_required or sys.version_info >= max_allowed:
     raise SystemExit(1)
 EOF

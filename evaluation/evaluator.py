@@ -10,7 +10,11 @@ import tempfile
 import numpy as np
 
 from preprocessing.train_test_split import chronological_split_indices
-from preprocessing.snapshot_sequence_builder import build_top_of_book_sequence_tensor
+from preprocessing.snapshot_sequence_builder import (
+    build_top_of_book_sequence_tensor,
+    build_hybrid_depth_sequence_tensor,
+)
+from preprocessing.feature_engineering import FeatureEngineer
 from .calibration import compute_calibration_metrics
 
 
@@ -93,89 +97,198 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
     width = max(max(widths), min_width)
     channels = 1
 
-    # Map snapshot-level top-of-book features for the target asset into the
-    # evaluation tensor, using the same snapshot index space as the labels.
-    try:
-        data_cfg = config["data"]
-        asset_pairs_cfg = data_cfg["asset_pairs"]
-        target_asset = str(asset_pairs_cfg["target_asset"])
-        order_books = data_object["order_books"]
-        target_book = order_books.get(target_asset, {})
-        snapshot_features = target_book.get("snapshot_features") or []
-    except KeyError:
-        snapshot_features = []
+    # Map snapshot-level features for the target asset into the evaluation
+    # tensor, using the same snapshot index space as the labels.
+    data_cfg = config.get("data", {})
+    asset_pairs_cfg = data_cfg.get("asset_pairs", {})
+    target_asset = str(asset_pairs_cfg.get("target_asset") or "unknown")
+    order_books = data_object.get("order_books", {})
+    target_book: Dict[str, Any] = order_books.get(target_asset, {})
+    snapshot_features: list[Any] = target_book.get("snapshot_features") or []
+    snapshot_depth_data: list[Any] = target_book.get("snapshot_depth_data") or []
 
     eval_indices = test_idx[:eval_n]
     x_eval = None
 
-    if snapshot_features:
-        logger.info(
-            "Building evaluation inputs from snapshot_features (target_asset=%s). test_samples=%s, eval_n=%s",
-            target_asset,
-            len(test_idx),
-            eval_n,
+    order_book_cfg = data_cfg.get("order_book", {})
+    representation = str(order_book_cfg.get("representation", "top_of_book"))
+
+    anchor_indices = metadata.get("anchor_indices")
+    if anchor_indices is None:
+        raise ValueError(
+            "metadata.anchor_indices must be populated by the preprocessing pipeline when snapshot features are present",
         )
 
-        anchor_indices = metadata.get("anchor_indices")
-        if anchor_indices is None:
-            raise ValueError(
-                "metadata.anchor_indices must be populated by the preprocessing pipeline when snapshot_features are present",
-            )
-
-        x_eval = build_top_of_book_sequence_tensor(
-            config=config,
-            snapshot_features=snapshot_features,
-            anchor_indices=list(anchor_indices),
-            sample_indices=eval_indices,
-            height=height,
-            width=width,
-            channels=channels,
-        )
-    else:
-        if missing_snapshot_strategy == "fail":
-            raise ValueError(
-                "No snapshot_features available for evaluation inputs for target asset; "
-                "set evaluation.missing_snapshot_strategy to 'skip' or 'synthetic' to change this behavior.",
-            )
-
-        if missing_snapshot_strategy == "skip":
+    if representation == "hybrid":
+        if snapshot_depth_data:
             logger.info(
-                "No snapshot_features available for evaluation inputs; skipping evaluation stage because "
-                "evaluation.missing_snapshot_strategy='skip'.",
+                "Building evaluation inputs from snapshot_depth_data (target_asset=%s). test_samples=%s, eval_n=%s",
+                target_asset,
+                len(test_idx),
+                eval_n,
             )
-            return
+            x_eval = build_hybrid_depth_sequence_tensor(
+                config=config,
+                snapshot_depth_data=snapshot_depth_data,
+                anchor_indices=list(anchor_indices),
+                sample_indices=eval_indices,
+            )
+        else:
+            if missing_snapshot_strategy == "fail":
+                raise ValueError(
+                    "No snapshot_depth_data available for evaluation inputs for target asset; "
+                    "set evaluation.missing_snapshot_strategy to 'skip' or 'synthetic' to change this behavior.",
+                )
 
-        data_cfg = config["data"]
-        time_range_cfg = data_cfg["time_range"]
-        cadence_seconds = int(time_range_cfg["cadence_seconds"])
-        if cadence_seconds <= 0:
-            raise ValueError("data.time_range.cadence_seconds must be positive")
+            if missing_snapshot_strategy == "skip":
+                logger.info(
+                    "No snapshot_depth_data available for evaluation inputs; skipping evaluation stage because "
+                    "evaluation.missing_snapshot_strategy='skip'.",
+                )
+                return
 
-        targets_cfg = config["targets"]
-        visible_window_seconds = int(targets_cfg["visible_window_seconds"])
-        if visible_window_seconds <= 0:
-            raise ValueError("targets.visible_window_seconds must be positive")
-        if visible_window_seconds % cadence_seconds != 0:
-            raise ValueError(
-                "targets.visible_window_seconds must be an integer multiple of data.time_range.cadence_seconds",
+            time_range_cfg = data_cfg["time_range"]
+            cadence_seconds = int(time_range_cfg["cadence_seconds"])
+            if cadence_seconds <= 0:
+                raise ValueError("data.time_range.cadence_seconds must be positive")
+
+            targets_cfg = config["targets"]
+            visible_window_seconds = int(targets_cfg["visible_window_seconds"])
+            if visible_window_seconds <= 0:
+                raise ValueError("targets.visible_window_seconds must be positive")
+            if visible_window_seconds % cadence_seconds != 0:
+                raise ValueError(
+                    "targets.visible_window_seconds must be an integer multiple of data.time_range.cadence_seconds",
+                )
+
+            window_steps = visible_window_seconds // cadence_seconds
+            if window_steps <= 0:
+                raise ValueError(
+                    "Derived visible window length in steps must be at least one snapshot; "
+                    f"visible_window_seconds={visible_window_seconds}, cadence_seconds={cadence_seconds}",
+                )
+
+            logger.info(
+                "No snapshot_depth_data available for evaluation inputs; using synthetic inputs because "
+                "evaluation.missing_snapshot_strategy='synthetic'.",
+            )
+            effective_levels = snapshot_depth_data[0]["bid_prices"].shape[0] if snapshot_depth_data else 1
+            x_eval = np.random.randn(eval_n, window_steps, effective_levels, 4, 1).astype("float32")
+    else:
+        if snapshot_features:
+            logger.info(
+                "Building evaluation inputs from snapshot_features (target_asset=%s). test_samples=%s, eval_n=%s",
+                target_asset,
+                len(test_idx),
+                eval_n,
             )
 
-        window_steps = visible_window_seconds // cadence_seconds
-        if window_steps <= 0:
-            raise ValueError(
-                "Derived visible window length in steps must be at least one snapshot; "
-                f"visible_window_seconds={visible_window_seconds}, cadence_seconds={cadence_seconds}",
+            x_eval = build_top_of_book_sequence_tensor(
+                config=config,
+                snapshot_features=snapshot_features,
+                anchor_indices=list(anchor_indices),
+                sample_indices=eval_indices,
+                height=height,
+                width=width,
+                channels=channels,
             )
+        else:
+            if missing_snapshot_strategy == "fail":
+                raise ValueError(
+                    "No snapshot_features available for evaluation inputs for target asset; "
+                    "set evaluation.missing_snapshot_strategy to 'skip' or 'synthetic' to change this behavior.",
+                )
 
-        # missing_snapshot_strategy == "synthetic"
-        logger.info(
-            "No snapshot_features available for evaluation inputs; using synthetic inputs because "
-            "evaluation.missing_snapshot_strategy='synthetic'.",
-        )
-        x_eval = np.random.randn(eval_n, window_steps, height, width, channels).astype("float32")
+            if missing_snapshot_strategy == "skip":
+                logger.info(
+                    "No snapshot_features available for evaluation inputs; skipping evaluation stage because "
+                    "evaluation.missing_snapshot_strategy='skip'.",
+                )
+                return
+
+            time_range_cfg = data_cfg["time_range"]
+            cadence_seconds = int(time_range_cfg["cadence_seconds"])
+            if cadence_seconds <= 0:
+                raise ValueError("data.time_range.cadence_seconds must be positive")
+
+            targets_cfg = config["targets"]
+            visible_window_seconds = int(targets_cfg["visible_window_seconds"])
+            if visible_window_seconds <= 0:
+                raise ValueError("targets.visible_window_seconds must be positive")
+            if visible_window_seconds % cadence_seconds != 0:
+                raise ValueError(
+                    "targets.visible_window_seconds must be an integer multiple of data.time_range.cadence_seconds",
+                )
+
+            window_steps = visible_window_seconds // cadence_seconds
+            if window_steps <= 0:
+                raise ValueError(
+                    "Derived visible window length in steps must be at least one snapshot; "
+                    f"visible_window_seconds={visible_window_seconds}, cadence_seconds={cadence_seconds}",
+                )
+
+            logger.info(
+                "No snapshot_features available for evaluation inputs; using synthetic inputs because "
+                "evaluation.missing_snapshot_strategy='synthetic'.",
+            )
+            x_eval = np.random.randn(eval_n, window_steps, height, width, channels).astype("float32")
 
     if x_eval is None:
         raise ValueError("Evaluation inputs could not be constructed; x_eval is None")
+
+    # Optionally integrate feature engineering derived features into the input
+    # channels, mirroring the training pipeline behavior.
+    fe_cfg = config["preprocessing"].get("feature_engineering", {})
+    if isinstance(fe_cfg, dict) and fe_cfg.get("enabled"):
+        try:
+            feature_engineer = FeatureEngineer(config)
+
+            snapshot_derived_features = target_book.get("snapshot_derived_features")
+            volume_proxy = target_book.get("volume_proxy")
+            mid_prices_list = target_book.get("mid_prices")
+
+            if snapshot_derived_features and volume_proxy and mid_prices_list:
+                mid_prices_arr = np.asarray(mid_prices_list, dtype="float64")
+                anchor_indices_list = list(anchor_indices)
+                cadence_seconds = int(data_cfg["time_range"]["cadence_seconds"])
+
+                all_features = feature_engineer.compute_all_features(
+                    snapshot_depth_data=snapshot_depth_data,
+                    mid_prices=mid_prices_arr,
+                    anchor_indices=anchor_indices_list,
+                    cadence_seconds=cadence_seconds,
+                )
+
+                if all_features is not None and all_features.shape[0] > 0:
+                    fe_eval = all_features[eval_indices].astype("float32")
+
+                    if x_eval.ndim == 5:
+                        _, t_steps, h_dim, w_dim, _ = x_eval.shape
+                        fe_eval_exp = fe_eval[:, None, None, None, :]
+                        fe_eval_broadcast = np.broadcast_to(
+                            fe_eval_exp,
+                            (fe_eval.shape[0], t_steps, h_dim, w_dim, fe_eval.shape[1]),
+                        )
+                        x_eval = np.concatenate(
+                            [x_eval, fe_eval_broadcast.astype("float32")], axis=-1
+                        )
+
+                        logger.info(
+                            "Integrated feature engineering features into evaluation inputs: "
+                            "n_features=%s, x_eval.shape=%s",
+                            fe_eval.shape[1],
+                            x_eval.shape,
+                        )
+            else:
+                logger.info(
+                    "Feature engineering skipped for evaluation: missing snapshot_derived_features, "
+                    "volume_proxy, or mid_prices from preprocessing."
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Feature engineering integration failed during evaluation: %s. Continuing without derived features.",
+                exc,
+            )
 
     # Optionally integrate temporal features into the evaluation input channels
     # according to the model.input_representation.temporal_features
