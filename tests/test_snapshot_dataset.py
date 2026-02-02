@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from typing import Tuple, cast
 
 import numpy as np
 from hypothesis import given, strategies as st
@@ -11,6 +12,7 @@ from training.snapshot_dataset import (
     SnapshotDataset,
     SnapshotRecord,
     _compute_intensity_bins,
+    build_training_generator,
     compute_normalization_stats,
     iter_snapshot_batches,
 )
@@ -131,6 +133,8 @@ class TestSnapshotDataset(unittest.TestCase):
             expected_min = np.min(x_flat, axis=0)
             expected_max = np.max(x_flat, axis=0)
 
+            assert stats.min is not None
+            assert stats.max is not None
             np.testing.assert_allclose(stats.min, expected_min)
             np.testing.assert_allclose(stats.max, expected_max)
 
@@ -198,6 +202,69 @@ class TestSnapshotDataset(unittest.TestCase):
             result = np.concatenate(collected, axis=0)
             expected = np.concatenate([x1[2:3], x2[:2]], axis=0)
             np.testing.assert_allclose(result, expected)
+
+    def test_build_training_generator_with_weights(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            x = np.asarray(
+                [
+                    [[[[1.0]]]],
+                    [[[[2.0]]]],
+                    [[[[3.0]]]],
+                ],
+                dtype="float32",
+            )
+            y_up = np.asarray([0, 1, 1], dtype="int64")
+            y_down = np.asarray([0, 1, 1], dtype="int64")
+            anchor_ts = np.asarray([0, 86400, 2 * 86400], dtype="int64")
+
+            chunk_path = os.path.join(tmp_dir, "chunk.npz")
+            np.savez_compressed(chunk_path, x=x, y_up=y_up, y_down=y_down, anchor_ts=anchor_ts)
+
+            chunk = SnapshotChunk(
+                start="2024-01-01 00:00:00",
+                end="2024-01-01 01:00:00",
+                file_path=chunk_path,
+                num_samples=3,
+                start_index=0,
+            )
+            dataset = SnapshotDataset(
+                snapshot_dir=tmp_dir,
+                manifest={"chunks": []},
+                chunks=[chunk],
+                total_samples=3,
+                config_hash="hash",
+            )
+
+            sample_weight_cfg = {
+                "enabled": True,
+                "method": "exponential_decay",
+                "half_life_days": 1,
+            }
+
+            gen, _ = build_training_generator(
+                dataset=dataset,
+                start_index=0,
+                end_index=3,
+                batch_size=2,
+                num_classes=2,
+                normalization=None,
+                sample_weight_cfg=sample_weight_cfg,
+            )
+
+            x_batch, y_batch, sample_weight = next(iter(gen))
+            self.assertEqual(x_batch.shape[0], 2)
+            self.assertEqual(len(y_batch), 2)
+            self.assertIsNotNone(sample_weight)
+            assert sample_weight is not None
+            self.assertEqual(len(sample_weight), 2)
+
+            sample_weight_pair = cast(Tuple[np.ndarray, np.ndarray], sample_weight)
+            w_up = np.asarray(sample_weight_pair[0], dtype="float32")
+            w_down = np.asarray(sample_weight_pair[1], dtype="float32")
+            self.assertTrue(np.allclose(w_up, w_down))
+
+            expected_weights = np.array([0.25, 0.5], dtype="float32")
+            self.assertTrue(np.allclose(w_up, expected_weights, rtol=1e-6, atol=1e-6))
 
     @given(
         boundaries=st.lists(

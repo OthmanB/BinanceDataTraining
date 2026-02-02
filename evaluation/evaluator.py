@@ -2,14 +2,24 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 import logging
 from pathlib import Path
 import tempfile
+import os
 
 import numpy as np
 
 from preprocessing.train_test_split import chronological_split_indices
+from training.snapshot_dataset import (
+    NormalizationStats,
+    compute_normalization_stats,
+    iter_snapshot_batches,
+    load_normalization_stats,
+    prepare_snapshot_dataset,
+    save_normalization_stats,
+)
+from training.snapshot_store import load_or_create_manifest, resolve_snapshot_context, save_manifest
 from preprocessing.snapshot_sequence_builder import (
     build_top_of_book_sequence_tensor,
     build_hybrid_depth_sequence_tensor,
@@ -674,4 +684,435 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
             logger.warning("Failed to log calibration curve artifacts to MLFlow: %s", exc)
 
 
-__all__ = ["evaluate_model"]
+def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
+    """Evaluate a trained model using snapshot datasets."""
+
+    snapshot_dataset = prepare_snapshot_dataset(config)
+    n_samples = int(snapshot_dataset.total_samples)
+    if n_samples <= 0:
+        logger.info("Snapshot evaluation invoked with num_samples=0; skipping.")
+        return
+
+    split_cfg = config["preprocessing"]["train_test_split"]
+    train_ratio = float(split_cfg["train_ratio"])
+    validation_ratio = float(split_cfg["validation_ratio"])
+    test_ratio = float(split_cfg["test_ratio"])
+
+    ratio_sum = train_ratio + validation_ratio + test_ratio
+    if abs(ratio_sum - 1.0) > 1e-6:
+        raise ValueError("train_ratio + validation_ratio + test_ratio must equal 1.0")
+
+    train_end = int(n_samples * train_ratio)
+    val_end = train_end + int(n_samples * validation_ratio)
+    if val_end > n_samples:
+        val_end = n_samples
+    test_start = val_end
+    test_end = n_samples
+
+    if test_end <= test_start:
+        logger.info("No test samples available for snapshot evaluation; skipping.")
+        return
+
+    training_cfg = config["training"]
+    debug_max_samples = int(training_cfg["debug_max_samples"])
+    if debug_max_samples > 0:
+        test_end = min(test_end, test_start + debug_max_samples)
+
+    if test_end <= test_start:
+        logger.info("Snapshot evaluation skipped: debug_max_samples limits test set to zero.")
+        return
+
+    model_cfg = config["model"]
+    output_cfg = model_cfg["output"]
+    output_type = str(output_cfg["type"])
+    if output_type != "two_head_intensity":
+        raise ValueError("Only model.output.type='two_head_intensity' is supported in snapshot evaluation")
+
+    num_classes = int(output_cfg["num_classes"])
+    if num_classes <= 1:
+        raise ValueError("model.output.num_classes must be >= 2 for evaluation")
+
+    context = resolve_snapshot_context(config)
+    manifest = load_or_create_manifest(context, config)
+
+    normalization_cfg = config["preprocessing"]["normalization"]
+    method = str(normalization_cfg["method"])
+    fit_on_train_only = bool(normalization_cfg["fit_on_train_only"])
+
+    stats_path = os.path.join(context.snapshot_dir, "normalization_stats_train.npz")
+    if os.path.exists(stats_path):
+        train_stats = load_normalization_stats(stats_path)
+    else:
+        train_stats = compute_normalization_stats(snapshot_dataset, 0, train_end, method)
+        save_normalization_stats(stats_path, train_stats)
+
+    stats_meta = manifest.get("normalization_stats", {})
+    stats_meta["train"] = {
+        "method": train_stats.method,
+        "path": stats_path,
+        "start_index": 0,
+        "end_index": train_end,
+    }
+    manifest["normalization_stats"] = stats_meta
+    save_manifest(context, manifest)
+
+    eval_stats: NormalizationStats
+    if fit_on_train_only:
+        eval_stats = train_stats
+    else:
+        eval_stats = train_stats
+
+    eval_cfg = config["evaluation"]
+    calib_cfg = eval_cfg["calibration_analysis"]
+    calib_enabled = bool(calib_cfg["enabled"])
+    n_bins = int(calib_cfg["n_bins"])
+    if n_bins <= 0:
+        raise ValueError("evaluation.calibration_analysis.n_bins must be positive")
+
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1, dtype="float64")
+
+    def _init_calibration_state() -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, int]:
+        return (
+            np.zeros(n_bins, dtype="float64"),
+            np.zeros(n_bins, dtype="float64"),
+            np.zeros(n_bins, dtype="int64"),
+            0.0,
+            0,
+        )
+
+    up_conf_sum, up_acc_sum, up_bin_count, up_brier_sum, up_count = _init_calibration_state()
+    down_conf_sum, down_acc_sum, down_bin_count, down_brier_sum, down_count = _init_calibration_state()
+
+    confusion_up = np.zeros((num_classes, num_classes), dtype=int)
+    confusion_down = np.zeros((num_classes, num_classes), dtype=int)
+
+    total_eval = 0
+    correct_up = 0
+    correct_down = 0
+
+    batch_size = int(training_cfg["batch_size"])
+    if batch_size <= 0:
+        raise ValueError("training.batch_size must be positive")
+
+    for x_chunk, y_up_chunk, y_down_chunk, _ in iter_snapshot_batches(
+        snapshot_dataset, test_start, test_end
+    ):
+        x_chunk = _apply_normalization_snapshot(x_chunk, eval_stats)
+        n_chunk = x_chunk.shape[0]
+
+        for offset in range(0, n_chunk, batch_size):
+            x_batch = x_chunk[offset : offset + batch_size]
+            y_true_up = y_up_chunk[offset : offset + batch_size]
+            y_true_down = y_down_chunk[offset : offset + batch_size]
+
+            y_pred = model.predict(x_batch, batch_size=batch_size, verbose=0)
+            if not isinstance(y_pred, (list, tuple)) or len(y_pred) != 2:
+                raise ValueError("Expected model.predict to return two outputs for two_head_intensity")
+
+            y_prob_up, y_prob_down = y_pred
+            y_prob_up = np.asarray(y_prob_up, dtype="float64")
+            y_prob_down = np.asarray(y_prob_down, dtype="float64")
+
+            if y_prob_up.shape[1] != num_classes or y_prob_down.shape[1] != num_classes:
+                raise ValueError("Prediction output classes do not match model.output.num_classes")
+
+            y_pred_up = np.argmax(y_prob_up, axis=1)
+            y_pred_down = np.argmax(y_prob_down, axis=1)
+
+            correct_up += int(np.sum(y_pred_up == y_true_up))
+            correct_down += int(np.sum(y_pred_down == y_true_down))
+            total_eval += int(y_true_up.shape[0])
+
+            np.add.at(confusion_up, (y_true_up, y_pred_up), 1)
+            np.add.at(confusion_down, (y_true_down, y_pred_down), 1)
+
+            if calib_enabled:
+                y_true_up_onehot = np.eye(num_classes, dtype="float64")[y_true_up]
+                y_true_down_onehot = np.eye(num_classes, dtype="float64")[y_true_down]
+
+                up_brier_sum += float(
+                    np.sum(np.sum((y_prob_up - y_true_up_onehot) ** 2, axis=1))
+                )
+                down_brier_sum += float(
+                    np.sum(np.sum((y_prob_down - y_true_down_onehot) ** 2, axis=1))
+                )
+                up_count += int(y_true_up.shape[0])
+                down_count += int(y_true_down.shape[0])
+
+                up_bins = _assign_calibration_bins_with_truth(
+                    y_prob_up,
+                    y_true_up_onehot,
+                    bin_edges,
+                )
+                down_bins = _assign_calibration_bins_with_truth(
+                    y_prob_down,
+                    y_true_down_onehot,
+                    bin_edges,
+                )
+
+                up_conf_sum += up_bins[0]
+                up_acc_sum += up_bins[1]
+                up_bin_count += up_bins[2]
+
+                down_conf_sum += down_bins[0]
+                down_acc_sum += down_bins[1]
+                down_bin_count += down_bins[2]
+
+    if total_eval <= 0:
+        logger.info("Snapshot evaluation found no samples after batching; skipping.")
+        return
+
+    accuracy_up = float(correct_up / total_eval)
+    accuracy_down = float(correct_down / total_eval)
+
+    per_class_precision_up, per_class_recall_up, per_class_f1_up = _compute_class_metrics(confusion_up)
+    per_class_precision_down, per_class_recall_down, per_class_f1_down = _compute_class_metrics(confusion_down)
+
+    macro_precision_up = float(np.mean(per_class_precision_up)) if per_class_precision_up else 0.0
+    macro_recall_up = float(np.mean(per_class_recall_up)) if per_class_recall_up else 0.0
+    macro_f1_up = float(np.mean(per_class_f1_up)) if per_class_f1_up else 0.0
+
+    macro_precision_down = float(np.mean(per_class_precision_down)) if per_class_precision_down else 0.0
+    macro_recall_down = float(np.mean(per_class_recall_down)) if per_class_recall_down else 0.0
+    macro_f1_down = float(np.mean(per_class_f1_down)) if per_class_f1_down else 0.0
+
+    calibration_results_up = None
+    calibration_results_down = None
+    if calib_enabled:
+        calibration_results_up = _finalize_calibration(
+            bin_edges,
+            up_conf_sum,
+            up_acc_sum,
+            up_bin_count,
+            up_brier_sum,
+            up_count,
+        )
+        calibration_results_down = _finalize_calibration(
+            bin_edges,
+            down_conf_sum,
+            down_acc_sum,
+            down_bin_count,
+            down_brier_sum,
+            down_count,
+        )
+
+    logger.info(
+        "Snapshot evaluation metrics. eval_n=%s, up_accuracy=%s, down_accuracy=%s, "
+        "up_macro_precision=%s, down_macro_precision=%s, up_macro_recall=%s, down_macro_recall=%s, "
+        "up_macro_f1=%s, down_macro_f1=%s",
+        total_eval,
+        accuracy_up,
+        accuracy_down,
+        macro_precision_up,
+        macro_precision_down,
+        macro_recall_up,
+        macro_recall_down,
+        macro_f1_up,
+        macro_f1_down,
+    )
+
+    try:
+        import mlflow  # type: ignore[import]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to import MLFlow for snapshot evaluation metric logging: %s", exc)
+        return
+
+    metrics = {
+        "eval_up_accuracy": accuracy_up,
+        "eval_up_macro_precision": macro_precision_up,
+        "eval_up_macro_recall": macro_recall_up,
+        "eval_up_macro_f1": macro_f1_up,
+        "eval_down_accuracy": accuracy_down,
+        "eval_down_macro_precision": macro_precision_down,
+        "eval_down_macro_recall": macro_recall_down,
+        "eval_down_macro_f1": macro_f1_down,
+    }
+
+    for cls, (prec, rec, f1) in enumerate(
+        zip(per_class_precision_up, per_class_recall_up, per_class_f1_up)
+    ):
+        metrics[f"eval_up_precision_class_{cls}"] = prec
+        metrics[f"eval_up_recall_class_{cls}"] = rec
+        metrics[f"eval_up_f1_class_{cls}"] = f1
+
+    for cls, (prec, rec, f1) in enumerate(
+        zip(per_class_precision_down, per_class_recall_down, per_class_f1_down)
+    ):
+        metrics[f"eval_down_precision_class_{cls}"] = prec
+        metrics[f"eval_down_recall_class_{cls}"] = rec
+        metrics[f"eval_down_f1_class_{cls}"] = f1
+
+    if calibration_results_up is not None:
+        metrics["eval_up_brier_score"] = float(calibration_results_up["brier_score"])
+        metrics["eval_up_ece"] = float(calibration_results_up["ece"])
+    if calibration_results_down is not None:
+        metrics["eval_down_brier_score"] = float(calibration_results_down["brier_score"])
+        metrics["eval_down_ece"] = float(calibration_results_down["ece"])
+
+    for name, value in metrics.items():
+        try:
+            mlflow.log_metric(name, float(value))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to log MLFlow evaluation metric %s: %s", name, exc)
+
+    # Optional confusion matrix artifact logging.
+    try:
+        mlflow_cfg = config.get("mlflow", {})
+        artifact_logging_cfg = mlflow_cfg.get("artifact_logging", {})
+        log_confusion = bool(artifact_logging_cfg.get("confusion_matrix"))
+    except Exception:  # noqa: BLE001
+        log_confusion = False
+
+    if log_confusion:
+        tmp_dir = Path(tempfile.mkdtemp())
+        cm_up_path = tmp_dir / "confusion_matrix_up.csv"
+        cm_down_path = tmp_dir / "confusion_matrix_down.csv"
+        try:
+            np.savetxt(cm_up_path, confusion_up, fmt="%d", delimiter=",")
+            np.savetxt(cm_down_path, confusion_down, fmt="%d", delimiter=",")
+            mlflow.log_artifact(str(cm_up_path), artifact_path="evaluation")
+            mlflow.log_artifact(str(cm_down_path), artifact_path="evaluation")
+            logger.info(
+                "Logged snapshot evaluation confusion matrices to MLFlow at %s and %s",
+                cm_up_path,
+                cm_down_path,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to log confusion matrix artifacts to MLFlow: %s", exc)
+
+    if calib_enabled and (calibration_results_up is not None or calibration_results_down is not None):
+        try:
+            tmp_dir = Path(tempfile.mkdtemp())
+
+            if calibration_results_up is not None:
+                calib_up_path = tmp_dir / "calibration_curve_up.csv"
+                _write_calibration_curve(calibration_results_up, calib_up_path)
+                mlflow.log_artifact(str(calib_up_path), artifact_path="evaluation")
+
+            if calibration_results_down is not None:
+                calib_down_path = tmp_dir / "calibration_curve_down.csv"
+                _write_calibration_curve(calibration_results_down, calib_down_path)
+                mlflow.log_artifact(str(calib_down_path), artifact_path="evaluation")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to log calibration curve artifacts to MLFlow: %s", exc)
+
+
+def _compute_class_metrics(confusion: np.ndarray) -> Tuple[list, list, list]:
+    per_class_precision = []
+    per_class_recall = []
+    per_class_f1 = []
+
+    num_classes = confusion.shape[0]
+    for cls in range(num_classes):
+        tp = float(confusion[cls, cls])
+        fp = float(confusion[:, cls].sum() - tp)
+        fn = float(confusion[cls, :].sum() - tp)
+
+        precision = tp / (tp + fp) if (tp + fp) > 0.0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0.0 else 0.0
+        f1 = (2.0 * precision * recall / (precision + recall)) if (precision + recall) > 0.0 else 0.0
+
+        per_class_precision.append(precision)
+        per_class_recall.append(recall)
+        per_class_f1.append(f1)
+
+    return per_class_precision, per_class_recall, per_class_f1
+
+
+def _finalize_calibration(
+    bin_edges: np.ndarray,
+    bin_conf_sum: np.ndarray,
+    bin_acc_sum: np.ndarray,
+    bin_count: np.ndarray,
+    brier_sum: float,
+    sample_count: int,
+) -> Dict[str, Any]:
+    bin_confidence = np.zeros_like(bin_conf_sum)
+    bin_accuracy = np.zeros_like(bin_acc_sum)
+
+    nonzero = bin_count > 0
+    bin_confidence[nonzero] = bin_conf_sum[nonzero] / bin_count[nonzero]
+    bin_accuracy[nonzero] = bin_acc_sum[nonzero] / bin_count[nonzero]
+
+    total = float(bin_count.sum())
+    if total > 0.0:
+        abs_diff = np.abs(bin_confidence - bin_accuracy)
+        weights = bin_count.astype("float64") / total
+        ece = float(np.sum(abs_diff * weights))
+    else:
+        ece = 0.0
+
+    if sample_count > 0:
+        brier_score = float(brier_sum / float(sample_count))
+    else:
+        brier_score = 0.0
+
+    return {
+        "brier_score": brier_score,
+        "ece": ece,
+        "bin_edges": bin_edges,
+        "bin_confidence": bin_confidence,
+        "bin_accuracy": bin_accuracy,
+        "bin_count": bin_count,
+    }
+
+
+def _write_calibration_curve(calibration_results: Dict[str, Any], path: Path) -> None:
+    edges = calibration_results["bin_edges"]
+    conf = calibration_results["bin_confidence"]
+    acc = calibration_results["bin_accuracy"]
+    count = calibration_results["bin_count"]
+
+    left_edges = edges[:-1]
+    right_edges = edges[1:]
+    data = np.column_stack([left_edges, right_edges, conf, acc, count])
+    header = "left_edge,right_edge,bin_confidence,bin_accuracy,bin_count"
+    np.savetxt(
+        path,
+        data,
+        fmt=["%.6f", "%.6f", "%.6f", "%.6f", "%d"],
+        delimiter=",",
+        header=header,
+        comments="",
+    )
+
+
+def _apply_normalization_snapshot(x: np.ndarray, stats: NormalizationStats) -> np.ndarray:
+    x_flat = x.reshape(x.shape[0], -1)
+
+    if stats.method == "min_max":
+        if stats.min is None or stats.max is None:
+            raise ValueError("Missing min/max normalization stats")
+        denom = stats.max - stats.min
+        denom = np.where(denom == 0, 1.0, denom)
+        x_norm = (x_flat - stats.min) / denom
+    elif stats.method == "standard":
+        if stats.mean is None or stats.std is None:
+            raise ValueError("Missing mean/std normalization stats")
+        std = np.where(stats.std == 0, 1.0, stats.std)
+        x_norm = (x_flat - stats.mean) / std
+    else:
+        raise ValueError(f"Unsupported normalization method for snapshot evaluation: {stats.method}")
+
+    return x_norm.reshape(x.shape).astype("float32")
+
+
+def _assign_calibration_bins_with_truth(
+    y_prob: np.ndarray,
+    y_true: np.ndarray,
+    bin_edges: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    probs_flat = y_prob.ravel()
+    true_flat = y_true.ravel()
+    num_bins = bin_edges.shape[0] - 1
+    bin_idx = np.searchsorted(bin_edges, probs_flat, side="right") - 1
+    bin_idx = np.clip(bin_idx, 0, num_bins - 1)
+
+    bin_count = np.bincount(bin_idx, minlength=num_bins).astype("int64")
+    bin_conf_sum = np.bincount(bin_idx, weights=probs_flat, minlength=num_bins).astype("float64")
+    bin_acc_sum = np.bincount(bin_idx, weights=true_flat, minlength=num_bins).astype("float64")
+
+    return bin_conf_sum, bin_acc_sum, bin_count
+
+
+__all__ = ["evaluate_model", "evaluate_snapshot_model"]

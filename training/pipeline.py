@@ -433,8 +433,9 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Optional[Dict[str
     if isinstance(snapshot_cfg, dict) and snapshot_cfg.get("enabled"):
         return _run_snapshot_training_pipeline(config)
 
-    if data_object is None:
-        raise ValueError("data_object is required when snapshot.enabled is false")
+    raise ConfigError(
+        "Legacy in-memory training pipeline is disabled. Set snapshot.enabled=true to use the snapshot pipeline."
+    )
 
     metadata = data_object["metadata"]
     n_samples = int(metadata["num_samples"])

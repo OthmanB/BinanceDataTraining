@@ -251,7 +251,7 @@ training:  # Controls how the model is fit on the prepared dataset.
 
 # Snapshot Configuration
 snapshot:  # Derived dataset snapshots for streaming training/restarts.
-  enabled: false  # When true, build or reuse a snapshot dataset from GreptimeDB chunk streams.
+  enabled: true  # When true, build or reuse a snapshot dataset from GreptimeDB chunk streams.
   directory: "snapshots"  # Root directory for snapshot datasets.
   root_name: "baseline"  # Required root name for snapshot directories.
   name: "auto"  # "auto" uses root_name + config hash + time range; or set a custom name.

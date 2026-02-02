@@ -12,7 +12,11 @@ import os
 
 import numpy as np
 
-from data.greptime_client import OrderBookChunk, stream_order_book_chunks, _generate_time_chunks
+from data.greptime_client import (
+    OrderBookChunk,
+    _generate_time_chunks,
+    stream_order_book_chunks_by_time,
+)
 from preprocessing.depth_aggregator import aggregate_snapshot_to_hybrid, get_hybrid_output_shape
 from preprocessing.feature_engineering import FeatureEngineer
 from preprocessing.time_utils import normalize_timestamp_array
@@ -61,6 +65,14 @@ class SnapshotRecord:
     mid_price: float
     hybrid_snapshot: Optional[np.ndarray]
     volume_proxy: float
+
+
+@dataclass
+class MultiAssetSnapshotRecord:
+    """Snapshot-level data for multiple assets at a given timestamp."""
+
+    timestamp: np.datetime64
+    asset_snapshots: Dict[str, SnapshotRecord]
 
 
 @dataclass(frozen=True)
@@ -171,11 +183,20 @@ class StreamingSampleBuilder:
         representation: str,
         height: int,
         width: int,
+        assets: List[str],
+        target_asset: str,
     ) -> None:
         self._config = config
         self._representation = representation
         self._height = height
         self._width = width
+        self._assets = [str(a) for a in assets]
+        if not self._assets:
+            raise ValueError("At least one asset must be provided for snapshot streaming")
+        if target_asset not in self._assets:
+            raise ValueError("target_asset must be included in assets for snapshot streaming")
+        self._target_asset = str(target_asset)
+        self._asset_indices = {asset: idx for idx, asset in enumerate(self._assets)}
 
         data_cfg = config["data"]
         time_range_cfg = data_cfg["time_range"]
@@ -241,7 +262,7 @@ class StreamingSampleBuilder:
                 "model.input_representation.temporal_features.integration_mode must be 'none' or 'concat_channels'",
             )
 
-        self._buffer: deque[SnapshotRecord] = deque()
+        self._buffer: deque[MultiAssetSnapshotRecord] = deque()
         self._buffer_start_idx = 0
         self._next_anchor_idx = self._window_steps - 1
         self._latest_idx = -1
@@ -251,7 +272,7 @@ class StreamingSampleBuilder:
     def num_classes(self) -> int:
         return self._num_classes
 
-    def add_snapshot(self, snapshot: SnapshotRecord) -> List[SampleRecord]:
+    def add_snapshot(self, snapshot: MultiAssetSnapshotRecord) -> List[SampleRecord]:
         samples: List[SampleRecord] = []
         self._buffer.append(snapshot)
         self._latest_idx += 1
@@ -282,8 +303,14 @@ class StreamingSampleBuilder:
         if len(window_records) != self._window_steps:
             return None
 
-        mid_prices = np.array([rec.mid_price for rec in self._buffer], dtype="float64")
-        volumes = np.array([rec.volume_proxy for rec in self._buffer], dtype="float64")
+        mid_prices = np.array(
+            [rec.asset_snapshots[self._target_asset].mid_price for rec in self._buffer],
+            dtype="float64",
+        )
+        volumes = np.array(
+            [rec.asset_snapshots[self._target_asset].volume_proxy for rec in self._buffer],
+            dtype="float64",
+        )
 
         future_start = anchor_pos + 1
         future_end = anchor_pos + self._horizon_steps + 1
@@ -305,9 +332,10 @@ class StreamingSampleBuilder:
             return None
 
         if self._feature_engineer is not None:
+            target_record = window_records[anchor_pos - window_start].asset_snapshots[self._target_asset]
             fe_vector = _compute_feature_vector(
                 self._feature_engineer,
-                window_records[anchor_pos - window_start],
+                target_record,
                 mid_prices,
                 volumes,
                 anchor_pos,
@@ -346,40 +374,49 @@ class StreamingSampleBuilder:
             anchor_ts_seconds=anchor_ts_seconds,
         )
 
-    def _build_input_sequence(self, window_records: List[SnapshotRecord]) -> Optional[np.ndarray]:
+    def _build_input_sequence(self, window_records: List[MultiAssetSnapshotRecord]) -> Optional[np.ndarray]:
+        num_assets = len(self._assets)
         if self._representation == "hybrid":
             effective_levels = get_hybrid_output_shape(self._config)
-            x_seq = np.zeros((self._window_steps, effective_levels, 4, 1), dtype="float32")
+            x_seq = np.zeros((self._window_steps, effective_levels, 4, num_assets), dtype="float32")
             for t_idx, rec in enumerate(window_records):
-                if rec.hybrid_snapshot is None:
-                    if rec.depth is None:
+                for asset_idx, asset in enumerate(self._assets):
+                    asset_rec = rec.asset_snapshots.get(asset)
+                    if asset_rec is None:
                         return None
-                    hybrid = aggregate_snapshot_to_hybrid(
-                        bid_prices=rec.depth["bid_prices"],
-                        bid_quantities=rec.depth["bid_quantities"],
-                        ask_prices=rec.depth["ask_prices"],
-                        ask_quantities=rec.depth["ask_quantities"],
-                        config=self._config,
-                    ).astype("float32")
-                    x_seq[t_idx, :, :, 0] = hybrid
-                else:
-                    x_seq[t_idx, :, :, 0] = rec.hybrid_snapshot
+                    if asset_rec.hybrid_snapshot is None:
+                        if asset_rec.depth is None:
+                            return None
+                        hybrid = aggregate_snapshot_to_hybrid(
+                            bid_prices=asset_rec.depth["bid_prices"],
+                            bid_quantities=asset_rec.depth["bid_quantities"],
+                            ask_prices=asset_rec.depth["ask_prices"],
+                            ask_quantities=asset_rec.depth["ask_quantities"],
+                            config=self._config,
+                        ).astype("float32")
+                        x_seq[t_idx, :, :, asset_idx] = hybrid
+                    else:
+                        x_seq[t_idx, :, :, asset_idx] = asset_rec.hybrid_snapshot
             return x_seq
 
         if self._representation == "top_of_book":
-            x_seq = np.zeros((self._window_steps, self._height, self._width, 1), dtype="float32")
+            x_seq = np.zeros((self._window_steps, self._height, self._width, num_assets), dtype="float32")
             for t_idx, rec in enumerate(window_records):
-                features = rec.snapshot_features
-                if len(features) < 4:
-                    continue
-                bid_price, bid_qty, ask_price, ask_qty = features[:4]
-                x_seq[t_idx, 0, 0, 0] = float(bid_price)
-                if self._width > 1:
-                    x_seq[t_idx, 0, 1, 0] = float(bid_qty)
-                if self._height > 1:
-                    x_seq[t_idx, 1, 0, 0] = float(ask_price)
-                if self._height > 1 and self._width > 1:
-                    x_seq[t_idx, 1, 1, 0] = float(ask_qty)
+                for asset_idx, asset in enumerate(self._assets):
+                    asset_rec = rec.asset_snapshots.get(asset)
+                    if asset_rec is None:
+                        return None
+                    features = asset_rec.snapshot_features
+                    if len(features) < 4:
+                        continue
+                    bid_price, bid_qty, ask_price, ask_qty = features[:4]
+                    x_seq[t_idx, 0, 0, asset_idx] = float(bid_price)
+                    if self._width > 1:
+                        x_seq[t_idx, 0, 1, asset_idx] = float(bid_qty)
+                    if self._height > 1:
+                        x_seq[t_idx, 1, 0, asset_idx] = float(ask_price)
+                    if self._height > 1 and self._width > 1:
+                        x_seq[t_idx, 1, 1, asset_idx] = float(ask_qty)
             return x_seq
 
         raise ValueError(f"Unsupported order book representation: {self._representation}")
@@ -529,6 +566,10 @@ def build_training_generator(
 
     if use_weights:
         def _generator_with_weights() -> Iterator[Tuple[np.ndarray, Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]]:
+            if current_day is None or decay_const is None:
+                raise ValueError("Sample weighting requires current_day and decay_const")
+            day_value = float(current_day)
+            decay_value = float(decay_const)
             for x_chunk, y_up_chunk, y_down_chunk, anchor_ts in iter_snapshot_batches(
                 dataset, start_index, end_index
             ):
@@ -546,8 +587,8 @@ def build_training_generator(
 
                     anchor_slice = anchor_ts[offset : offset + batch_size]
                     anchor_days = (anchor_slice // 86400).astype("float64")
-                    age_days = float(current_day) - anchor_days
-                    weights = np.exp(-age_days * decay_const).astype("float32")
+                    age_days = day_value - anchor_days
+                    weights = np.exp(-age_days * decay_value).astype("float32")
                     sample_weight = (weights, weights)
 
                     yield x_batch, y_batch, sample_weight
@@ -700,6 +741,54 @@ def _compute_current_day(dataset: SnapshotDataset, start_index: int, end_index: 
     return max_day
 
 
+def _build_multi_asset_records(
+    asset_records: Dict[str, List[SnapshotRecord]],
+    assets: List[str],
+    target_asset: str,
+    fail_on_invalid: bool,
+) -> List[MultiAssetSnapshotRecord]:
+    target_records = asset_records.get(target_asset, [])
+    if not target_records:
+        return []
+
+    record_maps = {
+        asset: {rec.timestamp: rec for rec in records}
+        for asset, records in asset_records.items()
+    }
+
+    multi_records: List[MultiAssetSnapshotRecord] = []
+    for target_rec in target_records:
+        asset_snapshots: Dict[str, SnapshotRecord] = {target_asset: target_rec}
+        missing_assets = []
+        for asset in assets:
+            if asset == target_asset:
+                continue
+            record = record_maps.get(asset, {}).get(target_rec.timestamp)
+            if record is None:
+                missing_assets.append(asset)
+                continue
+            asset_snapshots[asset] = record
+
+        if missing_assets:
+            message = (
+                "Missing aligned correlated asset snapshots for timestamp="
+                f"{target_rec.timestamp}; missing_assets={missing_assets}"
+            )
+            if fail_on_invalid:
+                raise ValueError(message)
+            logger.warning(message)
+            continue
+
+        multi_records.append(
+            MultiAssetSnapshotRecord(
+                timestamp=target_rec.timestamp,
+                asset_snapshots=asset_snapshots,
+            )
+        )
+
+    return multi_records
+
+
 def _build_snapshot_chunks(
     config: Dict[str, Any],
     context: SnapshotContext,
@@ -714,7 +803,12 @@ def _build_snapshot_chunks(
     if chunk_hours <= 0:
         raise ValueError("data.ingestion.chunk_hours must be positive")
 
-    target_asset = str(data_cfg["asset_pairs"]["target_asset"])
+    asset_pairs_cfg = data_cfg["asset_pairs"]
+    target_asset = str(asset_pairs_cfg["target_asset"])
+    correlated_assets = [str(a) for a in asset_pairs_cfg.get("correlated_assets", [])]
+    assets = [target_asset] + correlated_assets
+    if not assets:
+        raise ValueError("data.asset_pairs must define at least one asset for snapshot building")
 
     output_chunks = _generate_time_chunks(start_date, end_date, chunk_hours)
     output_boundaries = _build_output_boundaries(output_chunks)
@@ -731,7 +825,9 @@ def _build_snapshot_chunks(
             boundary["cached"] = True
 
     sample_builder = _create_sample_builder(config)
-    gap_handler = _create_gap_handler(config)
+    gap_handlers = {asset: _create_gap_handler(config) for asset in assets}
+    validation_cfg = data_cfg["validation"]
+    fail_on_invalid = bool(validation_cfg["fail_on_invalid"])
 
     current_chunk_idx = 0
     chunk_samples: List[SampleRecord] = []
@@ -775,11 +871,35 @@ def _build_snapshot_chunks(
         save_manifest(context, manifest)
         chunk_samples = []
 
-    for chunk in stream_order_book_chunks(config, assets_override=[target_asset]):
-        if chunk.asset != target_asset:
-            continue
-        snapshot_records = _build_snapshots_from_rows(chunk, config)
-        for snapshot in gap_handler.iter_gap_handled(snapshot_records):
+    current_chunk_key: Optional[Tuple[str, str]] = None
+    chunk_rows: Dict[str, List[List[Any]]] = {}
+
+    def process_chunk(chunk_key: Tuple[str, str], chunk_rows_by_asset: Dict[str, List[List[Any]]]) -> None:
+        nonlocal current_chunk_idx
+        missing_assets = [asset for asset in assets if asset not in chunk_rows_by_asset]
+        if missing_assets:
+            message = f"Missing chunk data for assets={missing_assets} in chunk {chunk_key}"
+            if fail_on_invalid:
+                raise ValueError(message)
+            logger.warning(message)
+            return
+
+        asset_records: Dict[str, List[SnapshotRecord]] = {}
+        for asset in assets:
+            rows = chunk_rows_by_asset.get(asset, [])
+            chunk = OrderBookChunk(
+                asset=asset,
+                chunk_start=chunk_key[0],
+                chunk_end=chunk_key[1],
+                rows=rows,
+            )
+            compute_volume_proxy = asset == target_asset
+            records = _build_snapshots_from_rows(chunk, config, compute_volume_proxy=compute_volume_proxy)
+            filled_records = list(gap_handlers[asset].iter_gap_handled(records))
+            asset_records[asset] = filled_records
+
+        multi_records = _build_multi_asset_records(asset_records, assets, target_asset, fail_on_invalid)
+        for snapshot in multi_records:
             for sample in sample_builder.add_snapshot(snapshot):
                 anchor_ts = sample.anchor_ts_seconds
 
@@ -797,12 +917,34 @@ def _build_snapshot_chunks(
 
                 chunk_samples.append(sample)
 
+    for chunk in stream_order_book_chunks_by_time(config, assets_override=assets):
+        key = (chunk.chunk_start, chunk.chunk_end)
+        if current_chunk_key is None:
+            current_chunk_key = key
+
+        if key != current_chunk_key:
+            process_chunk(current_chunk_key, chunk_rows)
+            chunk_rows = {}
+            current_chunk_key = key
+
+        chunk_rows[chunk.asset] = chunk.rows
+
+        if len(chunk_rows) == len(assets):
+            process_chunk(current_chunk_key, chunk_rows)
+            chunk_rows = {}
+            current_chunk_key = None
+
+    if current_chunk_key is not None and chunk_rows:
+        process_chunk(current_chunk_key, chunk_rows)
+
     if current_chunk_idx < len(output_boundaries):
         flush_chunk(current_chunk_idx)
 
     manifest["complete"] = True
     save_manifest(context, manifest)
     return manifest
+
+
 
 
 def _build_output_boundaries(output_chunks: List[Tuple[str, str, bool]]) -> List[Dict[str, Any]]:
@@ -887,7 +1029,19 @@ def _create_sample_builder(config: Dict[str, Any]) -> StreamingSampleBuilder:
     if representation == "full":
         representation = "hybrid"
 
-    return StreamingSampleBuilder(config, representation=representation, height=height, width=width)
+    asset_pairs_cfg = data_cfg["asset_pairs"]
+    target_asset = str(asset_pairs_cfg["target_asset"])
+    correlated_assets = [str(a) for a in asset_pairs_cfg.get("correlated_assets", [])]
+    assets = [target_asset] + correlated_assets
+
+    return StreamingSampleBuilder(
+        config,
+        representation=representation,
+        height=height,
+        width=width,
+        assets=assets,
+        target_asset=target_asset,
+    )
 
 
 def _create_gap_handler(config: Dict[str, Any]) -> GapHandler:
@@ -915,7 +1069,12 @@ def _create_gap_handler(config: Dict[str, Any]) -> GapHandler:
     )
 
 
-def _build_snapshots_from_rows(chunk: OrderBookChunk, config: Dict[str, Any]) -> List[SnapshotRecord]:
+def _build_snapshots_from_rows(
+    chunk: OrderBookChunk,
+    config: Dict[str, Any],
+    *,
+    compute_volume_proxy: bool,
+) -> List[SnapshotRecord]:
     data_cfg = config["data"]
     order_book_cfg = data_cfg["order_book"]
     representation = str(order_book_cfg.get("representation", "top_of_book"))
@@ -975,7 +1134,11 @@ def _build_snapshots_from_rows(chunk: OrderBookChunk, config: Dict[str, Any]) ->
     normalized_ts = normalize_timestamp_array(sorted_keys)
 
     fe_cfg = config["preprocessing"].get("feature_engineering", {})
-    feature_engineer = FeatureEngineer(config) if fe_cfg.get("enabled") else None
+    feature_engineer = (
+        FeatureEngineer(config)
+        if fe_cfg.get("enabled") and compute_volume_proxy
+        else None
+    )
 
     records: List[SnapshotRecord] = []
     for key, ts_norm in zip(sorted_keys, normalized_ts):

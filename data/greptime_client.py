@@ -473,6 +473,127 @@ def stream_order_book_chunks(
         )
 
 
+def stream_order_book_chunks_by_time(
+    config: Dict[str, Any],
+    assets_override: Optional[List[str]] = None,
+) -> Iterator[OrderBookChunk]:
+    """Stream raw order book rows in time-major order.
+
+    Yields chunks grouped by time window (chunk_start/chunk_end) and iterates
+    assets within each time window. This ordering is useful for multi-asset
+    snapshot construction.
+    """
+
+    data_cfg = config["data"]
+    asset_pairs_cfg = data_cfg["asset_pairs"]
+    time_range_cfg = data_cfg["time_range"]
+    order_book_cfg = data_cfg["order_book"]
+    schema_cfg = order_book_cfg["schema"]
+    ingestion_cfg = data_cfg["ingestion"]
+
+    chunk_hours = int(ingestion_cfg["chunk_hours"])
+    if chunk_hours <= 0:
+        raise ValueError(
+            f"data.ingestion.chunk_hours must be positive; got {chunk_hours}"
+        )
+
+    chunk_delay_seconds = float(ingestion_cfg["chunk_delay_seconds"])
+    if chunk_delay_seconds < 0.0:
+        raise ValueError(
+            f"data.ingestion.chunk_delay_seconds must be >= 0; got {chunk_delay_seconds}"
+        )
+
+    max_concurrent = int(ingestion_cfg["max_concurrent_chunk_fetches"])
+    if max_concurrent != 1:
+        raise ValueError(
+            "data.ingestion.max_concurrent_chunk_fetches must be 1 in this phase; "
+            f"got {max_concurrent}"
+        )
+
+    if assets_override is not None:
+        assets = [str(a) for a in assets_override]
+    else:
+        target_asset = asset_pairs_cfg["target_asset"]
+        correlated_assets = asset_pairs_cfg["correlated_assets"]
+        assets = [str(target_asset)] + [str(a) for a in correlated_assets]
+
+    if not assets:
+        return
+
+    global_start_date = str(time_range_cfg["start_date"])
+    global_end_date = str(time_range_cfg["end_date"])
+
+    multi_db_cfg = data_cfg.get("multi_database")
+    if isinstance(multi_db_cfg, dict) and multi_db_cfg.get("enabled"):
+        connections = multi_db_cfg["connections"]
+        if not isinstance(connections, list) or not connections:
+            raise ValueError(
+                "data.multi_database.connections must be a non-empty list when multi_database.enabled is true",
+            )
+
+        intervals: List[Tuple[str, str, Dict[str, Any]]] = []
+        for conn in connections:
+            conn_time_range = conn["time_range"]
+            conn_start = str(conn_time_range["start_date"])
+            conn_end = str(conn_time_range["end_date"])
+            if conn_start > conn_end:
+                raise ValueError(
+                    "Connection-level time_range.start_date must be <= time_range.end_date for data.multi_database.connections; "
+                    f"got start_date={conn_start!r}, end_date={conn_end!r}",
+                )
+            intervals.append((conn_start, conn_end, conn))
+
+        intervals.sort(key=lambda item: item[0])
+
+        prev_end = None
+        for conn_start, conn_end, _ in intervals:
+            if prev_end is not None and conn_start < prev_end:
+                raise ValueError(
+                    "Overlapping time ranges are not supported for data.multi_database.connections; "
+                    "ensure per-connection time_range intervals are ordered and do not have interior overlap.",
+                )
+            prev_end = conn_end
+
+        for conn_start, conn_end, conn in intervals:
+            constrained_start = max(global_start_date, conn_start)
+            constrained_end = min(global_end_date, conn_end)
+            if constrained_start > constrained_end:
+                continue
+
+            base_uri = conn["database_uri"]
+            table_prefix = conn["table_prefix"]
+            timeout_cfg = _get_timeout_config(conn)
+
+            yield from _stream_order_book_rows_for_connection_by_time(
+                str(base_uri),
+                str(table_prefix),
+                assets,
+                constrained_start,
+                constrained_end,
+                schema_cfg,
+                timeout_cfg,
+                chunk_hours,
+                chunk_delay_seconds,
+            )
+    else:
+        conn_cfg = data_cfg["connection"]
+        base_uri = conn_cfg["database_uri"]
+        table_prefix = conn_cfg["table_prefix"]
+        timeout_cfg = _get_timeout_config(conn_cfg)
+
+        yield from _stream_order_book_rows_for_connection_by_time(
+            str(base_uri),
+            str(table_prefix),
+            assets,
+            global_start_date,
+            global_end_date,
+            schema_cfg,
+            timeout_cfg,
+            chunk_hours,
+            chunk_delay_seconds,
+        )
+
+
 def _fetch_order_book_rows_for_connection(
     base_uri: str,
     table_prefix: str,
@@ -628,6 +749,148 @@ def _fetch_order_book_rows_for_connection(
         )
 
 
+def _fetch_order_book_rows_for_chunk(
+    base_uri: str,
+    table_prefix: str,
+    asset: str,
+    chunk_start: str,
+    chunk_end: str,
+    schema_cfg: Dict[str, Any],
+    timeout_cfg: Dict[str, Any],
+    end_inclusive: bool,
+) -> List[List[Any]]:
+    ts_col = schema_cfg["timestamp_column"]
+    bid_price_col = schema_cfg["bid_price_column"]
+    bid_qty_col = schema_cfg["bid_quantity_column"]
+    ask_price_col = schema_cfg["ask_price_column"]
+    ask_qty_col = schema_cfg["ask_quantity_column"]
+    batch_id_col = schema_cfg["batch_id_column"]
+
+    url = base_uri.rstrip("/") + "/v1/sql"
+    connect_timeout = timeout_cfg["connect_timeout_seconds"]
+    request_timeout = timeout_cfg["request_timeout_seconds"]
+
+    end_operator = "<=" if end_inclusive else "<"
+    table_name = f"{table_prefix}{asset.lower()}"
+
+    sql = (
+        f"SELECT {ts_col}, {bid_price_col}, {bid_qty_col}, {ask_price_col}, {ask_qty_col}, {batch_id_col} "
+        f"FROM {table_name} "
+        f"WHERE {ts_col} >= '{chunk_start}' AND {ts_col} {end_operator} '{chunk_end}' "
+        f"AND {bid_price_col} > 0 AND {ask_price_col} > 0 "
+        f"ORDER BY {ts_col} ASC"
+    )
+
+    try:
+        resp = requests.post(
+            url,
+            data={"sql": sql},
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=(connect_timeout, request_timeout),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "GreptimeDB data fetch failed for table %s (asset=%s, chunk=%s to %s): %s",
+            table_name,
+            asset,
+            chunk_start,
+            chunk_end,
+            exc,
+        )
+        return []
+
+    if not resp.ok:
+        logger.warning(
+            "GreptimeDB data fetch returned non-OK status for table %s (asset=%s, chunk=%s to %s): %s %s",
+            table_name,
+            asset,
+            chunk_start,
+            chunk_end,
+            resp.status_code,
+            resp.text,
+        )
+        return []
+
+    try:
+        payload = resp.json()
+    except ValueError:
+        logger.warning(
+            "GreptimeDB data fetch succeeded for table %s (asset=%s, chunk=%s to %s, HTTP %s) but response is not JSON.",
+            table_name,
+            asset,
+            chunk_start,
+            chunk_end,
+            resp.status_code,
+        )
+        return []
+
+    output = payload.get("output")
+    if not output:
+        return []
+
+    records = output[0].get("records") if isinstance(output, list) and output else None
+    if not records:
+        return []
+
+    rows = records.get("rows") or []
+    logger.debug(
+        "Fetched %s rows for chunk (asset=%s, %s to %s). execution_time_ms=%s",
+        len(rows),
+        asset,
+        chunk_start,
+        chunk_end,
+        payload.get("execution_time_ms"),
+    )
+    return rows
+
+
+def _stream_order_book_rows_for_connection_by_time(
+    base_uri: str,
+    table_prefix: str,
+    assets: List[str],
+    start_date: str,
+    end_date: str,
+    schema_cfg: Dict[str, Any],
+    timeout_cfg: Dict[str, Any],
+    chunk_hours: int,
+    chunk_delay_seconds: float,
+) -> Iterator[OrderBookChunk]:
+    chunks = _generate_time_chunks(start_date, end_date, chunk_hours)
+    total_chunks = len(chunks)
+
+    for chunk_idx, (chunk_start, chunk_end, is_last_chunk) in enumerate(chunks):
+        for asset in assets:
+            logger.info(
+                "Streaming time-chunk %s/%s for asset %s (%s to %s)",
+                chunk_idx + 1,
+                total_chunks,
+                asset,
+                chunk_start,
+                chunk_end,
+            )
+
+            rows = _fetch_order_book_rows_for_chunk(
+                base_uri=base_uri,
+                table_prefix=table_prefix,
+                asset=asset,
+                chunk_start=chunk_start,
+                chunk_end=chunk_end,
+                schema_cfg=schema_cfg,
+                timeout_cfg=timeout_cfg,
+                end_inclusive=is_last_chunk,
+            )
+
+            yield OrderBookChunk(
+                asset=str(asset),
+                chunk_start=chunk_start,
+                chunk_end=chunk_end,
+                rows=rows,
+            )
+
+            if chunk_delay_seconds > 0.0:
+                time.sleep(chunk_delay_seconds)
+
+
 def _stream_order_book_rows_for_connection(
     base_uri: str,
     table_prefix: str,
@@ -760,4 +1023,5 @@ __all__ = [
     "check_greptime_connectivity",
     "fetch_order_book_rows",
     "stream_order_book_chunks",
+    "stream_order_book_chunks_by_time",
 ]
