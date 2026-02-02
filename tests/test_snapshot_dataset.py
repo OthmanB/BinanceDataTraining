@@ -23,6 +23,7 @@ class TestSnapshotDataset(unittest.TestCase):
         handler = GapHandler(
             cadence_seconds=10,
             max_gap_seconds=60,
+            large_gap_seconds=600,
             handle_gaps="forward_fill",
             check_missing_data=True,
             fail_on_invalid=True,
@@ -38,6 +39,8 @@ class TestSnapshotDataset(unittest.TestCase):
             mid_price=100.0,
             hybrid_snapshot=None,
             volume_proxy=10.0,
+            confidence=1.0,
+            gap_reset=False,
         )
         rec1 = SnapshotRecord(
             timestamp=t1,
@@ -46,6 +49,8 @@ class TestSnapshotDataset(unittest.TestCase):
             mid_price=130.0,
             hybrid_snapshot=None,
             volume_proxy=12.0,
+            confidence=1.0,
+            gap_reset=False,
         )
 
         output = list(handler.iter_gap_handled([rec0, rec1]))
@@ -65,6 +70,7 @@ class TestSnapshotDataset(unittest.TestCase):
         handler = GapHandler(
             cadence_seconds=10,
             max_gap_seconds=60,
+            large_gap_seconds=600,
             handle_gaps="interpolate",
             check_missing_data=True,
             fail_on_invalid=True,
@@ -80,6 +86,8 @@ class TestSnapshotDataset(unittest.TestCase):
             mid_price=100.0,
             hybrid_snapshot=None,
             volume_proxy=10.0,
+            confidence=1.0,
+            gap_reset=False,
         )
         rec1 = SnapshotRecord(
             timestamp=t1,
@@ -88,6 +96,8 @@ class TestSnapshotDataset(unittest.TestCase):
             mid_price=130.0,
             hybrid_snapshot=None,
             volume_proxy=12.0,
+            confidence=1.0,
+            gap_reset=False,
         )
 
         output = list(handler.iter_gap_handled([rec0, rec1]))

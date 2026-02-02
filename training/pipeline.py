@@ -29,6 +29,7 @@ from .snapshot_dataset import (
     NormalizationStats,
     build_training_generator,
     compute_normalization_stats,
+    get_mask_channel_info,
     load_normalization_stats,
     prepare_snapshot_dataset,
     save_normalization_stats,
@@ -87,10 +88,19 @@ def _get_normalization_stats(
     method = str(norm_cfg["method"])
     stats_path = os.path.join(context.snapshot_dir, f"normalization_stats_{stats_key}.npz")
 
+    mask_start, mask_count = get_mask_channel_info(config)
+
     if os.path.exists(stats_path):
         stats = load_normalization_stats(stats_path)
     else:
-        stats = compute_normalization_stats(dataset, start_index, end_index, method)
+        stats = compute_normalization_stats(
+            dataset,
+            start_index,
+            end_index,
+            method,
+            mask_start=mask_start,
+            mask_count=mask_count,
+        )
         save_normalization_stats(stats_path, stats)
 
     stats_meta = manifest.get("normalization_stats", {})
@@ -193,6 +203,8 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
         "train",
     )
 
+    mask_start, mask_count = get_mask_channel_info(config)
+
     if fit_on_train_only:
         val_stats = train_stats
     else:
@@ -256,6 +268,8 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
         num_classes=int(output_cfg["num_classes"]),
         normalization=train_stats,
         sample_weight_cfg=training_cfg.get("sample_weighting"),
+        mask_start=mask_start,
+        mask_count=mask_count,
     )
 
     fit_kwargs: Dict[str, Any] = {
@@ -275,6 +289,8 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
             num_classes=int(output_cfg["num_classes"]),
             normalization=val_stats,
             sample_weight_cfg=None,
+            mask_start=mask_start,
+            mask_count=mask_count,
         )
         fit_kwargs["validation_data"] = val_gen
         fit_kwargs["validation_steps"] = val_steps
@@ -360,6 +376,8 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
                         num_classes=int(output_cfg["num_classes"]),
                         normalization=train_stats,
                         sample_weight_cfg=None,
+                        mask_start=mask_start,
+                        mask_count=mask_count,
                     )
                     batch = next(iter(sample_gen))
                     x_sample = batch[0]

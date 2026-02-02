@@ -65,6 +65,8 @@ class SnapshotRecord:
     mid_price: float
     hybrid_snapshot: Optional[np.ndarray]
     volume_proxy: float
+    confidence: float
+    gap_reset: bool
 
 
 @dataclass
@@ -103,12 +105,14 @@ class GapHandler:
         self,
         cadence_seconds: int,
         max_gap_seconds: int,
+        large_gap_seconds: int,
         handle_gaps: str,
         check_missing_data: bool,
         fail_on_invalid: bool,
     ) -> None:
         self._cadence_seconds = cadence_seconds
         self._max_gap_seconds = max_gap_seconds
+        self._large_gap_seconds = large_gap_seconds
         self._handle_gaps = handle_gaps
         self._check_missing_data = check_missing_data
         self._fail_on_invalid = fail_on_invalid
@@ -142,6 +146,11 @@ class GapHandler:
                     raise ValueError(message)
                 logger.warning(message)
 
+            gap_reset = gap_secs > self._max_gap_seconds
+            if self._large_gap_seconds <= 0:
+                raise ValueError("alignment.large_gap_seconds must be positive")
+            base_confidence = max(0.0, 1.0 - (gap_secs / float(self._large_gap_seconds)))
+
             if (
                 gap_secs > self._cadence_seconds
                 and gap_secs <= self._max_gap_seconds
@@ -151,6 +160,8 @@ class GapHandler:
                 for step in range(1, missing_steps + 1):
                     ts_new = prev.timestamp + np.timedelta64(step * self._cadence_seconds, "s")
                     if self._handle_gaps == "forward_fill":
+                        distance_fraction = step / float(missing_steps + 1)
+                        confidence = max(0.0, base_confidence * (1.0 - distance_fraction))
                         yield SnapshotRecord(
                             timestamp=ts_new,
                             snapshot_features=list(prev.snapshot_features),
@@ -158,9 +169,13 @@ class GapHandler:
                             mid_price=prev.mid_price,
                             hybrid_snapshot=None if prev.hybrid_snapshot is None else prev.hybrid_snapshot.copy(),
                             volume_proxy=prev.volume_proxy,
+                            confidence=confidence,
+                            gap_reset=False,
                         )
                     else:
                         alpha = step / float(missing_steps + 1)
+                        distance_fraction = min(alpha, 1.0 - alpha)
+                        confidence = max(0.0, base_confidence * (1.0 - distance_fraction))
                         yield SnapshotRecord(
                             timestamp=ts_new,
                             snapshot_features=_interpolate_features(prev.snapshot_features, snapshot.snapshot_features, alpha),
@@ -168,10 +183,46 @@ class GapHandler:
                             mid_price=(1.0 - alpha) * prev.mid_price + alpha * snapshot.mid_price,
                             hybrid_snapshot=None,
                             volume_proxy=(1.0 - alpha) * prev.volume_proxy + alpha * snapshot.volume_proxy,
+                            confidence=confidence,
+                            gap_reset=False,
                         )
 
             self._prev_snapshot = snapshot
-            yield snapshot
+            if gap_reset:
+                yield SnapshotRecord(
+                    timestamp=snapshot.timestamp,
+                    snapshot_features=list(snapshot.snapshot_features),
+                    depth=_copy_depth(snapshot.depth),
+                    mid_price=snapshot.mid_price,
+                    hybrid_snapshot=None if snapshot.hybrid_snapshot is None else snapshot.hybrid_snapshot.copy(),
+                    volume_proxy=snapshot.volume_proxy,
+                    confidence=snapshot.confidence,
+                    gap_reset=True,
+                )
+            else:
+                yield snapshot
+
+    @staticmethod
+    def align_multi_asset(
+        asset_records: Dict[str, List[SnapshotRecord]],
+        assets: List[str],
+        target_asset: str,
+        alignment_cfg: Dict[str, Any],
+        representation: str,
+        cadence_seconds: int,
+        hybrid_levels: Optional[int],
+        fail_on_invalid: bool,
+    ) -> List[MultiAssetSnapshotRecord]:
+        return _align_multi_asset_records(
+            asset_records,
+            assets,
+            target_asset,
+            alignment_cfg,
+            representation,
+            cadence_seconds,
+            hybrid_levels,
+            fail_on_invalid,
+        )
 
 
 class StreamingSampleBuilder:
@@ -197,6 +248,8 @@ class StreamingSampleBuilder:
             raise ValueError("target_asset must be included in assets for snapshot streaming")
         self._target_asset = str(target_asset)
         self._asset_indices = {asset: idx for idx, asset in enumerate(self._assets)}
+        alignment_cfg = config.get("data", {}).get("asset_pairs", {}).get("alignment", {})
+        self._include_mask_channel = bool(alignment_cfg.get("include_mask_channel"))
 
         data_cfg = config["data"]
         time_range_cfg = data_cfg["time_range"]
@@ -276,6 +329,13 @@ class StreamingSampleBuilder:
         samples: List[SampleRecord] = []
         self._buffer.append(snapshot)
         self._latest_idx += 1
+
+        target_record = snapshot.asset_snapshots.get(self._target_asset)
+        if target_record is not None and target_record.gap_reset:
+            self._buffer = deque([snapshot])
+            self._buffer_start_idx = self._latest_idx
+            self._next_anchor_idx = self._latest_idx + (self._window_steps - 1)
+            return samples
 
         while self._latest_idx >= self._next_anchor_idx + self._horizon_steps:
             sample = self._build_sample(self._next_anchor_idx)
@@ -397,6 +457,16 @@ class StreamingSampleBuilder:
                         x_seq[t_idx, :, :, asset_idx] = hybrid
                     else:
                         x_seq[t_idx, :, :, asset_idx] = asset_rec.hybrid_snapshot
+            if self._include_mask_channel:
+                mask_seq = np.zeros_like(x_seq)
+                for t_idx, rec in enumerate(window_records):
+                    for asset_idx, asset in enumerate(self._assets):
+                        asset_rec = rec.asset_snapshots.get(asset)
+                        if asset_rec is None:
+                            return None
+                        confidence = float(asset_rec.confidence)
+                        mask_seq[t_idx, :, :, asset_idx] = confidence
+                x_seq = np.concatenate([x_seq, mask_seq], axis=-1)
             return x_seq
 
         if self._representation == "top_of_book":
@@ -417,6 +487,16 @@ class StreamingSampleBuilder:
                         x_seq[t_idx, 1, 0, asset_idx] = float(ask_price)
                     if self._height > 1 and self._width > 1:
                         x_seq[t_idx, 1, 1, asset_idx] = float(ask_qty)
+            if self._include_mask_channel:
+                mask_seq = np.zeros_like(x_seq)
+                for t_idx, rec in enumerate(window_records):
+                    for asset_idx, asset in enumerate(self._assets):
+                        asset_rec = rec.asset_snapshots.get(asset)
+                        if asset_rec is None:
+                            return None
+                        confidence = float(asset_rec.confidence)
+                        mask_seq[t_idx, :, :, asset_idx] = confidence
+                x_seq = np.concatenate([x_seq, mask_seq], axis=-1)
             return x_seq
 
         raise ValueError(f"Unsupported order book representation: {self._representation}")
@@ -531,6 +611,19 @@ def iter_snapshot_batches(
         yield x, y_up, y_down, anchor_ts
 
 
+def get_mask_channel_info(config: Dict[str, Any]) -> Tuple[int, int]:
+    data_cfg = config.get("data", {})
+    asset_pairs_cfg = data_cfg.get("asset_pairs", {})
+    correlated_assets = asset_pairs_cfg.get("correlated_assets", []) or []
+    num_assets = 1 + len(correlated_assets)
+
+    alignment_cfg = asset_pairs_cfg.get("alignment", {})
+    include_mask = bool(alignment_cfg.get("include_mask_channel"))
+    if not include_mask:
+        return 0, 0
+    return num_assets, num_assets
+
+
 def build_training_generator(
     dataset: SnapshotDataset,
     start_index: int,
@@ -539,6 +632,8 @@ def build_training_generator(
     num_classes: int,
     normalization: Optional[NormalizationStats],
     sample_weight_cfg: Optional[Dict[str, Any]],
+    mask_start: int = 0,
+    mask_count: int = 0,
 ) -> Tuple[Iterator[Tuple[Any, ...]], int]:
     """Create a generator for model.fit from snapshot chunks."""
 
@@ -573,7 +668,7 @@ def build_training_generator(
             for x_chunk, y_up_chunk, y_down_chunk, anchor_ts in iter_snapshot_batches(
                 dataset, start_index, end_index
             ):
-                x_chunk = _apply_normalization(x_chunk, normalization)
+                x_chunk = _apply_normalization(x_chunk, normalization, mask_start, mask_count)
 
                 n_chunk = x_chunk.shape[0]
                 for offset in range(0, n_chunk, batch_size):
@@ -599,7 +694,7 @@ def build_training_generator(
         for x_chunk, y_up_chunk, y_down_chunk, anchor_ts in iter_snapshot_batches(
             dataset, start_index, end_index
         ):
-            x_chunk = _apply_normalization(x_chunk, normalization)
+            x_chunk = _apply_normalization(x_chunk, normalization, mask_start, mask_count)
 
             n_chunk = x_chunk.shape[0]
             for offset in range(0, n_chunk, batch_size):
@@ -621,6 +716,8 @@ def compute_normalization_stats(
     start_index: int,
     end_index: int,
     method: str,
+    mask_start: int = 0,
+    mask_count: int = 0,
 ) -> NormalizationStats:
     """Compute normalization stats in a streaming pass."""
 
@@ -638,7 +735,8 @@ def compute_normalization_stats(
     for x_chunk, _, _, _ in iter_snapshot_batches(dataset, start_index, end_index):
         if x_chunk.size == 0:
             continue
-        x_flat = x_chunk.reshape(x_chunk.shape[0], -1).astype("float64")
+        x_non_mask, _ = _strip_mask_channels(x_chunk, mask_start, mask_count)
+        x_flat = x_non_mask.reshape(x_non_mask.shape[0], -1).astype("float64")
 
         if method == "min_max":
             batch_min = np.min(x_flat, axis=0)
@@ -705,10 +803,17 @@ def load_normalization_stats(path: str) -> NormalizationStats:
     return NormalizationStats(method=method, min=min_vals, max=max_vals, mean=mean_vals, std=std_vals)
 
 
-def _apply_normalization(x: np.ndarray, stats: Optional[NormalizationStats]) -> np.ndarray:
+def _apply_normalization(
+    x: np.ndarray,
+    stats: Optional[NormalizationStats],
+    mask_start: int,
+    mask_count: int,
+) -> np.ndarray:
     if stats is None:
         return x
-    x_flat = x.reshape(x.shape[0], -1)
+
+    x_non_mask, mask = _strip_mask_channels(x, mask_start, mask_count)
+    x_flat = x_non_mask.reshape(x_non_mask.shape[0], -1)
 
     if stats.method == "min_max":
         if stats.min is None or stats.max is None:
@@ -724,7 +829,26 @@ def _apply_normalization(x: np.ndarray, stats: Optional[NormalizationStats]) -> 
     else:
         raise ValueError(f"Unsupported normalization method for snapshot dataset: {stats.method}")
 
-    return x_norm.reshape(x.shape).astype("float32")
+    x_norm = x_norm.reshape(x_non_mask.shape).astype("float32")
+    if mask is None:
+        return x_norm
+
+    left = x_norm[..., :mask_start]
+    right = x_norm[..., mask_start:]
+    return np.concatenate([left, mask, right], axis=-1)
+
+
+def _strip_mask_channels(
+    x: np.ndarray,
+    mask_start: int,
+    mask_count: int,
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    if mask_count <= 0:
+        return x, None
+    mask_end = mask_start + mask_count
+    mask = x[..., mask_start:mask_end]
+    x_non_mask = np.concatenate([x[..., :mask_start], x[..., mask_end:]], axis=-1)
+    return x_non_mask, mask
 
 
 def _compute_current_day(dataset: SnapshotDataset, start_index: int, end_index: int) -> int:
@@ -741,40 +865,74 @@ def _compute_current_day(dataset: SnapshotDataset, start_index: int, end_index: 
     return max_day
 
 
-def _build_multi_asset_records(
+def _align_multi_asset_records(
     asset_records: Dict[str, List[SnapshotRecord]],
     assets: List[str],
     target_asset: str,
+    alignment_cfg: Dict[str, Any],
+    representation: str,
+    cadence_seconds: int,
+    hybrid_levels: Optional[int],
     fail_on_invalid: bool,
 ) -> List[MultiAssetSnapshotRecord]:
     target_records = asset_records.get(target_asset, [])
     if not target_records:
         return []
 
-    record_maps = {
-        asset: {rec.timestamp: rec for rec in records}
-        for asset, records in asset_records.items()
-    }
+    method = str(alignment_cfg.get("method", "interpolate"))
+    missing_policy_large = str(alignment_cfg.get("missing_policy_large", "zero_pad"))
+    large_gap_seconds = int(alignment_cfg.get("large_gap_seconds", 0))
+    bucket_tolerance_seconds = float(alignment_cfg.get("bucket_tolerance_seconds", 0.0))
+
+    if method not in {"interpolate", "bucket"}:
+        raise ValueError("data.asset_pairs.alignment.method must be 'interpolate' or 'bucket'")
+    if missing_policy_large not in {"zero_pad", "skip", "error"}:
+        raise ValueError("data.asset_pairs.alignment.missing_policy_large must be 'zero_pad', 'skip', or 'error'")
+    if large_gap_seconds <= 0:
+        raise ValueError("data.asset_pairs.alignment.large_gap_seconds must be positive")
+    if bucket_tolerance_seconds < 0:
+        raise ValueError("data.asset_pairs.alignment.bucket_tolerance_seconds must be >= 0")
+
+    target_times = np.asarray([rec.timestamp for rec in target_records], dtype="datetime64[ns]")
+
+    aligned_by_asset: Dict[str, List[Optional[SnapshotRecord]]] = {}
+    for asset in assets:
+        if asset == target_asset:
+            continue
+        records = asset_records.get(asset, [])
+        aligned_by_asset[asset] = _align_asset_records(
+            records=records,
+            target_times=target_times,
+            method=method,
+            representation=representation,
+            missing_policy_large=missing_policy_large,
+            large_gap_seconds=large_gap_seconds,
+            bucket_tolerance_seconds=bucket_tolerance_seconds,
+            cadence_seconds=cadence_seconds,
+            hybrid_levels=hybrid_levels,
+            fail_on_invalid=fail_on_invalid,
+            asset_name=asset,
+        )
 
     multi_records: List[MultiAssetSnapshotRecord] = []
-    for target_rec in target_records:
+    for idx, target_rec in enumerate(target_records):
         asset_snapshots: Dict[str, SnapshotRecord] = {target_asset: target_rec}
         missing_assets = []
         for asset in assets:
             if asset == target_asset:
                 continue
-            record = record_maps.get(asset, {}).get(target_rec.timestamp)
-            if record is None:
+            aligned_rec = aligned_by_asset[asset][idx]
+            if aligned_rec is None:
                 missing_assets.append(asset)
                 continue
-            asset_snapshots[asset] = record
+            asset_snapshots[asset] = aligned_rec
 
         if missing_assets:
             message = (
                 "Missing aligned correlated asset snapshots for timestamp="
                 f"{target_rec.timestamp}; missing_assets={missing_assets}"
             )
-            if fail_on_invalid:
+            if missing_policy_large == "error" or fail_on_invalid:
                 raise ValueError(message)
             logger.warning(message)
             continue
@@ -789,6 +947,351 @@ def _build_multi_asset_records(
     return multi_records
 
 
+def _align_asset_records(
+    *,
+    records: List[SnapshotRecord],
+    target_times: np.ndarray,
+    method: str,
+    representation: str,
+    missing_policy_large: str,
+    large_gap_seconds: int,
+    bucket_tolerance_seconds: float,
+    cadence_seconds: int,
+    hybrid_levels: Optional[int],
+    fail_on_invalid: bool,
+    asset_name: str,
+) -> List[Optional[SnapshotRecord]]:
+    if not records:
+        if missing_policy_large == "zero_pad":
+            return [
+                _zero_pad_record(target_times[i], representation, hybrid_levels)
+                for i in range(len(target_times))
+            ]
+        if missing_policy_large == "skip":
+            return [None for _ in range(len(target_times))]
+        raise ValueError(f"No records available for asset {asset_name} during alignment")
+
+    if method == "interpolate":
+        return _align_asset_interpolate(
+            records=records,
+            target_times=target_times,
+            representation=representation,
+            missing_policy_large=missing_policy_large,
+            large_gap_seconds=large_gap_seconds,
+            hybrid_levels=hybrid_levels,
+            fail_on_invalid=fail_on_invalid,
+            asset_name=asset_name,
+        )
+
+    return _align_asset_bucket(
+        records=records,
+        target_times=target_times,
+        representation=representation,
+        missing_policy_large=missing_policy_large,
+        bucket_tolerance_seconds=bucket_tolerance_seconds,
+        cadence_seconds=cadence_seconds,
+        hybrid_levels=hybrid_levels,
+        fail_on_invalid=fail_on_invalid,
+        asset_name=asset_name,
+    )
+
+
+def _align_asset_interpolate(
+    *,
+    records: List[SnapshotRecord],
+    target_times: np.ndarray,
+    representation: str,
+    missing_policy_large: str,
+    large_gap_seconds: int,
+    hybrid_levels: Optional[int],
+    fail_on_invalid: bool,
+    asset_name: str,
+) -> List[Optional[SnapshotRecord]]:
+    times = np.asarray([rec.timestamp for rec in records], dtype="datetime64[ms]")
+    times_ms = times.astype("int64")
+    target_ms = target_times.astype("datetime64[ms]").astype("int64")
+
+    values, confidences = _extract_record_values(records, representation)
+    if values is None:
+        if missing_policy_large == "zero_pad":
+            return [
+                _zero_pad_record(target_times[i], representation, hybrid_levels)
+                for i in range(len(target_times))
+            ]
+        if missing_policy_large == "skip":
+            return [None for _ in range(len(target_times))]
+        raise ValueError(f"Missing values for asset {asset_name} during alignment")
+
+    aligned: List[Optional[SnapshotRecord]] = []
+    large_gap_ms = int(large_gap_seconds * 1000)
+
+    for t_ms, t_dt in zip(target_ms, target_times):
+        idx = int(np.searchsorted(times_ms, t_ms, side="left"))
+        if idx < len(times_ms) and times_ms[idx] == t_ms:
+            value = values[idx]
+            confidence = confidences[idx]
+            aligned.append(_build_aligned_record(t_dt, value, representation, confidence))
+            continue
+
+        left = idx - 1
+        right = idx
+        if left < 0 or right >= len(times_ms):
+            aligned.append(
+                _handle_missing_alignment(
+                    t_dt,
+                    representation,
+                    missing_policy_large,
+                    fail_on_invalid,
+                    asset_name,
+                    hybrid_levels,
+                )
+            )
+            continue
+
+        gap_ms = int(times_ms[right] - times_ms[left])
+        if gap_ms <= 0 or gap_ms > large_gap_ms:
+            aligned.append(
+                _handle_missing_alignment(
+                    t_dt,
+                    representation,
+                    missing_policy_large,
+                    fail_on_invalid,
+                    asset_name,
+                    hybrid_levels,
+                )
+            )
+            continue
+
+        alpha = float(t_ms - times_ms[left]) / float(gap_ms)
+        value = values[left] + alpha * (values[right] - values[left])
+        confidence = float(confidences[left] + alpha * (confidences[right] - confidences[left]))
+        confidence = float(np.clip(confidence, 0.0, 1.0))
+        aligned.append(_build_aligned_record(t_dt, value, representation, confidence))
+
+    return aligned
+
+
+def _align_asset_bucket(
+    *,
+    records: List[SnapshotRecord],
+    target_times: np.ndarray,
+    representation: str,
+    missing_policy_large: str,
+    bucket_tolerance_seconds: float,
+    cadence_seconds: int,
+    hybrid_levels: Optional[int],
+    fail_on_invalid: bool,
+    asset_name: str,
+) -> List[Optional[SnapshotRecord]]:
+    if cadence_seconds <= 0:
+        raise ValueError("data.time_range.cadence_seconds must be positive")
+
+    cadence_ms = int(cadence_seconds * 1000)
+    tolerance_ms = float(bucket_tolerance_seconds * 1000.0)
+
+    times = np.asarray([rec.timestamp for rec in records], dtype="datetime64[ms]")
+    times_ms = times.astype("int64")
+
+    bucket_map: Dict[int, Tuple[float, SnapshotRecord]] = {}
+    for rec, t_ms in zip(records, times_ms):
+        bucket = int((t_ms // cadence_ms) * cadence_ms)
+        distance = float(abs(t_ms - bucket))
+        if distance > tolerance_ms:
+            continue
+        existing = bucket_map.get(bucket)
+        if existing is None or distance < existing[0]:
+            bucket_map[bucket] = (distance, rec)
+
+    aligned: List[Optional[SnapshotRecord]] = []
+    target_ms = target_times.astype("datetime64[ms]").astype("int64")
+    for t_ms, t_dt in zip(target_ms, target_times):
+        bucket = int((t_ms // cadence_ms) * cadence_ms)
+        record_entry = bucket_map.get(bucket)
+        if record_entry is None:
+            aligned.append(
+                _handle_missing_alignment(
+                    t_dt,
+                    representation,
+                    missing_policy_large,
+                    fail_on_invalid,
+                    asset_name,
+                    hybrid_levels,
+                )
+            )
+            continue
+        record = record_entry[1]
+        value, confidence = _extract_single_record_value(record, representation)
+        aligned.append(_build_aligned_record(t_dt, value, representation, confidence))
+
+    return aligned
+
+
+def _extract_record_values(
+    records: List[SnapshotRecord],
+    representation: str,
+) -> Tuple[Optional[np.ndarray], np.ndarray]:
+    values_list = []
+    confidences = np.array([rec.confidence for rec in records], dtype="float64")
+
+    for rec in records:
+        value, _ = _extract_single_record_value(rec, representation)
+        if value is None:
+            return None, confidences
+        values_list.append(value)
+
+    values = np.asarray(values_list, dtype="float64")
+    return values, confidences
+
+
+def _extract_single_record_value(
+    record: SnapshotRecord,
+    representation: str,
+) -> Tuple[np.ndarray, float]:
+    if representation == "hybrid":
+        if record.hybrid_snapshot is None:
+            raise ValueError("Missing hybrid data for alignment")
+        value = np.asarray(record.hybrid_snapshot, dtype="float64")
+        return value, float(record.confidence)
+
+    features = record.snapshot_features
+    if len(features) < 4:
+        raise ValueError("snapshot_features must contain at least 4 values for alignment")
+    value = np.asarray(features[:4], dtype="float64")
+    return value, float(record.confidence)
+
+
+def _build_aligned_record(
+    timestamp: np.datetime64,
+    value: np.ndarray,
+    representation: str,
+    confidence: float,
+) -> SnapshotRecord:
+    confidence = float(np.clip(confidence, 0.0, 1.0))
+    if representation == "hybrid":
+        hybrid_snapshot = np.asarray(value, dtype="float32")
+        if hybrid_snapshot.ndim != 2 or hybrid_snapshot.shape[1] != 4:
+            raise ValueError("Aligned hybrid snapshot must have shape (L, 4)")
+        bid_price = float(hybrid_snapshot[0, 0]) if hybrid_snapshot.shape[0] > 0 else 0.0
+        bid_qty = float(hybrid_snapshot[0, 1]) if hybrid_snapshot.shape[0] > 0 else 0.0
+        ask_price = float(hybrid_snapshot[0, 2]) if hybrid_snapshot.shape[0] > 0 else 0.0
+        ask_qty = float(hybrid_snapshot[0, 3]) if hybrid_snapshot.shape[0] > 0 else 0.0
+        mid_price = 0.5 * (bid_price + ask_price) if bid_price > 0 and ask_price > 0 else 0.0
+        return SnapshotRecord(
+            timestamp=timestamp,
+            snapshot_features=[bid_price, bid_qty, ask_price, ask_qty],
+            depth=None,
+            mid_price=mid_price,
+            hybrid_snapshot=hybrid_snapshot.astype("float32"),
+            volume_proxy=0.0,
+            confidence=confidence,
+            gap_reset=False,
+        )
+
+    features = np.asarray(value, dtype="float32")
+    if features.shape[0] < 4:
+        raise ValueError("Aligned top_of_book features must have at least 4 values")
+    bid_price = float(features[0])
+    bid_qty = float(features[1])
+    ask_price = float(features[2])
+    ask_qty = float(features[3])
+    mid_price = 0.5 * (bid_price + ask_price) if bid_price > 0 and ask_price > 0 else 0.0
+    return SnapshotRecord(
+        timestamp=timestamp,
+        snapshot_features=[bid_price, bid_qty, ask_price, ask_qty],
+        depth=None,
+        mid_price=mid_price,
+        hybrid_snapshot=None,
+        volume_proxy=0.0,
+        confidence=confidence,
+        gap_reset=False,
+    )
+
+
+def _populate_hybrid_snapshots(
+    records: List[SnapshotRecord],
+    config: Dict[str, Any],
+    *,
+    fail_on_invalid: bool,
+    asset_name: str,
+) -> None:
+    hybrid_levels = get_hybrid_output_shape(config)
+    for rec in records:
+        if rec.hybrid_snapshot is not None:
+            continue
+        if rec.depth is None:
+            message = f"Missing depth data for asset={asset_name} while building hybrid snapshots"
+            if fail_on_invalid:
+                raise ValueError(message)
+            logger.warning(message)
+            fallback = np.zeros((hybrid_levels, 4), dtype="float32")
+            if len(rec.snapshot_features) >= 4:
+                bid_price, bid_qty, ask_price, ask_qty = rec.snapshot_features[:4]
+                fallback[0, 0] = float(bid_price)
+                fallback[0, 1] = float(bid_qty)
+                fallback[0, 2] = float(ask_price)
+                fallback[0, 3] = float(ask_qty)
+            rec.hybrid_snapshot = fallback
+            continue
+        rec.hybrid_snapshot = aggregate_snapshot_to_hybrid(
+            bid_prices=rec.depth["bid_prices"],
+            bid_quantities=rec.depth["bid_quantities"],
+            ask_prices=rec.depth["ask_prices"],
+            ask_quantities=rec.depth["ask_quantities"],
+            config=config,
+        ).astype("float32")
+
+
+def _zero_pad_record(
+    timestamp: np.datetime64,
+    representation: str,
+    hybrid_levels: Optional[int],
+) -> SnapshotRecord:
+    if representation == "hybrid":
+        if hybrid_levels is None or hybrid_levels <= 0:
+            raise ValueError("hybrid_levels must be provided for zero-padding hybrid snapshots")
+        return SnapshotRecord(
+            timestamp=timestamp,
+            snapshot_features=[0.0, 0.0, 0.0, 0.0],
+            depth=None,
+            mid_price=0.0,
+            hybrid_snapshot=np.zeros((hybrid_levels, 4), dtype="float32"),
+            volume_proxy=0.0,
+            confidence=0.0,
+            gap_reset=False,
+        )
+
+    return SnapshotRecord(
+        timestamp=timestamp,
+        snapshot_features=[0.0, 0.0, 0.0, 0.0],
+        depth=None,
+        mid_price=0.0,
+        hybrid_snapshot=None,
+        volume_proxy=0.0,
+        confidence=0.0,
+        gap_reset=False,
+    )
+
+
+def _handle_missing_alignment(
+    timestamp: np.datetime64,
+    representation: str,
+    missing_policy_large: str,
+    fail_on_invalid: bool,
+    asset_name: str,
+    hybrid_levels: Optional[int],
+) -> Optional[SnapshotRecord]:
+    message = f"Missing aligned data for asset={asset_name} at timestamp={timestamp}"
+    if missing_policy_large == "error":
+        raise ValueError(message)
+    if missing_policy_large == "skip":
+        if fail_on_invalid:
+            raise ValueError(message)
+        logger.warning(message)
+        return None
+    logger.warning("Zero-padding %s", message)
+    return _zero_pad_record(timestamp, representation, hybrid_levels)
+
+
 def _build_snapshot_chunks(
     config: Dict[str, Any],
     context: SnapshotContext,
@@ -799,6 +1302,7 @@ def _build_snapshot_chunks(
     start_date = str(time_range_cfg["start_date"])
     end_date = str(time_range_cfg["end_date"])
     chunk_hours = int(data_cfg["ingestion"]["chunk_hours"])
+    cadence_seconds = int(time_range_cfg["cadence_seconds"])
 
     if chunk_hours <= 0:
         raise ValueError("data.ingestion.chunk_hours must be positive")
@@ -884,6 +1388,11 @@ def _build_snapshot_chunks(
             logger.warning(message)
             return
 
+        order_book_cfg = data_cfg["order_book"]
+        representation = str(order_book_cfg.get("representation", "top_of_book"))
+        if representation == "full":
+            representation = "hybrid"
+
         asset_records: Dict[str, List[SnapshotRecord]] = {}
         for asset in assets:
             rows = chunk_rows_by_asset.get(asset, [])
@@ -896,9 +1405,28 @@ def _build_snapshot_chunks(
             compute_volume_proxy = asset == target_asset
             records = _build_snapshots_from_rows(chunk, config, compute_volume_proxy=compute_volume_proxy)
             filled_records = list(gap_handlers[asset].iter_gap_handled(records))
+            if representation == "hybrid":
+                _populate_hybrid_snapshots(
+                    filled_records,
+                    config,
+                    fail_on_invalid=fail_on_invalid,
+                    asset_name=asset,
+                )
             asset_records[asset] = filled_records
 
-        multi_records = _build_multi_asset_records(asset_records, assets, target_asset, fail_on_invalid)
+        hybrid_levels = get_hybrid_output_shape(config) if representation == "hybrid" else None
+
+        alignment_cfg = asset_pairs_cfg.get("alignment", {})
+        multi_records = GapHandler.align_multi_asset(
+            asset_records=asset_records,
+            assets=assets,
+            target_asset=target_asset,
+            alignment_cfg=alignment_cfg,
+            representation=representation,
+            cadence_seconds=cadence_seconds,
+            hybrid_levels=hybrid_levels,
+            fail_on_invalid=fail_on_invalid,
+        )
         for snapshot in multi_records:
             for sample in sample_builder.add_snapshot(snapshot):
                 anchor_ts = sample.anchor_ts_seconds
@@ -1050,19 +1578,24 @@ def _create_gap_handler(config: Dict[str, Any]) -> GapHandler:
     validation_cfg = data_cfg["validation"]
     targets_cfg = config["targets"]
     labeling_cfg = targets_cfg["labeling"]
+    alignment_cfg = data_cfg.get("asset_pairs", {}).get("alignment", {})
 
     cadence_seconds = int(time_range_cfg["cadence_seconds"])
     max_gap_seconds = int(validation_cfg["max_gap_seconds"])
     check_missing_data = bool(validation_cfg["check_missing_data"])
     fail_on_invalid = bool(validation_cfg["fail_on_invalid"])
-    handle_gaps = str(labeling_cfg["handle_gaps"])
+    handle_gaps = str(alignment_cfg.get("missing_policy_small") or labeling_cfg["handle_gaps"])
+    large_gap_seconds = int(alignment_cfg.get("large_gap_seconds", max_gap_seconds))
 
     if handle_gaps not in {"skip", "forward_fill", "interpolate"}:
         raise ValueError("targets.labeling.handle_gaps must be 'skip', 'forward_fill', or 'interpolate'")
+    if large_gap_seconds <= 0:
+        raise ValueError("data.asset_pairs.alignment.large_gap_seconds must be positive")
 
     return GapHandler(
         cadence_seconds=cadence_seconds,
         max_gap_seconds=max_gap_seconds,
+        large_gap_seconds=large_gap_seconds,
         handle_gaps=handle_gaps,
         check_missing_data=check_missing_data,
         fail_on_invalid=fail_on_invalid,
@@ -1207,6 +1740,8 @@ def _build_snapshots_from_rows(
                 mid_price=mid_price,
                 hybrid_snapshot=hybrid_snapshot,
                 volume_proxy=volume_proxy,
+                confidence=1.0,
+                gap_reset=False,
             )
         )
 
@@ -1418,6 +1953,7 @@ __all__ = [
     "SnapshotDataset",
     "build_training_generator",
     "compute_normalization_stats",
+    "get_mask_channel_info",
     "iter_snapshot_batches",
     "load_normalization_stats",
     "load_snapshot_dataset",

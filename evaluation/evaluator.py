@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 import logging
 from pathlib import Path
 import tempfile
@@ -14,6 +14,7 @@ from preprocessing.train_test_split import chronological_split_indices
 from training.snapshot_dataset import (
     NormalizationStats,
     compute_normalization_stats,
+    get_mask_channel_info,
     iter_snapshot_batches,
     load_normalization_stats,
     prepare_snapshot_dataset,
@@ -739,11 +740,20 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
     method = str(normalization_cfg["method"])
     fit_on_train_only = bool(normalization_cfg["fit_on_train_only"])
 
+    mask_start, mask_count = get_mask_channel_info(config)
+
     stats_path = os.path.join(context.snapshot_dir, "normalization_stats_train.npz")
     if os.path.exists(stats_path):
         train_stats = load_normalization_stats(stats_path)
     else:
-        train_stats = compute_normalization_stats(snapshot_dataset, 0, train_end, method)
+        train_stats = compute_normalization_stats(
+            snapshot_dataset,
+            0,
+            train_end,
+            method,
+            mask_start=mask_start,
+            mask_count=mask_count,
+        )
         save_normalization_stats(stats_path, train_stats)
 
     stats_meta = manifest.get("normalization_stats", {})
@@ -797,7 +807,7 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
     for x_chunk, y_up_chunk, y_down_chunk, _ in iter_snapshot_batches(
         snapshot_dataset, test_start, test_end
     ):
-        x_chunk = _apply_normalization_snapshot(x_chunk, eval_stats)
+        x_chunk = _apply_normalization_snapshot(x_chunk, eval_stats, mask_start, mask_count)
         n_chunk = x_chunk.shape[0]
 
         for offset in range(0, n_chunk, batch_size):
@@ -1077,8 +1087,14 @@ def _write_calibration_curve(calibration_results: Dict[str, Any], path: Path) ->
     )
 
 
-def _apply_normalization_snapshot(x: np.ndarray, stats: NormalizationStats) -> np.ndarray:
-    x_flat = x.reshape(x.shape[0], -1)
+def _apply_normalization_snapshot(
+    x: np.ndarray,
+    stats: NormalizationStats,
+    mask_start: int,
+    mask_count: int,
+) -> np.ndarray:
+    x_non_mask, mask = _strip_mask_channels(x, mask_start, mask_count)
+    x_flat = x_non_mask.reshape(x_non_mask.shape[0], -1)
 
     if stats.method == "min_max":
         if stats.min is None or stats.max is None:
@@ -1094,7 +1110,26 @@ def _apply_normalization_snapshot(x: np.ndarray, stats: NormalizationStats) -> n
     else:
         raise ValueError(f"Unsupported normalization method for snapshot evaluation: {stats.method}")
 
-    return x_norm.reshape(x.shape).astype("float32")
+    x_norm = x_norm.reshape(x_non_mask.shape).astype("float32")
+    if mask is None:
+        return x_norm
+
+    left = x_norm[..., :mask_start]
+    right = x_norm[..., mask_start:]
+    return np.concatenate([left, mask, right], axis=-1)
+
+
+def _strip_mask_channels(
+    x: np.ndarray,
+    mask_start: int,
+    mask_count: int,
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    if mask_count <= 0:
+        return x, None
+    mask_end = mask_start + mask_count
+    mask = x[..., mask_start:mask_end]
+    x_non_mask = np.concatenate([x[..., :mask_start], x[..., mask_end:]], axis=-1)
+    return x_non_mask, mask
 
 
 def _assign_calibration_bins_with_truth(
