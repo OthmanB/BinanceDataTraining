@@ -395,8 +395,15 @@ def prepare_snapshot_dataset(config: Dict[str, Any]) -> SnapshotDataset:
     manifest = load_or_create_manifest(context, config)
 
     complete = bool(manifest.get("complete"))
+    chunk_entries = manifest.get("chunks", []) or []
+    if complete and not chunk_entries:
+        logger.warning(
+            "Snapshot manifest marked complete but contains no chunks; rebuilding snapshot.",
+        )
+        complete = False
+
     if complete:
-        for entry in manifest.get("chunks", []) or []:
+        for entry in chunk_entries:
             file_rel = entry.get("file")
             if not file_rel:
                 complete = False
@@ -495,7 +502,7 @@ def build_training_generator(
     num_classes: int,
     normalization: Optional[NormalizationStats],
     sample_weight_cfg: Optional[Dict[str, Any]],
-) -> Tuple[Iterator[Tuple[np.ndarray, List[np.ndarray], Optional[List[np.ndarray]]]], int]:
+) -> Tuple[Iterator[Tuple[Any, ...]], int]:
     """Create a generator for model.fit from snapshot chunks."""
 
     if batch_size <= 0:
@@ -518,8 +525,36 @@ def build_training_generator(
         current_day = _compute_current_day(dataset, start_index, end_index)
         use_weights = True
 
-    def _generator() -> Iterator[Tuple[np.ndarray, List[np.ndarray], Optional[List[np.ndarray]]]]:
-        eye = np.eye(num_classes, dtype="float32")
+    eye = np.eye(num_classes, dtype="float32")
+
+    if use_weights:
+        def _generator_with_weights() -> Iterator[Tuple[np.ndarray, Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]]:
+            for x_chunk, y_up_chunk, y_down_chunk, anchor_ts in iter_snapshot_batches(
+                dataset, start_index, end_index
+            ):
+                x_chunk = _apply_normalization(x_chunk, normalization)
+
+                n_chunk = x_chunk.shape[0]
+                for offset in range(0, n_chunk, batch_size):
+                    x_batch = x_chunk[offset : offset + batch_size]
+                    y_up = y_up_chunk[offset : offset + batch_size]
+                    y_down = y_down_chunk[offset : offset + batch_size]
+
+                    y_up_oh = eye[y_up]
+                    y_down_oh = eye[y_down]
+                    y_batch = (y_up_oh, y_down_oh)
+
+                    anchor_slice = anchor_ts[offset : offset + batch_size]
+                    anchor_days = (anchor_slice // 86400).astype("float64")
+                    age_days = float(current_day) - anchor_days
+                    weights = np.exp(-age_days * decay_const).astype("float32")
+                    sample_weight = (weights, weights)
+
+                    yield x_batch, y_batch, sample_weight
+
+        return _generator_with_weights(), steps
+
+    def _generator_no_weights() -> Iterator[Tuple[np.ndarray, Tuple[np.ndarray, np.ndarray]]]:
         for x_chunk, y_up_chunk, y_down_chunk, anchor_ts in iter_snapshot_batches(
             dataset, start_index, end_index
         ):
@@ -533,20 +568,11 @@ def build_training_generator(
 
                 y_up_oh = eye[y_up]
                 y_down_oh = eye[y_down]
-                y_batch = [y_up_oh, y_down_oh]
+                y_batch = (y_up_oh, y_down_oh)
 
-                if use_weights and current_day is not None and decay_const is not None:
-                    anchor_slice = anchor_ts[offset : offset + batch_size]
-                    anchor_days = (anchor_slice // 86400).astype("float64")
-                    age_days = float(current_day) - anchor_days
-                    weights = np.exp(-age_days * decay_const).astype("float32")
-                    sample_weight = [weights, weights]
-                else:
-                    sample_weight = None
+                yield x_batch, y_batch
 
-                yield x_batch, y_batch, sample_weight
-
-    return _generator(), steps
+    return _generator_no_weights(), steps
 
 
 def compute_normalization_stats(

@@ -361,7 +361,9 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
                         normalization=train_stats,
                         sample_weight_cfg=None,
                     )
-                    x_sample, y_sample, _ = next(iter(sample_gen))
+                    batch = next(iter(sample_gen))
+                    x_sample = batch[0]
+                    y_sample = batch[1]
                     signature = infer_signature(x_sample, model.predict(x_sample))
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
