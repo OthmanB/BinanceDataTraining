@@ -22,6 +22,11 @@ import time
 
 import requests
 
+from .sql_utils import (
+    build_order_book_query,
+    build_connectivity_check_query,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -177,7 +182,7 @@ def _check_greptime_connectivity_for_connection(
 
     for asset in assets:
         table_name = f"{table_prefix}{asset.lower()}"
-        sql = f"SELECT 1 FROM {table_name} LIMIT 1"
+        sql = build_connectivity_check_query(table_name)
 
         logger.info(
             "Checking GreptimeDB connectivity at %s (table=%s)",
@@ -640,17 +645,15 @@ def _fetch_order_book_rows_for_connection(
 
         for chunk_idx, (chunk_start, chunk_end, is_last_chunk) in enumerate(chunks):
             # Use exclusive end for interior chunks, inclusive for last chunk
-            if is_last_chunk:
-                end_operator = "<="
-            else:
-                end_operator = "<"
-
-            sql = (
-                f"SELECT {ts_col}, {bid_price_col}, {bid_qty_col}, {ask_price_col}, {ask_qty_col}, {batch_id_col} "
-                f"FROM {table_name} "
-                f"WHERE {ts_col} >= '{chunk_start}' AND {ts_col} {end_operator} '{chunk_end}' "
-                f"AND {bid_price_col} > 0 AND {ask_price_col} > 0 "
-                f"ORDER BY {ts_col} ASC"
+            sql = build_order_book_query(
+                table_name=table_name,
+                columns=[ts_col, bid_price_col, bid_qty_col, ask_price_col, ask_qty_col, batch_id_col],
+                timestamp_column=ts_col,
+                start_datetime=chunk_start,
+                end_datetime=chunk_end,
+                end_inclusive=is_last_chunk,
+                bid_price_column=bid_price_col,
+                ask_price_column=ask_price_col,
             )
 
             logger.info(
@@ -770,15 +773,17 @@ def _fetch_order_book_rows_for_chunk(
     connect_timeout = timeout_cfg["connect_timeout_seconds"]
     request_timeout = timeout_cfg["request_timeout_seconds"]
 
-    end_operator = "<=" if end_inclusive else "<"
     table_name = f"{table_prefix}{asset.lower()}"
 
-    sql = (
-        f"SELECT {ts_col}, {bid_price_col}, {bid_qty_col}, {ask_price_col}, {ask_qty_col}, {batch_id_col} "
-        f"FROM {table_name} "
-        f"WHERE {ts_col} >= '{chunk_start}' AND {ts_col} {end_operator} '{chunk_end}' "
-        f"AND {bid_price_col} > 0 AND {ask_price_col} > 0 "
-        f"ORDER BY {ts_col} ASC"
+    sql = build_order_book_query(
+        table_name=table_name,
+        columns=[ts_col, bid_price_col, bid_qty_col, ask_price_col, ask_qty_col, batch_id_col],
+        timestamp_column=ts_col,
+        start_datetime=chunk_start,
+        end_datetime=chunk_end,
+        end_inclusive=end_inclusive,
+        bid_price_column=bid_price_col,
+        ask_price_column=ask_price_col,
     )
 
     try:
@@ -928,17 +933,19 @@ def _stream_order_book_rows_for_connection(
         )
 
         for chunk_idx, (chunk_start, chunk_end, is_last_chunk) in enumerate(chunks):
-            if is_last_chunk:
-                end_operator = "<="
-            else:
-                end_operator = "<"
+            include_end = is_last_chunk
 
-            sql = (
-                f"SELECT {ts_col}, {bid_price_col}, {bid_qty_col}, {ask_price_col}, {ask_qty_col}, {batch_id_col} "
-                f"FROM {table_name} "
-                f"WHERE {ts_col} >= '{chunk_start}' AND {ts_col} {end_operator} '{chunk_end}' "
-                f"AND {bid_price_col} > 0 AND {ask_price_col} > 0 "
-                f"ORDER BY {ts_col} ASC"
+            sql = build_order_book_query(
+                table_name=table_name,
+                ts_col=ts_col,
+                bid_price_col=bid_price_col,
+                bid_qty_col=bid_qty_col,
+                ask_price_col=ask_price_col,
+                ask_qty_col=ask_qty_col,
+                batch_id_col=batch_id_col,
+                start_dt=chunk_start,
+                end_dt=chunk_end,
+                include_end=include_end,
             )
 
             logger.info(

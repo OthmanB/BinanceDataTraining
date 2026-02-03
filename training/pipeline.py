@@ -28,15 +28,18 @@ from .dataset_cache import compute_dataset_hash, cache_dataset_to_npz
 from .snapshot_dataset import (
     NormalizationStats,
     build_training_generator,
+    compute_label_distribution,
     compute_normalization_stats,
     get_mask_channel_info,
+    load_label_stats_from_manifest,
     load_normalization_stats,
     prepare_snapshot_dataset,
+    save_label_stats_to_manifest,
     save_normalization_stats,
 )
 from .snapshot_store import load_or_create_manifest, resolve_snapshot_context, save_manifest
 from .callbacks import create_callbacks
-from .class_weights import compute_class_weights
+from .class_weights import compute_class_weights, compute_class_weights_from_counts
 
 
 logger = logging.getLogger(__name__)
@@ -142,11 +145,7 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
         )
 
     class_weights_cfg = training_cfg.get("class_weights", {})
-    if isinstance(class_weights_cfg, dict) and class_weights_cfg.get("compute_from_train"):
-        raise ConfigError(
-            "training.class_weights.compute_from_train is not supported for multi-output models in this phase. "
-            "Disable it or implement per-output sample weighting before enabling.",
-        )
+    use_class_weights = isinstance(class_weights_cfg, dict) and class_weights_cfg.get("compute_from_train")
 
     snapshot_dataset = prepare_snapshot_dataset(config)
     n_samples = int(snapshot_dataset.total_samples)
@@ -218,6 +217,62 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
             "val",
         )
 
+    # Compute class weights for imbalanced label handling if configured.
+    # Class weights are computed from training data only to avoid data leakage.
+    class_weights_up: Optional[Dict[int, float]] = None
+    class_weights_down: Optional[Dict[int, float]] = None
+
+    if use_class_weights:
+        num_classes = int(output_cfg["num_classes"])
+
+        # Try to load cached label stats from manifest first
+        train_label_dist = load_label_stats_from_manifest(manifest, "train")
+
+        if train_label_dist is None:
+            # Compute label distribution by streaming through training data
+            logger.info(
+                "Computing label distribution for class weights (train samples 0 to %s)...",
+                effective_train_n,
+            )
+            train_label_dist = compute_label_distribution(
+                snapshot_dataset,
+                start_index=0,
+                end_index=effective_train_n,
+                num_classes=num_classes,
+            )
+            # Cache in manifest for future runs
+            save_label_stats_to_manifest(context, manifest, train_label_dist, "train")
+
+        # Compute class weights from label counts
+        class_weights_up = compute_class_weights_from_counts(
+            train_label_dist.up_counts,
+            num_classes,
+        )
+        class_weights_down = compute_class_weights_from_counts(
+            train_label_dist.down_counts,
+            num_classes,
+        )
+
+        logger.info(
+            "Class weights computed for two-head outputs: up_weights=%s, down_weights=%s",
+            {c: round(w, 4) for c, w in sorted(class_weights_up.items())},
+            {c: round(w, 4) for c, w in sorted(class_weights_down.items())},
+        )
+
+        # Log class weights to MLFlow if available
+        try:
+            import mlflow  # type: ignore[import]
+        except Exception:  # noqa: BLE001
+            pass
+        else:
+            try:
+                for c, w in class_weights_up.items():
+                    mlflow.log_metric(f"class_weight_up_{c}", float(w))
+                for c, w in class_weights_down.items():
+                    mlflow.log_metric(f"class_weight_down_{c}", float(w))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to log class weights to MLFlow: %s", exc)
+
     from models.cnn_lstm_multiclass import build_cnn_lstm_model
 
     model = build_cnn_lstm_model(config, input_shape=input_shape)
@@ -270,6 +325,8 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
         sample_weight_cfg=training_cfg.get("sample_weighting"),
         mask_start=mask_start,
         mask_count=mask_count,
+        class_weights_up=class_weights_up,
+        class_weights_down=class_weights_down,
     )
 
     fit_kwargs: Dict[str, Any] = {
@@ -291,6 +348,8 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
             sample_weight_cfg=None,
             mask_start=mask_start,
             mask_count=mask_count,
+            class_weights_up=None,  # No class weights for validation
+            class_weights_down=None,
         )
         fit_kwargs["validation_data"] = val_gen
         fit_kwargs["validation_steps"] = val_steps

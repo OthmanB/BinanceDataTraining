@@ -634,18 +634,60 @@ def build_training_generator(
     sample_weight_cfg: Optional[Dict[str, Any]],
     mask_start: int = 0,
     mask_count: int = 0,
+    class_weights_up: Optional[Dict[int, float]] = None,
+    class_weights_down: Optional[Dict[int, float]] = None,
 ) -> Tuple[Iterator[Tuple[Any, ...]], int]:
-    """Create a generator for model.fit from snapshot chunks."""
+    """Create a generator for model.fit from snapshot chunks.
 
+    Parameters
+    ----------
+    dataset:
+        Snapshot dataset to iterate.
+    start_index:
+        Start sample index (inclusive).
+    end_index:
+        End sample index (exclusive).
+    batch_size:
+        Number of samples per batch.
+    num_classes:
+        Number of output classes.
+    normalization:
+        Optional normalization stats to apply.
+    sample_weight_cfg:
+        Optional sample weighting config (exponential decay).
+    mask_start:
+        Start index for mask channels (for normalization).
+    mask_count:
+        Number of mask channels (for normalization).
+    class_weights_up:
+        Optional dict mapping class index to weight for up-head.
+        When provided, class weights are applied as sample weights.
+    class_weights_down:
+        Optional dict mapping class index to weight for down-head.
+        When provided, class weights are applied as sample weights.
+
+    Returns
+    -------
+    Tuple[Iterator, int]:
+        Generator and number of steps per epoch.
+
+    Notes
+    -----
+    When both sample_weight_cfg (exponential decay) and class weights are
+    provided, the final sample weight is the product of both weights.
+    Class weights are converted to per-sample weights by looking up each
+    sample's label in the class_weights dict.
+    """
     if batch_size <= 0:
         raise ValueError("training.batch_size must be positive")
 
     total_samples = max(0, end_index - start_index)
     steps = int(math.ceil(total_samples / float(batch_size))) if total_samples > 0 else 0
 
+    # Determine if exponential decay weighting is enabled
     current_day = None
     decay_const = None
-    use_weights = False
+    use_decay_weights = False
     if sample_weight_cfg and sample_weight_cfg.get("enabled"):
         method = str(sample_weight_cfg["method"])
         if method != "exponential_decay":
@@ -655,16 +697,44 @@ def build_training_generator(
             raise ValueError("training.sample_weighting.half_life_days must be positive")
         decay_const = float(np.log(2.0) / float(half_life_days))
         current_day = _compute_current_day(dataset, start_index, end_index)
-        use_weights = True
+        use_decay_weights = True
+
+    # Determine if class weighting is enabled
+    use_class_weights = class_weights_up is not None or class_weights_down is not None
+
+    # Combined: any weighting active?
+    use_weights = use_decay_weights or use_class_weights
 
     eye = np.eye(num_classes, dtype="float32")
 
+    # Helper to compute class-based sample weights
+    def _compute_class_sample_weights(
+        y_up: np.ndarray,
+        y_down: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Convert class weights to per-sample weights."""
+        batch_len = y_up.shape[0]
+
+        if class_weights_up is not None:
+            weights_up = np.array(
+                [class_weights_up.get(int(label), 1.0) for label in y_up],
+                dtype="float32",
+            )
+        else:
+            weights_up = np.ones(batch_len, dtype="float32")
+
+        if class_weights_down is not None:
+            weights_down = np.array(
+                [class_weights_down.get(int(label), 1.0) for label in y_down],
+                dtype="float32",
+            )
+        else:
+            weights_down = np.ones(batch_len, dtype="float32")
+
+        return weights_up, weights_down
+
     if use_weights:
         def _generator_with_weights() -> Iterator[Tuple[np.ndarray, Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]]:
-            if current_day is None or decay_const is None:
-                raise ValueError("Sample weighting requires current_day and decay_const")
-            day_value = float(current_day)
-            decay_value = float(decay_const)
             for x_chunk, y_up_chunk, y_down_chunk, anchor_ts in iter_snapshot_batches(
                 dataset, start_index, end_index
             ):
@@ -680,12 +750,29 @@ def build_training_generator(
                     y_down_oh = eye[y_down]
                     y_batch = (y_up_oh, y_down_oh)
 
-                    anchor_slice = anchor_ts[offset : offset + batch_size]
-                    anchor_days = (anchor_slice // 86400).astype("float64")
-                    age_days = day_value - anchor_days
-                    weights = np.exp(-age_days * decay_value).astype("float32")
-                    sample_weight = (weights, weights)
+                    # Start with ones
+                    batch_len = x_batch.shape[0]
+                    weights_up = np.ones(batch_len, dtype="float32")
+                    weights_down = np.ones(batch_len, dtype="float32")
 
+                    # Apply exponential decay if enabled
+                    if use_decay_weights:
+                        if current_day is None or decay_const is None:
+                            raise ValueError("Sample weighting requires current_day and decay_const")
+                        anchor_slice = anchor_ts[offset : offset + batch_size]
+                        anchor_days = (anchor_slice // 86400).astype("float64")
+                        age_days = float(current_day) - anchor_days
+                        decay_weights = np.exp(-age_days * float(decay_const)).astype("float32")
+                        weights_up = weights_up * decay_weights
+                        weights_down = weights_down * decay_weights
+
+                    # Apply class weights if enabled
+                    if use_class_weights:
+                        class_w_up, class_w_down = _compute_class_sample_weights(y_up, y_down)
+                        weights_up = weights_up * class_w_up
+                        weights_down = weights_down * class_w_down
+
+                    sample_weight = (weights_up, weights_down)
                     yield x_batch, y_batch, sample_weight
 
         return _generator_with_weights(), steps
@@ -801,6 +888,182 @@ def load_normalization_stats(path: str) -> NormalizationStats:
         mean_vals = npz["mean"] if "mean" in npz else None
         std_vals = npz["std"] if "std" in npz else None
     return NormalizationStats(method=method, min=min_vals, max=max_vals, mean=mean_vals, std=std_vals)
+
+
+@dataclass(frozen=True)
+class LabelDistribution:
+    """Label distribution for two-head classification outputs."""
+
+    up_counts: Dict[int, int]
+    down_counts: Dict[int, int]
+    total_samples: int
+    num_classes: int
+
+
+def compute_label_distribution(
+    dataset: SnapshotDataset,
+    start_index: int,
+    end_index: int,
+    num_classes: int,
+) -> LabelDistribution:
+    """Compute label distribution from snapshot dataset by streaming chunks.
+
+    This function counts labels in a single pass without loading all labels
+    into memory, making it suitable for large datasets.
+
+    Parameters
+    ----------
+    dataset:
+        Snapshot dataset to iterate.
+    start_index:
+        Start sample index (inclusive).
+    end_index:
+        End sample index (exclusive).
+    num_classes:
+        Number of classes per head (must match model output).
+
+    Returns
+    -------
+    LabelDistribution:
+        Counts for each class index in both up and down heads.
+
+    Raises
+    ------
+    ValueError:
+        If num_classes < 1 or if no samples are found.
+    """
+    if num_classes < 1:
+        raise ValueError(f"num_classes must be >= 1; got {num_classes}")
+
+    up_counts: Dict[int, int] = {c: 0 for c in range(num_classes)}
+    down_counts: Dict[int, int] = {c: 0 for c in range(num_classes)}
+    total_samples = 0
+
+    for _, y_up_chunk, y_down_chunk, _ in iter_snapshot_batches(
+        dataset, start_index, end_index
+    ):
+        for y_up_val in y_up_chunk:
+            class_idx = int(y_up_val)
+            if 0 <= class_idx < num_classes:
+                up_counts[class_idx] += 1
+            total_samples += 1
+
+        for y_down_val in y_down_chunk:
+            class_idx = int(y_down_val)
+            if 0 <= class_idx < num_classes:
+                down_counts[class_idx] += 1
+
+    if total_samples == 0:
+        raise ValueError(
+            "No samples found in dataset range; cannot compute label distribution"
+        )
+
+    logger.info(
+        "Computed label distribution: total_samples=%s, up_counts=%s, down_counts=%s",
+        total_samples,
+        up_counts,
+        down_counts,
+    )
+
+    return LabelDistribution(
+        up_counts=up_counts,
+        down_counts=down_counts,
+        total_samples=total_samples,
+        num_classes=num_classes,
+    )
+
+
+def save_label_stats_to_manifest(
+    context: SnapshotContext,
+    manifest: Dict[str, Any],
+    distribution: LabelDistribution,
+    split_name: str,
+) -> None:
+    """Save label distribution to manifest for a given split.
+
+    Parameters
+    ----------
+    context:
+        Snapshot context for saving manifest.
+    manifest:
+        Manifest dict to update.
+    distribution:
+        Label distribution to save.
+    split_name:
+        Name of split (e.g., 'train', 'val').
+    """
+    label_stats = manifest.get("label_stats", {})
+    if not isinstance(label_stats, dict):
+        label_stats = {}
+
+    label_stats[split_name] = {
+        "up_counts": {str(k): v for k, v in distribution.up_counts.items()},
+        "down_counts": {str(k): v for k, v in distribution.down_counts.items()},
+        "total_samples": distribution.total_samples,
+        "num_classes": distribution.num_classes,
+    }
+
+    manifest["label_stats"] = label_stats
+    save_manifest(context, manifest)
+
+    logger.info(
+        "Saved label stats for split '%s' to manifest: total_samples=%s",
+        split_name,
+        distribution.total_samples,
+    )
+
+
+def load_label_stats_from_manifest(
+    manifest: Dict[str, Any],
+    split_name: str,
+) -> Optional[LabelDistribution]:
+    """Load label distribution from manifest for a given split.
+
+    Parameters
+    ----------
+    manifest:
+        Manifest dict to read from.
+    split_name:
+        Name of split (e.g., 'train', 'val').
+
+    Returns
+    -------
+    Optional[LabelDistribution]:
+        Label distribution if found in manifest, None otherwise.
+    """
+    label_stats = manifest.get("label_stats", {})
+    if not isinstance(label_stats, dict):
+        return None
+
+    split_stats = label_stats.get(split_name)
+    if not isinstance(split_stats, dict):
+        return None
+
+    try:
+        up_counts = {int(k): int(v) for k, v in split_stats["up_counts"].items()}
+        down_counts = {int(k): int(v) for k, v in split_stats["down_counts"].items()}
+        total_samples = int(split_stats["total_samples"])
+        num_classes = int(split_stats["num_classes"])
+    except (KeyError, ValueError, TypeError) as exc:
+        logger.warning(
+            "Failed to parse label stats for split '%s': %s",
+            split_name,
+            exc,
+        )
+        return None
+
+    logger.info(
+        "Loaded label stats for split '%s' from manifest: total_samples=%s",
+        split_name,
+        total_samples,
+    )
+
+    return LabelDistribution(
+        up_counts=up_counts,
+        down_counts=down_counts,
+        total_samples=total_samples,
+        num_classes=num_classes,
+    )
 
 
 def _apply_normalization(
@@ -1948,15 +2211,19 @@ def _interpolate_depth(
 
 
 __all__ = [
+    "LabelDistribution",
     "NormalizationStats",
     "SnapshotChunk",
     "SnapshotDataset",
     "build_training_generator",
+    "compute_label_distribution",
     "compute_normalization_stats",
     "get_mask_channel_info",
     "iter_snapshot_batches",
+    "load_label_stats_from_manifest",
     "load_normalization_stats",
     "load_snapshot_dataset",
     "prepare_snapshot_dataset",
+    "save_label_stats_to_manifest",
     "save_normalization_stats",
 ]
