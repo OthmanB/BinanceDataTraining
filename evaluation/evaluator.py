@@ -33,6 +33,10 @@ from .calibration import (
     probs_to_logits_proxy,
     logits_to_calibrated_probs,
 )
+from .temporal_degradation import (
+    compute_temporal_degradation,
+    TemporalDegradationResult,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -851,6 +855,19 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
     post_hoc_cfg = eval_cfg["post_hoc_calibration"]
     post_hoc_enabled = bool(post_hoc_cfg["enabled"])
 
+    # Temporal degradation configuration
+    temporal_cfg = eval_cfg["temporal_degradation"]
+    temporal_enabled = bool(temporal_cfg["enabled"])
+    temporal_num_windows = int(temporal_cfg["num_windows"])
+    temporal_overlap = float(temporal_cfg["overlap_fraction"])
+    temporal_log_per_window = bool(temporal_cfg.get("log_per_window_metrics", True))
+
+    if temporal_enabled:
+        if temporal_num_windows < 1:
+            raise ValueError("evaluation.temporal_degradation.num_windows must be >= 1")
+        if not 0.0 <= temporal_overlap < 0.5:
+            raise ValueError("evaluation.temporal_degradation.overlap_fraction must be in [0.0, 0.5)")
+
     bin_edges = np.linspace(0.0, 1.0, n_bins + 1, dtype="float64")
 
     def _init_calibration_state() -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, int]:
@@ -877,6 +894,12 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
     temperature_up: Optional[float] = None
     temperature_down: Optional[float] = None
     calibration_fit_summary: Optional[Dict[str, Any]] = None
+
+    # Temporal degradation prediction collection (only if enabled to save memory)
+    temporal_y_true_up: list = [] if temporal_enabled else []
+    temporal_y_true_down: list = [] if temporal_enabled else []
+    temporal_y_pred_up: list = [] if temporal_enabled else []
+    temporal_y_pred_down: list = [] if temporal_enabled else []
 
     def _collect_calibration_predictions(
         start_index: int,
@@ -1035,6 +1058,13 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
 
             np.add.at(confusion_up, (y_true_up, y_pred_up), 1)
             np.add.at(confusion_down, (y_true_down, y_pred_down), 1)
+
+            # Collect predictions for temporal degradation analysis
+            if temporal_enabled:
+                temporal_y_true_up.append(np.asarray(y_true_up, dtype="int64"))
+                temporal_y_true_down.append(np.asarray(y_true_down, dtype="int64"))
+                temporal_y_pred_up.append(y_pred_up)
+                temporal_y_pred_down.append(y_pred_down)
 
             y_true_up_onehot = np.eye(num_classes, dtype="float64")[y_true_up]
             y_true_down_onehot = np.eye(num_classes, dtype="float64")[y_true_down]
@@ -1298,6 +1328,93 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
                 mlflow.log_artifact(str(calib_down_cal_path), artifact_path="evaluation")
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to log calibration curve artifacts to MLFlow: %s", exc)
+
+    # Temporal degradation analysis
+    if temporal_enabled:
+        try:
+            if not temporal_y_true_up or not temporal_y_pred_up:
+                logger.warning(
+                    "Temporal degradation enabled but no predictions collected; skipping analysis."
+                )
+            else:
+                all_y_true_up = np.concatenate(temporal_y_true_up, axis=0)
+                all_y_pred_up = np.concatenate(temporal_y_pred_up, axis=0)
+                all_y_true_down = np.concatenate(temporal_y_true_down, axis=0)
+                all_y_pred_down = np.concatenate(temporal_y_pred_down, axis=0)
+
+                logger.info(
+                    "Computing temporal degradation analysis: num_windows=%d, overlap=%.2f, samples=%d",
+                    temporal_num_windows,
+                    temporal_overlap,
+                    len(all_y_true_up),
+                )
+
+                temporal_result_up = compute_temporal_degradation(
+                    all_y_true_up,
+                    all_y_pred_up,
+                    num_classes=num_classes,
+                    num_windows=temporal_num_windows,
+                    overlap_fraction=temporal_overlap,
+                )
+
+                temporal_result_down = compute_temporal_degradation(
+                    all_y_true_down,
+                    all_y_pred_down,
+                    num_classes=num_classes,
+                    num_windows=temporal_num_windows,
+                    overlap_fraction=temporal_overlap,
+                )
+
+                # Log summary metrics to MLflow
+                mlflow.log_metric("temporal_up_total_degradation", temporal_result_up.total_degradation)
+                mlflow.log_metric("temporal_up_degradation_rate", temporal_result_up.degradation_rate)
+                mlflow.log_metric("temporal_up_overall_trend", temporal_result_up.overall_trend)
+                mlflow.log_metric("temporal_up_first_window_accuracy", temporal_result_up.first_window_accuracy)
+                mlflow.log_metric("temporal_up_last_window_accuracy", temporal_result_up.last_window_accuracy)
+
+                mlflow.log_metric("temporal_down_total_degradation", temporal_result_down.total_degradation)
+                mlflow.log_metric("temporal_down_degradation_rate", temporal_result_down.degradation_rate)
+                mlflow.log_metric("temporal_down_overall_trend", temporal_result_down.overall_trend)
+                mlflow.log_metric("temporal_down_first_window_accuracy", temporal_result_down.first_window_accuracy)
+                mlflow.log_metric("temporal_down_last_window_accuracy", temporal_result_down.last_window_accuracy)
+
+                # Log per-window metrics if configured
+                if temporal_log_per_window:
+                    for wm in temporal_result_up.window_metrics:
+                        prefix = f"temporal_up_window_{wm.window_index}"
+                        mlflow.log_metric(f"{prefix}_accuracy", wm.accuracy)
+                        mlflow.log_metric(f"{prefix}_f1_macro", wm.f1_macro)
+                        mlflow.log_metric(f"{prefix}_num_samples", float(wm.num_samples))
+
+                    for wm in temporal_result_down.window_metrics:
+                        prefix = f"temporal_down_window_{wm.window_index}"
+                        mlflow.log_metric(f"{prefix}_accuracy", wm.accuracy)
+                        mlflow.log_metric(f"{prefix}_f1_macro", wm.f1_macro)
+                        mlflow.log_metric(f"{prefix}_num_samples", float(wm.num_samples))
+
+                # Save full results as JSON artifact
+                tmp_dir = Path(tempfile.mkdtemp())
+                temporal_path = tmp_dir / "temporal_degradation_analysis.json"
+                temporal_artifact = {
+                    "up": temporal_result_up.to_dict(),
+                    "down": temporal_result_down.to_dict(),
+                    "config": {
+                        "num_windows": temporal_num_windows,
+                        "overlap_fraction": temporal_overlap,
+                        "total_samples": len(all_y_true_up),
+                    },
+                }
+                with temporal_path.open("w", encoding="utf-8") as f:
+                    json.dump(temporal_artifact, f, indent=2, sort_keys=True)
+                mlflow.log_artifact(str(temporal_path), artifact_path="evaluation")
+
+                logger.info(
+                    "Temporal degradation analysis complete. Up: degradation=%.4f, Down: degradation=%.4f",
+                    temporal_result_up.total_degradation,
+                    temporal_result_down.total_degradation,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Temporal degradation analysis failed: %s", exc)
 
 
 def _compute_class_metrics(confusion: np.ndarray) -> Tuple[list, list, list]:
