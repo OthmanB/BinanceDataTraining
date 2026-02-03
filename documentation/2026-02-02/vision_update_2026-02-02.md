@@ -35,17 +35,17 @@ The diagram below captures the system as it operates today, from configuration v
 
 ```mermaid
 flowchart TD
-    Cfg[Config + Schema] -->|validated| Orchestrator[main.py]
-    Orchestrator --> Ingest[Greptime client (chunked streaming)]
-    Ingest --> Build[Snapshot builder + gap handling]
-    Build --> Align[Multi-asset alignment + mask channels]
-    Align --> Feat[Feature engineering + temporal features]
-    Feat --> Store[Snapshot chunks (.npz)]
-    Store --> Manifest[Snapshot manifest + config hash]
-    Store --> Dataset[SnapshotDataset]
-    Dataset --> Train[Training pipeline]
-    Dataset --> Eval[Evaluation pipeline]
-    Train --> MLflow[MLflow metrics + artifacts]
+    Cfg["Config + Schema"] -->|validated| Orchestrator["main.py"]
+    Orchestrator --> Ingest["Greptime client (chunked streaming)"]
+    Ingest --> Build["Snapshot builder + gap handling"]
+    Build --> Align["Multi-asset alignment + mask channels"]
+    Align --> Feat["Feature engineering + temporal features"]
+    Feat --> Store["Snapshot chunks (.npz)"]
+    Store --> Manifest["Snapshot manifest + config hash"]
+    Store --> Dataset["SnapshotDataset"]
+    Dataset --> Train["Training pipeline"]
+    Dataset --> Eval["Evaluation pipeline"]
+    Train --> MLflow["MLflow metrics + artifacts"]
     Eval --> MLflow
 ```
 
@@ -67,15 +67,15 @@ The next schematic zooms into how snapshot records are produced and aligned. Gap
 
 ```mermaid
 flowchart LR
-    Rows[Order book rows per asset] --> Gap[GapHandler per asset]
-    Gap --> Hybrid[Hybrid aggregation (optional)]
-    Gap --> Top[Top-of-book path]
-    Hybrid --> Align[Align to target timeline]
+    Rows["Order book rows per asset"] --> Gap["GapHandler per asset"]
+    Gap --> Hybrid["Hybrid aggregation (optional)"]
+    Gap --> Top["Top-of-book path"]
+    Hybrid --> Align["Align to target timeline"]
     Top --> Align
-    Align --> Policy[Large-gap policy (zero-pad/skip/error)]
-    Policy --> Mask[Confidence mask channel]
-    Mask --> Window[Windowed samples + labels]
-    Window --> Chunk[Chunked snapshot files]
+    Align --> Policy["Large-gap policy (zero-pad/skip/error)"]
+    Policy --> Mask["Confidence mask channel"]
+    Mask --> Window["Windowed samples + labels"]
+    Window --> Chunk["Chunked snapshot files"]
 ```
 
 ## 5. Model Training and Evaluation
@@ -92,16 +92,16 @@ Training and evaluation share the snapshot dataset and normalization statistics.
 
 ```mermaid
 flowchart TD
-    Dataset[SnapshotDataset] -->|train split| Stats[Normalization stats (mask-aware)]
-    Stats --> TrainGen[Training generator]
-    Stats --> ValGen[Validation generator]
-    Dataset -->|test split| EvalBatch[Evaluation batches]
-    TrainGen --> Model[Model fit]
+    Dataset["SnapshotDataset"] -->|train split| Stats["Normalization stats (mask-aware)"]
+    Stats --> TrainGen["Training generator"]
+    Stats --> ValGen["Validation generator"]
+    Dataset -->|test split| EvalBatch["Evaluation batches"]
+    TrainGen --> Model["Model fit"]
     ValGen --> Model
-    EvalBatch --> Norm[Apply normalization (mask-aware)]
-    Norm --> Metrics[Metrics + artifacts]
+    EvalBatch --> Norm["Apply normalization (mask-aware)"]
+    Norm --> Metrics["Metrics + artifacts"]
     Model --> Metrics
-    Metrics --> MLflow[MLflow logging]
+    Metrics --> MLflow["MLflow logging"]
 ```
 
 ## 6. What Remains to Reach the Full Vision
