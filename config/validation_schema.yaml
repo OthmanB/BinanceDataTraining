@@ -324,6 +324,22 @@ sections:
         type: number
       missing_snapshot_strategy:
         type: string
+      backtesting.enabled:
+        type: boolean
+      backtesting.initial_capital:
+        type: number
+      backtesting.transaction_cost:
+        type: number
+      backtesting.signal_strategy:
+        type: string
+      backtesting.signal_threshold:
+        type: number
+      backtesting.intensity_threshold:
+        type: number
+      backtesting.position_sizing:
+        type: string
+      backtesting.max_position_pct:
+        type: number
 
   logging:
     type: dict

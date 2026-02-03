@@ -684,6 +684,48 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to log calibration curve artifacts to MLFlow: %s", exc)
 
+    # Backtesting integration
+    backtest_cfg = eval_cfg.get("backtesting", {})
+    if backtest_cfg.get("enabled", False):
+        try:
+            from .backtesting import run_backtest, log_backtest_to_mlflow
+
+            # Get mid prices for backtesting
+            mid_prices_list = target_book.get("mid_prices")
+            if mid_prices_list is None or len(mid_prices_list) == 0:
+                logger.warning("Backtesting skipped: no mid_prices available in target_book")
+            else:
+                mid_prices = np.asarray(mid_prices_list, dtype="float64")
+
+                # Map eval_indices to prices using anchor_indices
+                anchor_indices_list = list(anchor_indices)
+                eval_prices = np.array([
+                    mid_prices[anchor_indices_list[idx]] if idx < len(anchor_indices_list) and anchor_indices_list[idx] < len(mid_prices) else 0.0
+                    for idx in eval_indices
+                ])
+
+                # Calculate horizon steps from config
+                time_range_cfg = data_cfg.get("time_range", {})
+                cadence_seconds = int(time_range_cfg.get("cadence_seconds", 10))
+                targets_cfg = config.get("targets", {})
+                prediction_horizon_seconds = int(targets_cfg.get("prediction_horizon_seconds", 1800))
+                horizon_steps = prediction_horizon_seconds // cadence_seconds if cadence_seconds > 0 else 180
+
+                # Run backtest
+                backtest_result = run_backtest(
+                    config=config,
+                    y_prob_up=y_prob_up,
+                    y_prob_down=y_prob_down,
+                    prices=eval_prices,
+                    horizon_steps=horizon_steps,
+                )
+
+                # Log to MLflow
+                log_backtest_to_mlflow(backtest_result)
+
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Backtesting failed during evaluation: %s", exc)
+
 
 def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
     """Evaluate a trained model using snapshot datasets."""

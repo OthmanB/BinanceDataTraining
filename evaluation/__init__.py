@@ -5,6 +5,7 @@ This module provides:
 - evaluate_snapshot_model: Evaluate using snapshot datasets
 - calibration: Post-hoc calibration utilities (temperature scaling)
 - temporal_degradation: Temporal degradation analysis utilities
+- backtesting: Simulated trading performance evaluation
 """
 
 from .evaluator import evaluate_model, evaluate_snapshot_model
@@ -21,6 +22,14 @@ from .temporal_degradation import (
     compute_temporal_degradation,
     evaluate_temporal_degradation_from_generator,
 )
+from .backtesting import (
+    BacktestError,
+    BacktestConfig,
+    Trade,
+    BacktestResult,
+    run_backtest,
+    log_backtest_to_mlflow,
+)
 
 __all__ = [
     "evaluate_model",
@@ -34,4 +43,10 @@ __all__ = [
     "compute_window_metrics",
     "compute_temporal_degradation",
     "evaluate_temporal_degradation_from_generator",
+    "BacktestError",
+    "BacktestConfig",
+    "Trade",
+    "BacktestResult",
+    "run_backtest",
+    "log_backtest_to_mlflow",
 ]

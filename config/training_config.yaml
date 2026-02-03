@@ -338,9 +338,14 @@ evaluation:  # Post-training evaluation and calibration settings.
   missing_snapshot_strategy: "fail"  # Behaviour when snapshot-based inputs are unavailable during evaluation.
 
   backtesting:
-    enabled: false  # Placeholder configuration; backtesting logic is not yet implemented and should remain disabled.
-    initial_capital: 10000  # Nominal starting capital for future backtesting.
-    transaction_cost: 0.001 # Per-trade proportional transaction cost assumed in backtesting.
+    enabled: false              # When true, run backtesting simulation after evaluation.
+    initial_capital: 10000      # Starting capital for backtesting simulation.
+    transaction_cost: 0.001     # Per-trade proportional transaction cost (0.001 = 0.1%).
+    signal_strategy: "net_intensity"  # Strategy for signal generation: "net_intensity" or "threshold".
+    signal_threshold: 0.6       # Probability threshold for threshold strategy (ignored for net_intensity).
+    intensity_threshold: 1      # Minimum intensity class for action (0=any, 1=1%+, 2=2%+, 3=5%+).
+    position_sizing: "equal"    # Position sizing method: "equal" (fixed) or "confidence" (scale by probability).
+    max_position_pct: 1.0       # Maximum capital per position as a fraction (1.0 = all-in).
 
 # Data Diagnostics Configuration
 diagnostics:  # Controls pre-training data quality checks and their logging.
