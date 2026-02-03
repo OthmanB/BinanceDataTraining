@@ -7,7 +7,25 @@ Tests cover:
 - Query building functions
 """
 
+import os
+import string
 import unittest
+
+# Reduce hypothesis examples in CI for faster test runs
+_MAX_EXAMPLES = 10 if os.environ.get("CI") else 50
+
+try:
+    from hypothesis import given, settings, HealthCheck
+    from hypothesis import strategies as st
+
+    HYPOTHESIS_AVAILABLE = True
+except ImportError:
+    HYPOTHESIS_AVAILABLE = False
+    # Stubs for type checking when hypothesis is not installed
+    given = None  # type: ignore[assignment]
+    settings = None  # type: ignore[assignment]
+    HealthCheck = None  # type: ignore[assignment,misc]
+    st = None  # type: ignore[assignment]
 
 from data.sql_utils import (
     SQLValidationError,
@@ -278,6 +296,110 @@ class TestBuildConnectivityCheckQuery(unittest.TestCase):
         """Invalid table name should raise SQLValidationError."""
         with self.assertRaises(SQLValidationError):
             build_connectivity_check_query("bad; DROP TABLE x")
+
+
+@unittest.skipUnless(HYPOTHESIS_AVAILABLE, "hypothesis not installed")
+class TestSQLValidationProperties(unittest.TestCase):
+    """Property-based tests for SQL validation using Hypothesis."""
+
+    @settings(max_examples=_MAX_EXAMPLES, suppress_health_check=[HealthCheck.too_slow])
+    @given(
+        # Generate valid SQL identifiers: start with letter/underscore, then alnum/underscore
+        identifier=st.from_regex(r"[a-zA-Z_][a-zA-Z0-9_]{0,30}", fullmatch=True)
+    )
+    def test_valid_identifiers_accepted(self, identifier: str) -> None:
+        """Valid SQL identifiers should be accepted."""
+        result = validate_identifier(identifier)
+        self.assertEqual(result, identifier)
+
+    @settings(max_examples=_MAX_EXAMPLES, suppress_health_check=[HealthCheck.too_slow])
+    @given(
+        year=st.integers(min_value=1900, max_value=2100),
+        month=st.integers(min_value=1, max_value=12),
+        day=st.integers(min_value=1, max_value=28),  # Use 28 to avoid invalid dates
+    )
+    def test_valid_dates_accepted(self, year: int, month: int, day: int) -> None:
+        """Valid YYYY-MM-DD dates should be accepted."""
+        date_str = f"{year:04d}-{month:02d}-{day:02d}"
+        result = validate_datetime_literal(date_str)
+        self.assertEqual(result, date_str)
+
+    @settings(max_examples=_MAX_EXAMPLES, suppress_health_check=[HealthCheck.too_slow])
+    @given(
+        year=st.integers(min_value=1900, max_value=2100),
+        month=st.integers(min_value=1, max_value=12),
+        day=st.integers(min_value=1, max_value=28),
+        hour=st.integers(min_value=0, max_value=23),
+        minute=st.integers(min_value=0, max_value=59),
+        second=st.integers(min_value=0, max_value=59),
+    )
+    def test_valid_datetimes_accepted(
+        self, year: int, month: int, day: int, hour: int, minute: int, second: int
+    ) -> None:
+        """Valid YYYY-MM-DD HH:MM:SS datetimes should be accepted."""
+        datetime_str = f"{year:04d}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}:{second:02d}"
+        result = validate_datetime_literal(datetime_str)
+        self.assertEqual(result, datetime_str)
+
+    @settings(max_examples=_MAX_EXAMPLES, suppress_health_check=[HealthCheck.too_slow])
+    @given(
+        base_identifier=st.from_regex(r"[a-zA-Z_][a-zA-Z0-9_]{0,10}", fullmatch=True),
+        injection_pattern=st.sampled_from([
+            ";",
+            "';",
+            "--",
+            "/*",
+            "*/",
+            "' OR '1'='1",
+            "; DROP TABLE users",
+            "' UNION SELECT",
+            "1; DELETE FROM",
+        ]),
+    )
+    def test_injection_patterns_rejected_in_identifier(
+        self, base_identifier: str, injection_pattern: str
+    ) -> None:
+        """SQL injection patterns in identifiers should be rejected."""
+        malicious = base_identifier + injection_pattern
+        with self.assertRaises(SQLValidationError):
+            validate_identifier(malicious)
+
+    @settings(max_examples=_MAX_EXAMPLES, suppress_health_check=[HealthCheck.too_slow])
+    @given(
+        injection_pattern=st.sampled_from([
+            "2025-01-01'; DROP TABLE users; --",
+            "2025-01-01 UNION SELECT * FROM secrets",
+            "2025-01-01'; DELETE FROM",
+            "'; --",
+            "1 OR 1=1; --",
+        ]),
+    )
+    def test_injection_patterns_rejected_in_datetime(self, injection_pattern: str) -> None:
+        """SQL injection patterns in datetimes should be rejected."""
+        with self.assertRaises(SQLValidationError):
+            validate_datetime_literal(injection_pattern)
+
+    @settings(max_examples=_MAX_EXAMPLES, suppress_health_check=[HealthCheck.too_slow])
+    @given(
+        # Generate identifiers that start with digit (invalid)
+        invalid_start=st.from_regex(r"[0-9][a-zA-Z0-9_]{0,10}", fullmatch=True)
+    )
+    def test_digit_start_identifiers_rejected(self, invalid_start: str) -> None:
+        """Identifiers starting with digits should be rejected."""
+        with self.assertRaises(SQLValidationError):
+            validate_identifier(invalid_start)
+
+    @settings(max_examples=_MAX_EXAMPLES, suppress_health_check=[HealthCheck.too_slow])
+    @given(
+        # Generate identifiers with special characters (invalid)
+        base=st.from_regex(r"[a-zA-Z][a-zA-Z0-9]{0,5}", fullmatch=True),
+        special=st.sampled_from(list("!@#$%^&*()-+=[]{}|\\:\"<>,?/~`")),
+    )
+    def test_special_chars_in_identifiers_rejected(self, base: str, special: str) -> None:
+        """Identifiers with special characters should be rejected."""
+        invalid_identifier = base + special
+        with self.assertRaises(SQLValidationError):
+            validate_identifier(invalid_identifier)
 
 
 if __name__ == "__main__":

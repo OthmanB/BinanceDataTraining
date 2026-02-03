@@ -7,6 +7,7 @@ This module tests:
 - fit_temperature: Convenience function for fitting
 """
 
+import os
 import unittest
 
 import numpy as np
@@ -19,6 +20,24 @@ from evaluation.calibration import (
     apply_temperature_scaling,
     fit_temperature,
 )
+
+# Reduce hypothesis examples in CI for faster test runs
+_MAX_EXAMPLES = 10 if os.environ.get("CI") else 50
+
+try:
+    from hypothesis import given, settings, HealthCheck
+    from hypothesis import strategies as st
+    from hypothesis.extra.numpy import arrays
+
+    HYPOTHESIS_AVAILABLE = True
+except ImportError:
+    HYPOTHESIS_AVAILABLE = False
+    # Stubs for type checking when hypothesis is not installed
+    given = None  # type: ignore[assignment]
+    settings = None  # type: ignore[assignment]
+    HealthCheck = None  # type: ignore[assignment,misc]
+    st = None  # type: ignore[assignment]
+    arrays = None  # type: ignore[assignment]
 
 
 class TestComputeCalibrationMetricsBasic(unittest.TestCase):
@@ -362,6 +381,140 @@ class TestCalibrationImprovesECE(unittest.TestCase):
 
         # ECE should improve (or at least not get worse)
         self.assertLessEqual(scaler.post_calibration_ece, scaler.pre_calibration_ece + 0.05)
+
+
+@unittest.skipUnless(HYPOTHESIS_AVAILABLE, "hypothesis not installed")
+class TestCalibrationProperties(unittest.TestCase):
+    """Property-based tests for calibration functions using Hypothesis."""
+
+    @settings(max_examples=_MAX_EXAMPLES, suppress_health_check=[HealthCheck.too_slow])
+    @given(
+        logits=arrays(
+            dtype=np.float64,
+            shape=st.tuples(
+                st.integers(min_value=1, max_value=50),
+                st.integers(min_value=2, max_value=6),
+            ),
+            elements=st.floats(min_value=-10.0, max_value=10.0, allow_nan=False, allow_infinity=False),
+        ),
+        temperature=st.floats(min_value=0.1, max_value=10.0),
+    )
+    def test_probabilities_sum_to_one(self, logits: np.ndarray, temperature: float) -> None:
+        """Scaled probabilities should always sum to 1 for each sample."""
+        probs = apply_temperature_scaling(logits, temperature)
+
+        # Check each row sums to 1
+        row_sums = np.sum(probs, axis=1)
+        assert_allclose(row_sums, np.ones(probs.shape[0]), atol=1e-6)
+
+    @settings(max_examples=_MAX_EXAMPLES, suppress_health_check=[HealthCheck.too_slow])
+    @given(
+        logits=arrays(
+            dtype=np.float64,
+            shape=st.tuples(
+                st.integers(min_value=1, max_value=30),
+                st.integers(min_value=2, max_value=5),
+            ),
+            elements=st.floats(min_value=-5.0, max_value=5.0, allow_nan=False, allow_infinity=False),
+        ),
+        temperature=st.floats(min_value=0.1, max_value=10.0),
+    )
+    def test_probabilities_are_valid(self, logits: np.ndarray, temperature: float) -> None:
+        """All probabilities should be in [0, 1]."""
+        probs = apply_temperature_scaling(logits, temperature)
+
+        self.assertTrue(np.all(probs >= 0.0))
+        self.assertTrue(np.all(probs <= 1.0))
+
+    @settings(max_examples=_MAX_EXAMPLES, suppress_health_check=[HealthCheck.too_slow])
+    @given(
+        logits=arrays(
+            dtype=np.float64,
+            shape=st.tuples(
+                st.integers(min_value=1, max_value=20),
+                st.integers(min_value=2, max_value=4),
+            ),
+            elements=st.floats(min_value=-3.0, max_value=3.0, allow_nan=False, allow_infinity=False),
+        ),
+    )
+    def test_temperature_one_equals_softmax(self, logits: np.ndarray) -> None:
+        """Temperature=1 should equal regular softmax."""
+        probs = apply_temperature_scaling(logits, temperature=1.0)
+        expected = softmax(logits, axis=1)
+
+        assert_allclose(probs, expected, atol=1e-10)
+
+    @settings(max_examples=_MAX_EXAMPLES, suppress_health_check=[HealthCheck.too_slow])
+    @given(
+        logits=arrays(
+            dtype=np.float64,
+            shape=st.tuples(
+                st.integers(min_value=1, max_value=20),
+                st.integers(min_value=2, max_value=4),
+            ),
+            elements=st.floats(min_value=-5.0, max_value=5.0, allow_nan=False, allow_infinity=False),
+        ),
+        t_low=st.floats(min_value=0.1, max_value=1.0),
+        t_high=st.floats(min_value=2.0, max_value=10.0),
+    )
+    def test_higher_temperature_more_uniform(self, logits: np.ndarray, t_low: float, t_high: float) -> None:
+        """Higher temperature should produce more uniform (lower entropy) distributions."""
+        probs_low = apply_temperature_scaling(logits, t_low)
+        probs_high = apply_temperature_scaling(logits, t_high)
+
+        # Max probability should be lower (or equal) with higher temperature
+        # for each sample
+        max_low = np.max(probs_low, axis=1)
+        max_high = np.max(probs_high, axis=1)
+
+        # Allow small tolerance for numerical issues
+        self.assertTrue(np.all(max_high <= max_low + 1e-6))
+
+    @settings(max_examples=_MAX_EXAMPLES, suppress_health_check=[HealthCheck.too_slow])
+    @given(
+        temperature=st.floats(min_value=0.1, max_value=10.0),
+        pre_ece=st.floats(min_value=0.0, max_value=1.0),
+        post_ece=st.floats(min_value=0.0, max_value=1.0),
+    )
+    def test_scaler_serialization_roundtrip(
+        self, temperature: float, pre_ece: float, post_ece: float
+    ) -> None:
+        """to_dict and from_dict should preserve all state."""
+        scaler = TemperatureScaler(
+            temperature=temperature,
+            fitted=True,
+            pre_calibration_ece=pre_ece,
+            post_calibration_ece=post_ece,
+        )
+
+        data = scaler.to_dict()
+        restored = TemperatureScaler.from_dict(data)
+
+        self.assertEqual(restored.temperature, temperature)
+        self.assertTrue(restored.fitted)
+        self.assertEqual(restored.pre_calibration_ece, pre_ece)
+        self.assertEqual(restored.post_calibration_ece, post_ece)
+
+    @settings(max_examples=_MAX_EXAMPLES, suppress_health_check=[HealthCheck.too_slow])
+    @given(
+        n_samples=st.integers(min_value=20, max_value=100),
+        n_classes=st.integers(min_value=2, max_value=5),
+        logit_scale=st.floats(min_value=1.0, max_value=10.0),
+        seed=st.integers(min_value=0, max_value=10000),
+    )
+    def test_fitted_temperature_is_bounded(
+        self, n_samples: int, n_classes: int, logit_scale: float, seed: int
+    ) -> None:
+        """Fitted temperature should be within specified bounds."""
+        np.random.seed(seed)
+        logits = np.random.randn(n_samples, n_classes) * logit_scale
+        y_true = np.random.randint(0, n_classes, n_samples)
+
+        bounds = (0.5, 5.0)
+        scaler = fit_temperature(logits, y_true, bounds=bounds)
+
+        self.assertGreaterEqual(scaler.temperature, bounds[0])
+        self.assertLessEqual(scaler.temperature, bounds[1])
 
 
 if __name__ == "__main__":

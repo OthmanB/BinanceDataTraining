@@ -6,6 +6,7 @@ This module tests:
 - WindowMetrics and TemporalDegradationResult dataclasses
 """
 
+import os
 import unittest
 
 import numpy as np
@@ -17,6 +18,23 @@ from evaluation.temporal_degradation import (
     compute_window_metrics,
     compute_temporal_degradation,
 )
+
+# Reduce hypothesis examples in CI for faster test runs
+_MAX_EXAMPLES = 10 if os.environ.get("CI") else 50
+
+try:
+    from hypothesis import given, settings, HealthCheck, assume
+    from hypothesis import strategies as st
+
+    HYPOTHESIS_AVAILABLE = True
+except ImportError:
+    HYPOTHESIS_AVAILABLE = False
+    # Stubs for type checking when hypothesis is not installed
+    given = None  # type: ignore[assignment]
+    settings = None  # type: ignore[assignment]
+    HealthCheck = None  # type: ignore[assignment,misc]
+    assume = None  # type: ignore[assignment]
+    st = None  # type: ignore[assignment]
 
 
 class TestComputeWindowMetricsBasic(unittest.TestCase):
@@ -317,6 +335,133 @@ class TestWindowMetricsDataclass(unittest.TestCase):
         self.assertEqual(metrics.accuracy, 0.8)
         self.assertEqual(metrics.num_samples, 10)
         self.assertEqual(len(metrics.per_class_accuracy), 2)
+
+
+@unittest.skipUnless(HYPOTHESIS_AVAILABLE, "hypothesis not installed")
+class TestTemporalDegradationProperties(unittest.TestCase):
+    """Property-based tests for temporal degradation analysis using Hypothesis."""
+
+    @settings(max_examples=_MAX_EXAMPLES, suppress_health_check=[HealthCheck.too_slow])
+    @given(
+        n_samples=st.integers(min_value=10, max_value=200),
+        n_classes=st.integers(min_value=2, max_value=5),
+        num_windows=st.integers(min_value=1, max_value=10),
+        seed=st.integers(min_value=0, max_value=10000),
+    )
+    def test_metrics_are_bounded(
+        self, n_samples: int, n_classes: int, num_windows: int, seed: int
+    ) -> None:
+        """All metrics should be in valid ranges [0, 1]."""
+        np.random.seed(seed)
+        y_true = np.random.randint(0, n_classes, n_samples)
+        y_pred = np.random.randint(0, n_classes, n_samples)
+
+        result = compute_temporal_degradation(
+            y_true, y_pred, num_classes=n_classes, num_windows=num_windows
+        )
+
+        for wm in result.window_metrics:
+            self.assertGreaterEqual(wm.accuracy, 0.0)
+            self.assertLessEqual(wm.accuracy, 1.0)
+            self.assertGreaterEqual(wm.precision_macro, 0.0)
+            self.assertLessEqual(wm.precision_macro, 1.0)
+            self.assertGreaterEqual(wm.recall_macro, 0.0)
+            self.assertLessEqual(wm.recall_macro, 1.0)
+            self.assertGreaterEqual(wm.f1_macro, 0.0)
+            self.assertLessEqual(wm.f1_macro, 1.0)
+
+    @settings(max_examples=_MAX_EXAMPLES, suppress_health_check=[HealthCheck.too_slow])
+    @given(
+        n_samples=st.integers(min_value=10, max_value=100),
+        n_classes=st.integers(min_value=2, max_value=4),
+        num_windows=st.integers(min_value=1, max_value=5),
+        seed=st.integers(min_value=0, max_value=10000),
+    )
+    def test_perfect_predictions_accuracy_one(
+        self, n_samples: int, n_classes: int, num_windows: int, seed: int
+    ) -> None:
+        """y_true == y_pred should result in accuracy 1.0 for all windows."""
+        np.random.seed(seed)
+        y_true = np.random.randint(0, n_classes, n_samples)
+        y_pred = y_true.copy()
+
+        result = compute_temporal_degradation(
+            y_true, y_pred, num_classes=n_classes, num_windows=num_windows
+        )
+
+        for wm in result.window_metrics:
+            self.assertEqual(wm.accuracy, 1.0)
+
+        self.assertEqual(result.first_window_accuracy, 1.0)
+        self.assertEqual(result.last_window_accuracy, 1.0)
+        self.assertEqual(result.total_degradation, 0.0)
+
+    @settings(max_examples=_MAX_EXAMPLES, suppress_health_check=[HealthCheck.too_slow])
+    @given(
+        n_samples=st.integers(min_value=10, max_value=100),
+        n_classes=st.integers(min_value=2, max_value=4),
+        num_windows=st.integers(min_value=1, max_value=5),
+        seed=st.integers(min_value=0, max_value=10000),
+    )
+    def test_total_degradation_formula(
+        self, n_samples: int, n_classes: int, num_windows: int, seed: int
+    ) -> None:
+        """total_degradation should equal first_window_accuracy - last_window_accuracy."""
+        np.random.seed(seed)
+        y_true = np.random.randint(0, n_classes, n_samples)
+        y_pred = np.random.randint(0, n_classes, n_samples)
+
+        result = compute_temporal_degradation(
+            y_true, y_pred, num_classes=n_classes, num_windows=num_windows
+        )
+
+        expected_degradation = result.first_window_accuracy - result.last_window_accuracy
+        assert_allclose(result.total_degradation, expected_degradation, atol=1e-10)
+
+    @settings(max_examples=_MAX_EXAMPLES, suppress_health_check=[HealthCheck.too_slow])
+    @given(
+        n_samples=st.integers(min_value=10, max_value=100),
+        n_classes=st.integers(min_value=2, max_value=4),
+        num_windows=st.integers(min_value=1, max_value=10),
+        seed=st.integers(min_value=0, max_value=10000),
+    )
+    def test_window_count_matches(
+        self, n_samples: int, n_classes: int, num_windows: int, seed: int
+    ) -> None:
+        """Number of window_metrics should be <= num_windows."""
+        np.random.seed(seed)
+        y_true = np.random.randint(0, n_classes, n_samples)
+        y_pred = np.random.randint(0, n_classes, n_samples)
+
+        result = compute_temporal_degradation(
+            y_true, y_pred, num_classes=n_classes, num_windows=num_windows
+        )
+
+        self.assertLessEqual(len(result.window_metrics), num_windows)
+        self.assertGreater(len(result.window_metrics), 0)
+
+    @settings(max_examples=_MAX_EXAMPLES, suppress_health_check=[HealthCheck.too_slow])
+    @given(
+        n_samples=st.integers(min_value=20, max_value=100),
+        n_classes=st.integers(min_value=2, max_value=4),
+        num_windows=st.integers(min_value=2, max_value=8),
+        seed=st.integers(min_value=0, max_value=10000),
+    )
+    def test_window_indices_sequential(
+        self, n_samples: int, n_classes: int, num_windows: int, seed: int
+    ) -> None:
+        """Window indices should be sequential starting from 0."""
+        np.random.seed(seed)
+        y_true = np.random.randint(0, n_classes, n_samples)
+        y_pred = np.random.randint(0, n_classes, n_samples)
+
+        result = compute_temporal_degradation(
+            y_true, y_pred, num_classes=n_classes, num_windows=num_windows
+        )
+
+        indices = [wm.window_index for wm in result.window_metrics]
+        expected_indices = list(range(len(result.window_metrics)))
+        self.assertEqual(indices, expected_indices)
 
 
 if __name__ == "__main__":
