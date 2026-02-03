@@ -317,6 +317,20 @@ evaluation:  # Post-training evaluation and calibration settings.
     enabled: true  # When true, compute calibration curves and summary statistics.
     n_bins: 10     # Number of probability bins used for calibration analysis.
 
+  post_hoc_calibration:
+    enabled: false  # When true, apply temperature scaling to calibrate predictions.
+    method: "temperature_scaling"  # Calibration method: "temperature_scaling" or "isotonic" (future).
+    fit_on_validation: true  # If true, fit temperature on validation set; otherwise on test set.
+    temperature_bounds:
+      min: 0.1  # Minimum temperature value during optimization.
+      max: 10.0  # Maximum temperature value during optimization.
+
+  temporal_degradation:
+    enabled: false  # When true, analyze model performance degradation over time.
+    num_windows: 5  # Number of chronological windows to evaluate.
+    overlap_fraction: 0.0  # Overlap between consecutive windows (0.0 to 0.5).
+    log_per_window_metrics: true  # Log detailed metrics for each window to MLflow.
+
   missing_snapshot_strategy: "fail"  # Behaviour when snapshot-based inputs are unavailable during evaluation.
 
   backtesting:

@@ -302,6 +302,18 @@ sections:
         type: list
       calibration_analysis.enabled:
         type: boolean
+      post_hoc_calibration.enabled:
+        type: boolean
+      post_hoc_calibration.method:
+        type: string
+      post_hoc_calibration.fit_on_validation:
+        type: boolean
+      temporal_degradation.enabled:
+        type: boolean
+      temporal_degradation.num_windows:
+        type: integer
+      temporal_degradation.overlap_fraction:
+        type: number
       missing_snapshot_strategy:
         type: string
 
