@@ -113,7 +113,12 @@ def compute_calibration_metrics(y_true: Any, y_prob: Any, *, num_bins: int) -> D
     }
 
 
-def probs_to_logits_proxy(probs: np.ndarray, *, eps: float = 1e-12) -> np.ndarray:
+def probs_to_logits_proxy(
+    probs: np.ndarray,
+    *,
+    eps: float = 1e-12,
+    strict: bool = True,
+) -> np.ndarray:
     """Convert probabilities to logit-like values suitable for temperature scaling.
 
     This is useful when the model outputs softmax probabilities instead of logits.
@@ -124,13 +129,23 @@ def probs_to_logits_proxy(probs: np.ndarray, *, eps: float = 1e-12) -> np.ndarra
     ----------
     probs : np.ndarray
         Array of probabilities with shape (n_samples, n_classes).
+        Values should be in [0, 1] and rows should approximately sum to 1.
     eps : float
         Clipping epsilon to avoid log(0). Must be in (0, 0.5).
+    strict : bool
+        If True, fail fast on inputs that don't look like probabilities.
+        If False, only log warnings and attempt to proceed.
 
     Returns
     -------
     np.ndarray
         Logit-like array of shape (n_samples, n_classes).
+
+    Raises
+    ------
+    ValueError
+        If strict=True and inputs are clearly not probabilities (e.g., contain
+        negative values, values > 1.0, or rows that don't sum close to 1).
     """
     if eps <= 0.0 or eps >= 0.5:
         raise ValueError(f"eps must be in (0, 0.5), got {eps}")
@@ -141,6 +156,51 @@ def probs_to_logits_proxy(probs: np.ndarray, *, eps: float = 1e-12) -> np.ndarra
             "probs must be a 2D array of shape (n_samples, n_classes) for logits proxy conversion"
         )
 
+    n_samples, n_classes = probs_arr.shape
+    if n_samples == 0 or n_classes == 0:
+        raise ValueError("probs array must have at least one sample and one class")
+
+    # Fail-fast validation: detect if input looks like logits rather than probabilities
+    min_val = float(probs_arr.min())
+    max_val = float(probs_arr.max())
+
+    # Logits can be negative or > 1; probabilities should be in [0, 1]
+    if min_val < -0.01:  # Small tolerance for numerical errors
+        msg = (
+            f"probs_to_logits_proxy received values < 0 (min={min_val:.4f}). "
+            "This suggests the input is logits, not probabilities. "
+            "Use raw logits directly with TemperatureScaler.fit() instead."
+        )
+        if strict:
+            raise ValueError(msg)
+        logger.warning(msg)
+
+    if max_val > 1.01:  # Small tolerance for numerical errors
+        msg = (
+            f"probs_to_logits_proxy received values > 1 (max={max_val:.4f}). "
+            "This suggests the input is logits, not probabilities. "
+            "Use raw logits directly with TemperatureScaler.fit() instead."
+        )
+        if strict:
+            raise ValueError(msg)
+        logger.warning(msg)
+
+    # Check row sums are approximately 1 (valid probability distributions)
+    row_sums_raw = probs_arr.sum(axis=1)
+    sum_deviation = np.abs(row_sums_raw - 1.0)
+    max_deviation = float(sum_deviation.max())
+    if max_deviation > 0.1:  # Allow 10% deviation for numerical errors
+        msg = (
+            f"probs_to_logits_proxy received rows with sum far from 1.0 "
+            f"(max deviation={max_deviation:.4f}). "
+            "This suggests the input may not be valid probabilities. "
+            "Rows should sum to approximately 1.0."
+        )
+        if strict:
+            raise ValueError(msg)
+        logger.warning(msg)
+
+    # Clip and normalize to ensure valid log computation
     probs_arr = np.clip(probs_arr, eps, 1.0 - eps)
     row_sums = probs_arr.sum(axis=1, keepdims=True)
     row_sums = np.where(row_sums == 0.0, 1.0, row_sums)

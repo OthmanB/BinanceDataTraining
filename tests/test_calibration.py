@@ -175,6 +175,88 @@ class TestCalibrationHelpers(unittest.TestCase):
         assert_allclose(direct, wrapped, atol=1e-10)
 
 
+class TestProbsToLogitsProxyValidation(unittest.TestCase):
+    """Fail-fast validation tests for probs_to_logits_proxy."""
+
+    def test_negative_values_raises_in_strict_mode(self) -> None:
+        """Negative values should raise ValueError in strict mode."""
+        # These look like logits, not probabilities
+        logits_not_probs = np.array([[-1.0, 2.0, 0.5], [0.3, -0.5, 1.2]])
+
+        with self.assertRaises(ValueError) as ctx:
+            probs_to_logits_proxy(logits_not_probs, strict=True)
+
+        self.assertIn("< 0", str(ctx.exception))
+        self.assertIn("logits", str(ctx.exception).lower())
+
+    def test_values_above_one_raises_in_strict_mode(self) -> None:
+        """Values > 1.0 should raise ValueError in strict mode."""
+        # These look like logits, not probabilities
+        logits_not_probs = np.array([[1.5, 0.3, 0.2], [0.1, 2.0, 0.5]])
+
+        with self.assertRaises(ValueError) as ctx:
+            probs_to_logits_proxy(logits_not_probs, strict=True)
+
+        self.assertIn("> 1", str(ctx.exception))
+        self.assertIn("logits", str(ctx.exception).lower())
+
+    def test_row_sums_far_from_one_raises_in_strict_mode(self) -> None:
+        """Row sums far from 1.0 should raise ValueError in strict mode."""
+        # These don't sum to 1
+        bad_probs = np.array([[0.1, 0.1, 0.1], [0.2, 0.2, 0.2]])  # sum = 0.3, 0.6
+
+        with self.assertRaises(ValueError) as ctx:
+            probs_to_logits_proxy(bad_probs, strict=True)
+
+        self.assertIn("sum", str(ctx.exception).lower())
+
+    def test_non_strict_mode_allows_bad_inputs(self) -> None:
+        """Non-strict mode should warn but proceed with bad inputs."""
+        import warnings
+
+        # Negative values (logits-like)
+        logits_not_probs = np.array([[-1.0, 2.0, 0.5], [0.3, -0.5, 1.2]])
+
+        # Should not raise, just warn
+        with warnings.catch_warnings(record=True):
+            result = probs_to_logits_proxy(logits_not_probs, strict=False)
+
+        # Result should still be computed (clipped and normalized)
+        self.assertEqual(result.shape, logits_not_probs.shape)
+        self.assertTrue(np.isfinite(result).all())
+
+    def test_empty_array_raises(self) -> None:
+        """Empty array should raise ValueError."""
+        empty = np.zeros((0, 3), dtype="float64")
+
+        with self.assertRaises(ValueError) as ctx:
+            probs_to_logits_proxy(empty)
+
+        self.assertIn("at least one", str(ctx.exception).lower())
+
+    def test_valid_probabilities_succeed(self) -> None:
+        """Valid probabilities should work without issues."""
+        np.random.seed(123)
+        logits = np.random.randn(10, 4)
+        probs = softmax(logits, axis=1)
+
+        # Should succeed
+        result = probs_to_logits_proxy(probs, strict=True)
+
+        self.assertEqual(result.shape, probs.shape)
+        self.assertTrue(np.isfinite(result).all())
+
+    def test_small_numerical_errors_tolerated(self) -> None:
+        """Small numerical errors should be tolerated."""
+        # Slightly off but close to valid probabilities
+        probs = np.array([[0.5, 0.3, 0.2001], [0.4, 0.4, 0.2]])  # sum slightly > 1
+
+        # Should succeed (within 0.01 tolerance)
+        result = probs_to_logits_proxy(probs, strict=True)
+
+        self.assertEqual(result.shape, probs.shape)
+
+
 class TestTemperatureScalerBasic(unittest.TestCase):
     """Basic tests for TemperatureScaler class."""
 
