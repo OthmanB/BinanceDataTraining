@@ -4,7 +4,7 @@
 **Auditor:** Cascade AI  
 **Scope:** Full codebase audit against user global coding rules + CNN+LSTM training goal assessment
 
-This audit reflects the state as of 2026-01-17. The codebase has since converged on a snapshot-first pipeline, and an implementation-aligned vision update is available at documentation/2025-11-03/vision_update_2026-02-02.md. The aligned priority and technical debt updates are in documentation/2025-11-03/implementation_priority_matrix_update_2026-02-02.md and documentation/2025-11-03/technical_debt_register_update_2026-02-02.md.
+This audit reflects the state as of 2026-01-17. The codebase has since converged on a snapshot-first pipeline, and an implementation-aligned vision update is available at documentation/2026-02-02/vision_update_2026-02-02.md. The aligned priority and technical debt updates are in documentation/2026-02-02/implementation_priority_matrix_update_2026-02-02.md and documentation/2026-02-02/technical_debt_register_update_2026-02-02.md.
 
 ---
 

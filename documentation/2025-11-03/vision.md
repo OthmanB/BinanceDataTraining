@@ -5,7 +5,7 @@
 **Version:** 0.3 - Final Refinements  
 **Status:** Ready for Implementation Planning
 
-This original vision document remains the historical blueprint for the project. The implementation has since converged on a snapshot-first pipeline, and an implementation-aligned update is available in documentation/2025-11-03/vision_update_2026-02-02.md. The corresponding updated priority and technical debt registers are in documentation/2025-11-03/implementation_priority_matrix_update_2026-02-02.md and documentation/2025-11-03/technical_debt_register_update_2026-02-02.md.
+This original vision document remains the historical blueprint for the project. The implementation has since converged on a snapshot-first pipeline, and an implementation-aligned update is available in documentation/2026-02-02/vision_update_2026-02-02.md. The corresponding updated priority and technical debt registers are in documentation/2026-02-02/implementation_priority_matrix_update_2026-02-02.md and documentation/2026-02-02/technical_debt_register_update_2026-02-02.md.
 
 ---
 

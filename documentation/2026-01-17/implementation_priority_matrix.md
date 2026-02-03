@@ -3,7 +3,7 @@
 **Date:** 2026-01-17 08:00 UTC+09:00  
 **Reference:** Code Audit Report 2026-01-17
 
-This matrix reflects the state as of 2026-01-17. For the snapshot-pipeline-aligned update and current status, see documentation/2025-11-03/implementation_priority_matrix_update_2026-02-02.md and the aligned vision at documentation/2025-11-03/vision_update_2026-02-02.md.
+This matrix reflects the state as of 2026-01-17. For the snapshot-pipeline-aligned update and current status, see documentation/2026-02-02/implementation_priority_matrix_update_2026-02-02.md and the aligned vision at documentation/2026-02-02/vision_update_2026-02-02.md.
 
 ---
 

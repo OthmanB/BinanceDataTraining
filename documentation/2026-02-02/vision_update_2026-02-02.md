@@ -29,6 +29,26 @@ In practice, data ingestion and preprocessing are handled in training/snapshot_d
 
 Three practical outcomes define the current architecture. First, the system scales to large time ranges by streaming data chunk-by-chunk instead of loading an entire window into memory. Second, datasets are reproducible because the snapshot manifest stores a deterministic configuration hash. Third, missingness is modeled explicitly in multi-asset inputs through a confidence mask channel that is appended alongside asset channels.
 
+### 3.1 Architecture Schematic (Overall Flow)
+
+The diagram below captures the system as it operates today, from configuration validation through ingestion, snapshot dataset construction, and the training and evaluation loops that report to MLflow. It is intentionally linear and emphasizes the snapshot dataset as the shared contract between training and evaluation.
+
+```mermaid
+flowchart TD
+    Cfg[Config + Schema] -->|validated| Orchestrator[main.py]
+    Orchestrator --> Ingest[Greptime client (chunked streaming)]
+    Ingest --> Build[Snapshot builder + gap handling]
+    Build --> Align[Multi-asset alignment + mask channels]
+    Align --> Feat[Feature engineering + temporal features]
+    Feat --> Store[Snapshot chunks (.npz)]
+    Store --> Manifest[Snapshot manifest + config hash]
+    Store --> Dataset[SnapshotDataset]
+    Dataset --> Train[Training pipeline]
+    Dataset --> Eval[Evaluation pipeline]
+    Train --> MLflow[MLflow metrics + artifacts]
+    Eval --> MLflow
+```
+
 ## 4. Data and Preprocessing Strategy
 
 GreptimeDB data is fetched in fixed time chunks using configured request timeouts and retry behavior. Chunked ingestion prevents monolithic queries and provides natural boundaries for dataset persistence. Each chunk is translated into snapshot records at the configured cadence, and per-asset gap handling is applied before alignment. Large gaps in the target asset trigger buffer resets so that samples never straddle discontinuities.
@@ -41,6 +61,23 @@ Normalization is computed and applied within the snapshot pipeline, and mask cha
 
 Temporal features remain available and can be concatenated as additional channels when configured. This preserves the original intent of encoding time-of-day and day-of-week effects while staying within the snapshot data flow.
 
+### 4.1 Snapshot Build and Alignment Schematic
+
+The next schematic zooms into how snapshot records are produced and aligned. Gap handling is applied per asset, hybrid aggregation is performed if enabled, and alignment uses the target asset timeline. Confidence masks are appended after alignment so the model can treat missingness as a first-class signal.
+
+```mermaid
+flowchart LR
+    Rows[Order book rows per asset] --> Gap[GapHandler per asset]
+    Gap --> Hybrid[Hybrid aggregation (optional)]
+    Gap --> Top[Top-of-book path]
+    Hybrid --> Align[Align to target timeline]
+    Top --> Align
+    Align --> Policy[Large-gap policy (zero-pad/skip/error)]
+    Policy --> Mask[Confidence mask channel]
+    Mask --> Window[Windowed samples + labels]
+    Window --> Chunk[Chunked snapshot files]
+```
+
 ## 5. Model Training and Evaluation
 
 The CNN+LSTM architecture remains the canonical model family. In snapshot mode, the training pipeline supports two-head intensity output aligned to the configured price class boundaries. Training proceeds with chronological splits, optional sample weighting, and MLflow logging of metrics and artifacts.
@@ -48,6 +85,24 @@ The CNN+LSTM architecture remains the canonical model family. In snapshot mode, 
 Evaluation is snapshot-aware and uses the same normalization stats as training. Calibration analysis is available, but post-hoc calibration methods are not yet implemented.
 
 Hyperparameter optimization is currently disabled in snapshot mode to avoid conflicts with snapshot dataset handling and MLflow lifecycle. This constraint is intentional and should be revisited only when the snapshot pipeline can support reproducible tuning runs.
+
+### 5.1 Training and Evaluation Schematic
+
+Training and evaluation share the snapshot dataset and normalization statistics. The diagram below highlights the mask-aware normalization path and the split-specific data flows, which preserve reproducibility across training and evaluation while keeping the dataset identity stable.
+
+```mermaid
+flowchart TD
+    Dataset[SnapshotDataset] -->|train split| Stats[Normalization stats (mask-aware)]
+    Stats --> TrainGen[Training generator]
+    Stats --> ValGen[Validation generator]
+    Dataset -->|test split| EvalBatch[Evaluation batches]
+    TrainGen --> Model[Model fit]
+    ValGen --> Model
+    EvalBatch --> Norm[Apply normalization (mask-aware)]
+    Norm --> Metrics[Metrics + artifacts]
+    Model --> Metrics
+    Metrics --> MLflow[MLflow logging]
+```
 
 ## 6. What Remains to Reach the Full Vision
 
@@ -67,7 +122,7 @@ The snapshot pipeline enforces strict configuration validation. Alignment settin
 
 ## 8. Document Lineage and References
 
-This update is intended to be read together with the original vision in documentation/2025-11-03/vision.md and the audit materials in documentation/2026-01-17/code_audit_report.md, documentation/2026-01-17/implementation_priority_matrix.md, and documentation/2026-01-17/technical_debt_register.md. The implementation-aligned planning updates that correspond to this vision are provided in documentation/2025-11-03/implementation_priority_matrix_update_2026-02-02.md and documentation/2025-11-03/technical_debt_register_update_2026-02-02.md.
+This update is intended to be read together with the original vision in documentation/2025-11-03/vision.md and the audit materials in documentation/2026-01-17/code_audit_report.md, documentation/2026-01-17/implementation_priority_matrix.md, and documentation/2026-01-17/technical_debt_register.md. The implementation-aligned planning updates that correspond to this vision are provided in documentation/2026-02-02/implementation_priority_matrix_update_2026-02-02.md and documentation/2026-02-02/technical_debt_register_update_2026-02-02.md.
 
 ## 9. Change Log
 

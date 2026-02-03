@@ -3,7 +3,7 @@
 **Date:** 2026-02-02  
 **Time:** 11:45 UTC+09:00  
 **Reference:** documentation/2026-01-17/technical_debt_register.md  
-**Aligned Vision:** documentation/2025-11-03/vision_update_2026-02-02.md
+**Aligned Vision:** documentation/2026-02-02/vision_update_2026-02-02.md
 
 ---
 
@@ -164,4 +164,4 @@ Remove implicit defaults (TD-012), add integration tests (TD-013), and address M
 
 ## References
 
-This update is linked to the original register at documentation/2026-01-17/technical_debt_register.md and the snapshot-aligned vision in documentation/2025-11-03/vision_update_2026-02-02.md. The related priority matrix updates are in documentation/2025-11-03/implementation_priority_matrix_update_2026-02-02.md and the original matrix in documentation/2026-01-17/implementation_priority_matrix.md.
+This update is linked to the original register at documentation/2026-01-17/technical_debt_register.md and the snapshot-aligned vision in documentation/2026-02-02/vision_update_2026-02-02.md. The related priority matrix updates are in documentation/2026-02-02/implementation_priority_matrix_update_2026-02-02.md and the original matrix in documentation/2026-01-17/implementation_priority_matrix.md.

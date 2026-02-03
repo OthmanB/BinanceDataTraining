@@ -3,7 +3,7 @@
 **Date:** 2026-02-02  
 **Time:** 11:45 UTC+09:00  
 **Reference:** documentation/2026-01-17/implementation_priority_matrix.md  
-**Aligned Vision:** documentation/2025-11-03/vision_update_2026-02-02.md
+**Aligned Vision:** documentation/2026-02-02/vision_update_2026-02-02.md
 
 ---
 
@@ -129,4 +129,4 @@ These items should be treated as P3 priorities because they affect production re
 
 ## References
 
-This update is linked to the original matrix at documentation/2026-01-17/implementation_priority_matrix.md and the snapshot-aligned vision in documentation/2025-11-03/vision_update_2026-02-02.md. The related technical debt updates are in documentation/2025-11-03/technical_debt_register_update_2026-02-02.md and the original register in documentation/2026-01-17/technical_debt_register.md.
+This update is linked to the original matrix at documentation/2026-01-17/implementation_priority_matrix.md and the snapshot-aligned vision in documentation/2026-02-02/vision_update_2026-02-02.md. The related technical debt updates are in documentation/2026-02-02/technical_debt_register_update_2026-02-02.md and the original register in documentation/2026-01-17/technical_debt_register.md.
