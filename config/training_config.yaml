@@ -203,6 +203,22 @@ model:  # Defines the neural network architecture and its compilation settings.
     layers: [64]          # Sizes of fully connected layers after the recurrent block.
     dropout_rates: [0.2]  # Dropout rates for each dense layer.
 
+  long_term:
+    enabled: false                    # When true, add long-term context branch (TD-019 dual-channel).
+    windows_days: [7, 30, 90]         # Multi-scale windows: weekly, monthly, quarterly.
+    resolution_days: 1                # Aggregation resolution (daily statistics).
+    features:                         # Features to compute per window:
+      - "mean_return"                 #   Average daily return.
+      - "volatility"                  #   Daily return standard deviation.
+      - "volume_proxy"                #   Average daily volume (from order book depth).
+      - "skewness"                    #   Return distribution skewness.
+    summary_method: "mean"            # How to summarize stats: "mean", "ewma", "last".
+    ewma_halflife_days: 7.0           # Half-life for EWMA weighting (when summary_method="ewma").
+    input_dim: null                   # Auto-computed: len(windows_days) * len(features). Set to override.
+    dense:
+      layers: [32]                    # Dense layer sizes for long-term branch.
+      dropout_rates: [0.2]            # Dropout rates for long-term dense layers.
+
   output:
     type: "two_head_intensity"  # Output head configuration: separate up/down intensity classifications.
     num_classes: 4               # Number of classes per head; should equal len(targets.price_classes.boundaries) + 1.

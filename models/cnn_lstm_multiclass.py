@@ -1,33 +1,60 @@
-"""Canonical CNN+LSTM model architecture (skeleton).
+"""Canonical CNN+LSTM model architecture with dual-channel support.
 
 This module defines a builder for the multi-class CNN+LSTM model described in the
-technical specifications. The actual model is not used in Phase 3 yet, but the
-builder is provided for completeness and future integration.
+technical specifications. Supports both single-input (short-term only) and
+dual-input (short-term + long-term context) architectures.
+
+The dual-channel architecture (TD-019) adds a secondary input branch for
+long-term market context features (7/30/90-day summary statistics), which
+are merged with the short-term CNN+LSTM features before the output heads.
+
+Architecture:
+    Short-Term Input (T, H, W, C) → CNN+LSTM → (lstm_units,)
+                                                    ↓
+    [Optional Long-Term Input (n_features,)] → Dense → Concatenate → Dense → Two-Head Output
 """
 
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 import logging
 
 
 logger = logging.getLogger(__name__)
 
 
-def build_cnn_lstm_model(config: Dict[str, Any], input_shape: Tuple[int, ...]):
+def build_cnn_lstm_model(
+    config: Dict[str, Any],
+    input_shape: Tuple[int, ...],
+    long_term_input_dim: Optional[int] = None,
+):
     """Build a CNN+LSTM Keras model according to the configuration.
+
+    Supports dual-channel architecture when model.long_term.enabled is True.
 
     Parameters
     ----------
     config:
         Global configuration dictionary loaded from YAML.
     input_shape:
-        Shape of the main input tensor (excluding batch dimension).
+        Shape of the main (short-term) input tensor (excluding batch dimension).
+        Expected: (T, H, W, C) where T is time steps, H/W are spatial dims.
+    long_term_input_dim:
+        Dimension of the long-term input vector. If None and long_term is enabled,
+        it will be read from config.model.long_term.input_dim. Pass 0 to force
+        single-input mode even when config has long_term enabled.
+
+    Returns
+    -------
+    keras.Model:
+        Compiled Keras model with either:
+        - Single input: (batch, T, H, W, C) when long_term disabled
+        - Dual inputs: [(batch, T, H, W, C), (batch, lt_dim)] when long_term enabled
 
     Notes
     -----
     - TensorFlow/Keras is imported lazily inside this function to avoid import
       errors at startup if the dependency is not installed yet.
-    - This function is not invoked in Phase 3; it will be wired into the
-      training pipeline in later phases.
+    - When dual-input mode is enabled, the model expects a list of two inputs
+      during training and inference.
     """
 
     model_cfg = config.get("model", {})
@@ -51,6 +78,27 @@ def build_cnn_lstm_model(config: Dict[str, Any], input_shape: Tuple[int, ...]):
     lstm_cfg = model_cfg.get("lstm", {})
     dense_cfg = model_cfg.get("dense", {})
     output_cfg = model_cfg.get("output", {})
+    long_term_cfg = model_cfg.get("long_term", {})
+
+    # Determine if long-term branch is enabled
+    long_term_enabled = bool(long_term_cfg.get("enabled", False))
+    if long_term_input_dim == 0:
+        # Explicit override to disable long-term
+        long_term_enabled = False
+    elif long_term_input_dim is None and long_term_enabled:
+        # Read from config
+        long_term_input_dim = int(long_term_cfg.get("input_dim", 0))
+        if long_term_input_dim <= 0:
+            # Auto-compute from windows and features
+            windows = long_term_cfg.get("windows_days", [7, 30, 90])
+            features = long_term_cfg.get("features", ["mean_return", "volatility", "volume_proxy", "skewness"])
+            long_term_input_dim = len(windows) * len(features)
+    
+    if long_term_enabled and (long_term_input_dim is None or long_term_input_dim <= 0):
+        raise ValueError(
+            "model.long_term.enabled is True but input_dim could not be determined. "
+            "Set model.long_term.input_dim or ensure windows_days and features are configured."
+        )
 
     num_layers = int(cnn_cfg.get("num_layers"))
     filters = cnn_cfg.get("filters")
@@ -96,6 +144,36 @@ def build_cnn_lstm_model(config: Dict[str, Any], input_shape: Tuple[int, ...]):
         return_sequences=False,
     )(x)
 
+    # Store short-term branch output before dense layers
+    short_term_output = x
+
+    # Build long-term branch if enabled
+    long_term_input = None
+    if long_term_enabled:
+        long_term_input = keras.Input(
+            shape=(long_term_input_dim,), name="long_term_input"
+        )
+        
+        # Long-term dense layers (configurable, default to single 32-unit layer)
+        lt_dense_cfg = long_term_cfg.get("dense", {})
+        lt_dense_layers = lt_dense_cfg.get("layers", [32]) or [32]
+        lt_dropout_rates = lt_dense_cfg.get("dropout_rates", [0.2]) or [0.2]
+        
+        y = long_term_input
+        for i, units in enumerate(lt_dense_layers):
+            y = layers.Dense(int(units), activation="relu", name=f"lt_dense_{i}")(y)
+            dr = float(lt_dropout_rates[i]) if i < len(lt_dropout_rates) else 0.0
+            if dr > 0:
+                y = layers.Dropout(dr, name=f"lt_dropout_{i}")(y)
+        
+        # Merge short-term and long-term branches
+        x = layers.Concatenate(name="merge_branches")([short_term_output, y])
+        
+        logger.info(
+            "Long-term branch added: input_dim=%d, dense_layers=%s",
+            long_term_input_dim, lt_dense_layers
+        )
+
     dense_layers = dense_cfg.get("layers", []) or []
     dense_dropout_rates = dense_cfg.get("dropout_rates", []) or []
 
@@ -115,7 +193,15 @@ def build_cnn_lstm_model(config: Dict[str, Any], input_shape: Tuple[int, ...]):
     up_head = layers.Dense(num_classes, activation=output_activation, name="up_intensity")(x)
     down_head = layers.Dense(num_classes, activation=output_activation, name="down_intensity")(x)
 
-    model = keras.Model(inputs=inputs, outputs=[up_head, down_head], name="cnn_lstm_two_head_intensity")
+    # Build model with appropriate inputs
+    if long_term_enabled and long_term_input is not None:
+        all_inputs = [inputs, long_term_input]
+        model_name = "cnn_lstm_dual_channel_two_head"
+    else:
+        all_inputs = inputs
+        model_name = "cnn_lstm_two_head_intensity"
+
+    model = keras.Model(inputs=all_inputs, outputs=[up_head, down_head], name=model_name)
 
     compilation_cfg = model_cfg.get("compilation", {})
     optimizer_name = compilation_cfg.get("optimizer")
@@ -162,7 +248,8 @@ def build_cnn_lstm_model(config: Dict[str, Any], input_shape: Tuple[int, ...]):
     model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
 
     logger.info(
-        "CNN+LSTM model built and compiled: name=%s, num_classes=%d", model.name, num_classes
+        "CNN+LSTM model built and compiled: name=%s, num_classes=%d, long_term_enabled=%s",
+        model.name, num_classes, long_term_enabled
     )
 
     return model

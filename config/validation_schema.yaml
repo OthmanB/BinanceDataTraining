@@ -195,6 +195,30 @@ sections:
       compilation.loss:
         type: string
 
+  # Optional keys for model.long_term (TD-019 dual-channel support)
+  # These are not required since long_term.enabled defaults to false
+  model_long_term:
+    type: dict
+    optional_keys:
+      long_term.enabled:
+        type: boolean
+      long_term.windows_days:
+        type: list
+      long_term.resolution_days:
+        type: integer
+      long_term.features:
+        type: list
+      long_term.summary_method:
+        type: string
+      long_term.ewma_halflife_days:
+        type: number
+      long_term.input_dim:
+        type: any
+      long_term.dense.layers:
+        type: list
+      long_term.dense.dropout_rates:
+        type: list
+
   training:
     type: dict
     required_keys:
