@@ -273,9 +273,64 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to log class weights to MLFlow: %s", exc)
 
-    from models.cnn_lstm_multiclass import build_cnn_lstm_model
+    # Build or load model based on fine-tuning configuration
+    fine_tuning_cfg = training_cfg.get("fine_tuning", {})
+    fine_tuning_enabled = isinstance(fine_tuning_cfg, dict) and fine_tuning_cfg.get("enabled", False)
 
-    model = build_cnn_lstm_model(config, input_shape=input_shape)
+    if fine_tuning_enabled:
+        from .fine_tuning import (
+            FineTuningError,
+            load_model_from_registry,
+            load_model_from_run,
+            prepare_fine_tuning,
+        )
+
+        use_registry = bool(fine_tuning_cfg.get("use_model_registry", False))
+
+        if use_registry:
+            registry_name = fine_tuning_cfg.get("registry_name")
+            if not registry_name:
+                raise ConfigError(
+                    "training.fine_tuning.registry_name is required when use_model_registry is true"
+                )
+            stage = str(fine_tuning_cfg.get("base_model_stage", "Production"))
+            logger.info(
+                "Fine-tuning enabled: loading model from registry. name=%s, stage=%s",
+                registry_name,
+                stage,
+            )
+            try:
+                model = load_model_from_registry(registry_name, stage=stage)
+            except FineTuningError as exc:
+                raise ConfigError(f"Failed to load base model for fine-tuning: {exc}") from exc
+        else:
+            run_id = fine_tuning_cfg.get("base_model_run_id")
+            if not run_id:
+                raise ConfigError(
+                    "training.fine_tuning.base_model_run_id is required when fine_tuning.enabled is true "
+                    "and use_model_registry is false"
+                )
+            logger.info("Fine-tuning enabled: loading model from MLflow run. run_id=%s", run_id)
+            try:
+                model = load_model_from_run(run_id)
+            except FineTuningError as exc:
+                raise ConfigError(f"Failed to load base model for fine-tuning: {exc}") from exc
+
+        # Prepare the model for fine-tuning (freeze layers, adjust LR)
+        try:
+            model = prepare_fine_tuning(config, model, input_shape=input_shape)
+        except FineTuningError as exc:
+            raise ConfigError(f"Failed to prepare model for fine-tuning: {exc}") from exc
+
+        logger.info(
+            "Model prepared for fine-tuning: freeze_layers=%s, lr_factor=%s",
+            fine_tuning_cfg.get("freeze_layers", "none"),
+            fine_tuning_cfg.get("learning_rate_factor", 0.1),
+        )
+    else:
+        from models.cnn_lstm_multiclass import build_cnn_lstm_model
+
+        model = build_cnn_lstm_model(config, input_shape=input_shape)
 
     # Log model complexity metrics to MLFlow if available.
     try:

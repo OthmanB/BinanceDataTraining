@@ -253,8 +253,12 @@ training:  # Controls how the model is fit on the prepared dataset.
 
   fine_tuning:
     enabled: false              # When true, resume training from a previously saved model instead of starting from scratch.
-    base_model_run_id: null     # Required when fine_tuning.enabled is true; identifies the MLflow run/model to load.
-    base_model_stage: "binance-model-training"  # MLflow experiment/stage or registry naming context for the base model.
+    base_model_run_id: null     # Required when fine_tuning.enabled is true and use_model_registry is false; identifies the MLflow run/model to load.
+    base_model_stage: "Production"  # MLflow model registry stage to load from (e.g., "Production", "Staging", "None").
+    use_model_registry: false   # When true, load model from MLflow model registry; when false, load from run artifacts.
+    registry_name: null         # Required when use_model_registry is true; the registered model name in MLflow.
+    freeze_layers: "none"       # Layer freezing pattern: "none", "cnn", "cnn_lstm", "all_but_output".
+    learning_rate_factor: 0.1   # Multiplicative factor for learning rate when fine-tuning (e.g., 0.1 = 10x lower LR).
 
 # Snapshot Configuration
 snapshot:  # Derived dataset snapshots for streaming training/restarts.

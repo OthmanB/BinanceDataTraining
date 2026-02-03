@@ -240,6 +240,14 @@ sections:
         type: any
       fine_tuning.base_model_stage:
         type: string
+      fine_tuning.use_model_registry:
+        type: boolean
+      fine_tuning.registry_name:
+        type: any
+      fine_tuning.freeze_layers:
+        type: string
+      fine_tuning.learning_rate_factor:
+        type: number
       dataset_cache.enabled:
         type: boolean
       dataset_cache.directory:
