@@ -324,6 +324,8 @@ sections:
         type: string
       local_tmp_dir:
         type: string
+      run_naming.pattern:
+        type: string
       artifact_logging.trained_model:
         type: boolean
 

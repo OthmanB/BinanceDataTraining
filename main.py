@@ -34,13 +34,13 @@ from models.hyperparameter_tuning import run_hyperparameter_search
 
 
 def _enforce_production_sample_cap(config: Dict[str, Any], n_samples: int) -> None:
-    run_mode_cfg = config.get("run_mode", {})
-    mode = str(run_mode_cfg.get("mode"))
+    run_mode_cfg = config["run_mode"]  # Required by schema
+    mode = str(run_mode_cfg["mode"])  # Required by schema
     if mode != "production":
         return
 
-    training_cfg = config.get("training", {})
-    debug_max_samples = int(training_cfg.get("debug_max_samples", 0))
+    training_cfg = config["training"]  # Required by schema
+    debug_max_samples = int(training_cfg["debug_max_samples"])  # Required by schema
     if debug_max_samples < n_samples:
         raise ConfigError(
             "training.debug_max_samples must be >= metadata.num_samples when run_mode.mode='production'. "
@@ -67,20 +67,21 @@ def main() -> int:
         return 1
 
     # Determine run mode (production vs trial) from configuration.
-    run_mode_cfg = config.get("run_mode", {})
-    mode = str(run_mode_cfg.get("mode"))
+    run_mode_cfg = config["run_mode"]  # Required by schema
+    mode = str(run_mode_cfg["mode"])  # Required by schema
     if mode not in ("production", "trial"):
         logger.error("Invalid run_mode.mode in configuration: %r (expected 'production' or 'trial')", mode)
         return 1
 
     # Start MLFlow run
-    mlflow_cfg = config.get("mlflow", {})
-    run_pattern = (
-        mlflow_cfg.get("run_naming", {}).get("pattern")
-        or "{asset}_{model}_{timestamp}"
-    )
-    target_asset = config.get("data", {}).get("asset_pairs", {}).get("target_asset")
-    model_name = config.get("model", {}).get("architecture")
+    mlflow_cfg = config["mlflow"]
+    run_naming_cfg = mlflow_cfg.get("run_naming", {})
+    run_pattern = run_naming_cfg.get("pattern")
+    if not run_pattern:
+        logger.error("mlflow.run_naming.pattern is required in configuration")
+        return 1
+    target_asset = config["data"]["asset_pairs"]["target_asset"]
+    model_name = config["model"]["architecture"]
     timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
 
     run_name = run_pattern.format(
@@ -95,8 +96,8 @@ def main() -> int:
         logger.error("Failed to start MLFlow run: %s", exc)
         return 1
 
-    snapshot_cfg = config.get("snapshot", {})
-    snapshot_enabled = bool(snapshot_cfg.get("enabled"))
+    snapshot_cfg = config["snapshot"]  # Required by schema
+    snapshot_enabled = bool(snapshot_cfg["enabled"])  # Required by schema
 
     if not snapshot_enabled:
         logger.error(
@@ -112,7 +113,7 @@ def main() -> int:
 
     config_for_training = config
 
-    hpo_cfg = config.get("hyperparameter_optimization")
+    hpo_cfg = config["hyperparameter_optimization"]  # Required by schema
     if isinstance(hpo_cfg, dict) and hpo_cfg.get("enabled"):
         logger.error("Hyperparameter optimization is not supported when snapshot.enabled is true.")
         end_run()

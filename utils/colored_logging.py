@@ -29,13 +29,19 @@ class ColoredFormatter(logging.Formatter):
 
 
 def setup_colored_logging(config: Dict[str, Any]) -> logging.Logger:
-    """Set up root logger with colored output according to config."""
+    """Set up root logger with colored output according to config.
+    
+    Requires logging.level and logging.colors to be present in config.
+    These are validated by the config schema.
+    """
 
-    logging_cfg = config.get("logging", {})
-    level_name = logging_cfg.get("level", "INFO").upper()
-    level = getattr(logging, level_name, logging.INFO)
+    logging_cfg = config["logging"]  # Required section, fail fast if missing
+    level_name = logging_cfg["level"].upper()  # Required by schema
+    level = getattr(logging, level_name, None)
+    if level is None:
+        raise ValueError(f"Invalid logging level: {level_name}")
 
-    colors = logging_cfg.get("colors", {})
+    colors = logging_cfg["colors"]  # Required by schema
 
     logger = logging.getLogger()
     logger.setLevel(level)
