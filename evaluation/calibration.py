@@ -2,6 +2,7 @@
 
 This module provides:
 - compute_calibration_metrics: Compute ECE, Brier score, and reliability curves
+- probs_to_logits_proxy: Convert probabilities to logit-like values
 - TemperatureScaler: Post-hoc temperature scaling for probability calibration
 - apply_temperature_scaling: Apply learned temperature to logits/probabilities
 """
@@ -112,10 +113,53 @@ def compute_calibration_metrics(y_true: Any, y_prob: Any, *, num_bins: int) -> D
     }
 
 
+def probs_to_logits_proxy(probs: np.ndarray, *, eps: float = 1e-12) -> np.ndarray:
+    """Convert probabilities to logit-like values suitable for temperature scaling.
+
+    This is useful when the model outputs softmax probabilities instead of logits.
+    The returned values preserve class ordering and can be used with temperature
+    scaling because softmax(log(p) / T) yields a valid calibrated distribution.
+
+    Parameters
+    ----------
+    probs : np.ndarray
+        Array of probabilities with shape (n_samples, n_classes).
+    eps : float
+        Clipping epsilon to avoid log(0). Must be in (0, 0.5).
+
+    Returns
+    -------
+    np.ndarray
+        Logit-like array of shape (n_samples, n_classes).
+    """
+    if eps <= 0.0 or eps >= 0.5:
+        raise ValueError(f"eps must be in (0, 0.5), got {eps}")
+
+    probs_arr = np.asarray(probs, dtype="float64")
+    if probs_arr.ndim != 2:
+        raise ValueError(
+            "probs must be a 2D array of shape (n_samples, n_classes) for logits proxy conversion"
+        )
+
+    probs_arr = np.clip(probs_arr, eps, 1.0 - eps)
+    row_sums = probs_arr.sum(axis=1, keepdims=True)
+    row_sums = np.where(row_sums == 0.0, 1.0, row_sums)
+    probs_arr = probs_arr / row_sums
+
+    return np.log(probs_arr)
+
+
+def logits_to_calibrated_probs(logits: np.ndarray, temperature: float) -> np.ndarray:
+    """Apply temperature scaling to logits and return calibrated probabilities."""
+    return apply_temperature_scaling(logits, temperature)
+
+
 __all__ = [
     "compute_calibration_metrics",
+    "probs_to_logits_proxy",
     "TemperatureScaler",
     "apply_temperature_scaling",
+    "logits_to_calibrated_probs",
     "fit_temperature",
 ]
 
@@ -323,7 +367,8 @@ def apply_temperature_scaling(
     Parameters
     ----------
     logits : np.ndarray
-        Pre-softmax logits of shape (n_samples, n_classes).
+        Pre-softmax logits of shape (n_samples, n_classes). Log-probability
+        proxies from probs_to_logits_proxy are also acceptable.
     temperature : float
         Temperature parameter (must be positive).
 

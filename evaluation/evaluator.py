@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple
+import json
 import logging
 from pathlib import Path
 import tempfile
@@ -26,10 +27,17 @@ from preprocessing.snapshot_sequence_builder import (
     build_hybrid_depth_sequence_tensor,
 )
 from preprocessing.feature_engineering import FeatureEngineer
-from .calibration import compute_calibration_metrics
+from .calibration import (
+    compute_calibration_metrics,
+    fit_temperature,
+    probs_to_logits_proxy,
+    logits_to_calibrated_probs,
+)
 
 
 logger = logging.getLogger(__name__)
+
+CALIBRATION_MEMORY_WARN_THRESHOLD = 1_000_000
 
 
 def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, Any]) -> None:
@@ -519,6 +527,7 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
     calib_enabled = bool(calib_cfg["enabled"])
     calibration_results_up: Dict[str, Any] | None = None
     calibration_results_down: Dict[str, Any] | None = None
+    calibration_fit_summary: Dict[str, Any] | None = None  # Only populated in evaluate_snapshot_model
 
     if calib_enabled:
         n_bins = int(calib_cfg["n_bins"])
@@ -610,6 +619,20 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
             mlflow.log_metric(name, float(value))
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to log MLFlow evaluation metric %s: %s", name, exc)
+
+    if calibration_fit_summary is not None:
+        try:
+            tmp_dir = Path(tempfile.mkdtemp())
+            summary_path = tmp_dir / "post_hoc_calibration_summary.json"
+            with summary_path.open("w", encoding="utf-8") as handle:
+                json.dump(calibration_fit_summary, handle, indent=2, sort_keys=True)
+            mlflow.log_artifact(str(summary_path), artifact_path="evaluation")
+            logger.info(
+                "Logged post-hoc calibration summary artifact to MLFlow at %s",
+                summary_path,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to log post-hoc calibration summary artifact to MLFlow: %s", exc)
 
     # Optional confusion matrix artifact logging.
     try:
@@ -814,12 +837,19 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
     else:
         eval_stats = train_stats
 
+    batch_size = int(training_cfg["batch_size"])
+    if batch_size <= 0:
+        raise ValueError("training.batch_size must be positive")
+
     eval_cfg = config["evaluation"]
     calib_cfg = eval_cfg["calibration_analysis"]
     calib_enabled = bool(calib_cfg["enabled"])
     n_bins = int(calib_cfg["n_bins"])
     if n_bins <= 0:
         raise ValueError("evaluation.calibration_analysis.n_bins must be positive")
+
+    post_hoc_cfg = eval_cfg["post_hoc_calibration"]
+    post_hoc_enabled = bool(post_hoc_cfg["enabled"])
 
     bin_edges = np.linspace(0.0, 1.0, n_bins + 1, dtype="float64")
 
@@ -834,6 +864,8 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
 
     up_conf_sum, up_acc_sum, up_bin_count, up_brier_sum, up_count = _init_calibration_state()
     down_conf_sum, down_acc_sum, down_bin_count, down_brier_sum, down_count = _init_calibration_state()
+    up_conf_sum_cal, up_acc_sum_cal, up_bin_count_cal, up_brier_sum_cal, up_count_cal = _init_calibration_state()
+    down_conf_sum_cal, down_acc_sum_cal, down_bin_count_cal, down_brier_sum_cal, down_count_cal = _init_calibration_state()
 
     confusion_up = np.zeros((num_classes, num_classes), dtype=int)
     confusion_down = np.zeros((num_classes, num_classes), dtype=int)
@@ -842,9 +874,135 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
     correct_up = 0
     correct_down = 0
 
-    batch_size = int(training_cfg["batch_size"])
-    if batch_size <= 0:
-        raise ValueError("training.batch_size must be positive")
+    temperature_up: Optional[float] = None
+    temperature_down: Optional[float] = None
+    calibration_fit_summary: Optional[Dict[str, Any]] = None
+
+    def _collect_calibration_predictions(
+        start_index: int,
+        end_index: int,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        probs_up_parts = []
+        probs_down_parts = []
+        labels_up_parts = []
+        labels_down_parts = []
+
+        for x_chunk, y_up_chunk, y_down_chunk, _ in iter_snapshot_batches(
+            snapshot_dataset, start_index, end_index
+        ):
+            x_chunk = _apply_normalization_snapshot(x_chunk, eval_stats, mask_start, mask_count)
+            n_chunk = x_chunk.shape[0]
+
+            for offset in range(0, n_chunk, batch_size):
+                x_batch = x_chunk[offset : offset + batch_size]
+                y_true_up = y_up_chunk[offset : offset + batch_size]
+                y_true_down = y_down_chunk[offset : offset + batch_size]
+
+                y_pred = model.predict(x_batch, batch_size=batch_size, verbose=0)
+                if not isinstance(y_pred, (list, tuple)) or len(y_pred) != 2:
+                    raise ValueError("Expected model.predict to return two outputs for two_head_intensity")
+
+                y_prob_up, y_prob_down = y_pred
+                y_prob_up = np.asarray(y_prob_up, dtype="float64")
+                y_prob_down = np.asarray(y_prob_down, dtype="float64")
+
+                if y_prob_up.shape[1] != num_classes or y_prob_down.shape[1] != num_classes:
+                    raise ValueError("Prediction output classes do not match model.output.num_classes")
+
+                probs_up_parts.append(y_prob_up)
+                probs_down_parts.append(y_prob_down)
+                labels_up_parts.append(np.asarray(y_true_up, dtype="int64"))
+                labels_down_parts.append(np.asarray(y_true_down, dtype="int64"))
+
+        if not probs_up_parts:
+            raise ValueError("No predictions collected for post-hoc calibration fitting")
+
+        probs_up = np.concatenate(probs_up_parts, axis=0)
+        probs_down = np.concatenate(probs_down_parts, axis=0)
+        labels_up = np.concatenate(labels_up_parts, axis=0)
+        labels_down = np.concatenate(labels_down_parts, axis=0)
+
+        if probs_up.shape[0] != labels_up.shape[0] or probs_down.shape[0] != labels_down.shape[0]:
+            raise ValueError("Calibration data size mismatch between predictions and labels")
+
+        return probs_up, probs_down, labels_up, labels_down
+
+    if post_hoc_enabled:
+        method = str(post_hoc_cfg["method"])
+        if method != "temperature_scaling":
+            raise ValueError(
+                "evaluation.post_hoc_calibration.method must be 'temperature_scaling' when enabled"
+            )
+
+        fit_on_validation = bool(post_hoc_cfg["fit_on_validation"])
+        bounds_cfg = post_hoc_cfg["temperature_bounds"]
+        min_temp = float(bounds_cfg["min"])
+        max_temp = float(bounds_cfg["max"])
+        min_samples = int(post_hoc_cfg["min_samples"])
+
+        if min_samples <= 0:
+            raise ValueError("evaluation.post_hoc_calibration.min_samples must be positive")
+        if min_temp <= 0.0 or max_temp <= 0.0 or min_temp >= max_temp:
+            raise ValueError(
+                "evaluation.post_hoc_calibration.temperature_bounds must satisfy 0 < min < max"
+            )
+
+        fit_start = train_end if fit_on_validation else test_start
+        fit_end = val_end if fit_on_validation else test_end
+        fit_count = fit_end - fit_start
+        if fit_count <= 0:
+            raise ValueError("Post-hoc calibration fit range is empty")
+
+        if fit_count > CALIBRATION_MEMORY_WARN_THRESHOLD:
+            logger.warning(
+                "Post-hoc calibration will buffer %s samples in memory; consider reducing evaluation range",
+                fit_count,
+            )
+
+        probs_up_fit, probs_down_fit, labels_up_fit, labels_down_fit = _collect_calibration_predictions(
+            fit_start,
+            fit_end,
+        )
+
+        fit_samples = int(probs_up_fit.shape[0])
+        if fit_samples < min_samples:
+            raise ValueError(
+                "Post-hoc calibration requires at least {min_samples} samples; got {fit_samples}".format(
+                    min_samples=min_samples,
+                    fit_samples=fit_samples,
+                )
+            )
+
+        logits_up = probs_to_logits_proxy(probs_up_fit)
+        logits_down = probs_to_logits_proxy(probs_down_fit)
+
+        scaler_up = fit_temperature(
+            logits_up,
+            labels_up_fit,
+            num_bins=n_bins,
+            bounds=(min_temp, max_temp),
+        )
+        scaler_down = fit_temperature(
+            logits_down,
+            labels_down_fit,
+            num_bins=n_bins,
+            bounds=(min_temp, max_temp),
+        )
+
+        if not scaler_up.fitted or not scaler_down.fitted:
+            raise ValueError("Post-hoc calibration failed to fit temperature scalers")
+
+        temperature_up = scaler_up.temperature
+        temperature_down = scaler_down.temperature
+
+        calibration_fit_summary = {
+            "fit_split": "validation" if fit_on_validation else "test",
+            "num_samples": fit_samples,
+            "num_bins": n_bins,
+            "temperature_bounds": {"min": min_temp, "max": max_temp},
+            "up": scaler_up.to_dict(),
+            "down": scaler_down.to_dict(),
+        }
 
     for x_chunk, y_up_chunk, y_down_chunk, _ in iter_snapshot_batches(
         snapshot_dataset, test_start, test_end
@@ -878,10 +1036,10 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
             np.add.at(confusion_up, (y_true_up, y_pred_up), 1)
             np.add.at(confusion_down, (y_true_down, y_pred_down), 1)
 
-            if calib_enabled:
-                y_true_up_onehot = np.eye(num_classes, dtype="float64")[y_true_up]
-                y_true_down_onehot = np.eye(num_classes, dtype="float64")[y_true_down]
+            y_true_up_onehot = np.eye(num_classes, dtype="float64")[y_true_up]
+            y_true_down_onehot = np.eye(num_classes, dtype="float64")[y_true_down]
 
+            if calib_enabled:
                 up_brier_sum += float(
                     np.sum(np.sum((y_prob_up - y_true_up_onehot) ** 2, axis=1))
                 )
@@ -910,6 +1068,47 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
                 down_acc_sum += down_bins[1]
                 down_bin_count += down_bins[2]
 
+            if post_hoc_enabled:
+                if temperature_up is None or temperature_down is None:
+                    raise ValueError("Post-hoc calibration is enabled but temperatures are missing")
+
+                y_prob_up_cal = logits_to_calibrated_probs(
+                    probs_to_logits_proxy(y_prob_up),
+                    temperature_up,
+                )
+                y_prob_down_cal = logits_to_calibrated_probs(
+                    probs_to_logits_proxy(y_prob_down),
+                    temperature_down,
+                )
+
+                up_brier_sum_cal += float(
+                    np.sum(np.sum((y_prob_up_cal - y_true_up_onehot) ** 2, axis=1))
+                )
+                down_brier_sum_cal += float(
+                    np.sum(np.sum((y_prob_down_cal - y_true_down_onehot) ** 2, axis=1))
+                )
+                up_count_cal += int(y_true_up.shape[0])
+                down_count_cal += int(y_true_down.shape[0])
+
+                up_bins_cal = _assign_calibration_bins_with_truth(
+                    y_prob_up_cal,
+                    y_true_up_onehot,
+                    bin_edges,
+                )
+                down_bins_cal = _assign_calibration_bins_with_truth(
+                    y_prob_down_cal,
+                    y_true_down_onehot,
+                    bin_edges,
+                )
+
+                up_conf_sum_cal += up_bins_cal[0]
+                up_acc_sum_cal += up_bins_cal[1]
+                up_bin_count_cal += up_bins_cal[2]
+
+                down_conf_sum_cal += down_bins_cal[0]
+                down_acc_sum_cal += down_bins_cal[1]
+                down_bin_count_cal += down_bins_cal[2]
+
     if total_eval <= 0:
         logger.info("Snapshot evaluation found no samples after batching; skipping.")
         return
@@ -930,6 +1129,8 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
 
     calibration_results_up = None
     calibration_results_down = None
+    calibration_results_up_cal = None
+    calibration_results_down_cal = None
     if calib_enabled:
         calibration_results_up = _finalize_calibration(
             bin_edges,
@@ -946,6 +1147,23 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
             down_bin_count,
             down_brier_sum,
             down_count,
+        )
+    if post_hoc_enabled:
+        calibration_results_up_cal = _finalize_calibration(
+            bin_edges,
+            up_conf_sum_cal,
+            up_acc_sum_cal,
+            up_bin_count_cal,
+            up_brier_sum_cal,
+            up_count_cal,
+        )
+        calibration_results_down_cal = _finalize_calibration(
+            bin_edges,
+            down_conf_sum_cal,
+            down_acc_sum_cal,
+            down_bin_count_cal,
+            down_brier_sum_cal,
+            down_count_cal,
         )
 
     logger.info(
@@ -1000,6 +1218,23 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
     if calibration_results_down is not None:
         metrics["eval_down_brier_score"] = float(calibration_results_down["brier_score"])
         metrics["eval_down_ece"] = float(calibration_results_down["ece"])
+    if calibration_results_up_cal is not None:
+        metrics["eval_up_brier_score_calibrated"] = float(calibration_results_up_cal["brier_score"])
+        metrics["eval_up_ece_calibrated"] = float(calibration_results_up_cal["ece"])
+    if calibration_results_down_cal is not None:
+        metrics["eval_down_brier_score_calibrated"] = float(calibration_results_down_cal["brier_score"])
+        metrics["eval_down_ece_calibrated"] = float(calibration_results_down_cal["ece"])
+
+    if calibration_fit_summary is not None:
+        up_summary = calibration_fit_summary.get("up", {})
+        down_summary = calibration_fit_summary.get("down", {})
+        metrics["calibration_temperature_up"] = float(up_summary.get("temperature", 0.0))
+        metrics["calibration_temperature_down"] = float(down_summary.get("temperature", 0.0))
+        metrics["calibration_fit_up_ece_pre"] = float(up_summary.get("pre_calibration_ece", 0.0))
+        metrics["calibration_fit_up_ece_post"] = float(up_summary.get("post_calibration_ece", 0.0))
+        metrics["calibration_fit_down_ece_pre"] = float(down_summary.get("pre_calibration_ece", 0.0))
+        metrics["calibration_fit_down_ece_post"] = float(down_summary.get("post_calibration_ece", 0.0))
+        metrics["calibration_fit_samples"] = float(calibration_fit_summary.get("num_samples", 0))
 
     for name, value in metrics.items():
         try:
@@ -1032,19 +1267,35 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to log confusion matrix artifacts to MLFlow: %s", exc)
 
-    if calib_enabled and (calibration_results_up is not None or calibration_results_down is not None):
+    if (
+        (calib_enabled and (calibration_results_up is not None or calibration_results_down is not None))
+        or (
+            post_hoc_enabled
+            and (calibration_results_up_cal is not None or calibration_results_down_cal is not None)
+        )
+    ):
         try:
             tmp_dir = Path(tempfile.mkdtemp())
 
-            if calibration_results_up is not None:
+            if calib_enabled and calibration_results_up is not None:
                 calib_up_path = tmp_dir / "calibration_curve_up.csv"
                 _write_calibration_curve(calibration_results_up, calib_up_path)
                 mlflow.log_artifact(str(calib_up_path), artifact_path="evaluation")
 
-            if calibration_results_down is not None:
+            if calib_enabled and calibration_results_down is not None:
                 calib_down_path = tmp_dir / "calibration_curve_down.csv"
                 _write_calibration_curve(calibration_results_down, calib_down_path)
                 mlflow.log_artifact(str(calib_down_path), artifact_path="evaluation")
+
+            if post_hoc_enabled and calibration_results_up_cal is not None:
+                calib_up_cal_path = tmp_dir / "calibration_curve_up_calibrated.csv"
+                _write_calibration_curve(calibration_results_up_cal, calib_up_cal_path)
+                mlflow.log_artifact(str(calib_up_cal_path), artifact_path="evaluation")
+
+            if post_hoc_enabled and calibration_results_down_cal is not None:
+                calib_down_cal_path = tmp_dir / "calibration_curve_down_calibrated.csv"
+                _write_calibration_curve(calibration_results_down_cal, calib_down_cal_path)
+                mlflow.log_artifact(str(calib_down_cal_path), artifact_path="evaluation")
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to log calibration curve artifacts to MLFlow: %s", exc)
 

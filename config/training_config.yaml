@@ -341,6 +341,7 @@ evaluation:  # Post-training evaluation and calibration settings.
     enabled: false  # When true, apply temperature scaling to calibrate predictions.
     method: "temperature_scaling"  # Calibration method: "temperature_scaling" or "isotonic" (future).
     fit_on_validation: true  # If true, fit temperature on validation set; otherwise on test set.
+    min_samples: 500  # Minimum samples required to fit temperature scaling reliably.
     temperature_bounds:
       min: 0.1  # Minimum temperature value during optimization.
       max: 10.0  # Maximum temperature value during optimization.

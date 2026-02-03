@@ -16,8 +16,10 @@ from scipy.special import softmax
 
 from evaluation.calibration import (
     compute_calibration_metrics,
+    probs_to_logits_proxy,
     TemperatureScaler,
     apply_temperature_scaling,
+    logits_to_calibrated_probs,
     fit_temperature,
 )
 
@@ -144,6 +146,33 @@ class TestComputeCalibrationMetricsValidation(unittest.TestCase):
 
         self.assertEqual(result["brier_score"], 0.0)
         self.assertEqual(result["ece"], 0.0)
+
+
+class TestCalibrationHelpers(unittest.TestCase):
+    """Tests for calibration helper utilities."""
+
+    def test_probs_to_logits_proxy_roundtrip(self) -> None:
+        """Logits proxy should preserve probabilities with temperature 1."""
+        np.random.seed(7)
+        logits = np.random.randn(20, 4).astype("float64")
+        probs = softmax(logits, axis=1)
+
+        logits_proxy = probs_to_logits_proxy(probs)
+        restored = apply_temperature_scaling(logits_proxy, temperature=1.0)
+
+        assert_allclose(restored.sum(axis=1), 1.0, atol=1e-8)
+        assert_allclose(restored, probs, atol=1e-6)
+
+    def test_logits_to_calibrated_probs_matches_apply(self) -> None:
+        """Helper should match apply_temperature_scaling output."""
+        np.random.seed(11)
+        logits = np.random.randn(10, 3).astype("float64")
+        temperature = 2.5
+
+        direct = apply_temperature_scaling(logits, temperature)
+        wrapped = logits_to_calibrated_probs(logits, temperature)
+
+        assert_allclose(direct, wrapped, atol=1e-10)
 
 
 class TestTemperatureScalerBasic(unittest.TestCase):

@@ -11,8 +11,10 @@ This module provides:
 from .evaluator import evaluate_model, evaluate_snapshot_model
 from .calibration import (
     compute_calibration_metrics,
+    probs_to_logits_proxy,
     TemperatureScaler,
     apply_temperature_scaling,
+    logits_to_calibrated_probs,
     fit_temperature,
 )
 from .temporal_degradation import (
@@ -35,8 +37,10 @@ __all__ = [
     "evaluate_model",
     "evaluate_snapshot_model",
     "compute_calibration_metrics",
+    "probs_to_logits_proxy",
     "TemperatureScaler",
     "apply_temperature_scaling",
+    "logits_to_calibrated_probs",
     "fit_temperature",
     "WindowMetrics",
     "TemporalDegradationResult",

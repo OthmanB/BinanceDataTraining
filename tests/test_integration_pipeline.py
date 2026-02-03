@@ -193,7 +193,7 @@ def get_minimal_config() -> Dict[str, Any]:
         "evaluation": {
             "metrics": ["accuracy"],
             "calibration_analysis": {"enabled": False, "n_bins": 10},
-            "post_hoc_calibration": {"enabled": False, "method": "temperature_scaling", "fit_on_validation": True, "temperature_bounds": {"min": 0.1, "max": 10.0}},
+            "post_hoc_calibration": {"enabled": False, "method": "temperature_scaling", "fit_on_validation": True, "min_samples": 500, "temperature_bounds": {"min": 0.1, "max": 10.0}},
             "temporal_degradation": {"enabled": False, "num_windows": 5, "overlap_fraction": 0.25},
             "missing_snapshot_strategy": "skip",
             "backtesting": {"enabled": False, "initial_capital": 10000.0, "transaction_cost": 0.001, "signal_strategy": "net_intensity", "signal_threshold": 0.6, "intensity_threshold": 1, "position_sizing": "equal", "max_position_pct": 1.0},
