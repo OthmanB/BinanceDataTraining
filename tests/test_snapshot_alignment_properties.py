@@ -127,8 +127,8 @@ class TestSnapshotAlignmentProperties(unittest.TestCase):
             records=records,
             target_times=target_ts,
             representation="top_of_book",
-            missing_policy_large="error",
-            large_gap_seconds=gap + 10,
+            missing_policy="error",
+            max_gap_seconds=gap + 10,
             hybrid_levels=None,
             fail_on_invalid=True,
             asset_name="TEST",
@@ -158,8 +158,8 @@ class TestSnapshotAlignmentProperties(unittest.TestCase):
             records=records,
             target_times=target_ts,
             representation="hybrid",
-            missing_policy_large="error",
-            large_gap_seconds=60,
+            missing_policy="error",
+            max_gap_seconds=60,
             hybrid_levels=left_snap.shape[0],
             fail_on_invalid=True,
             asset_name="TEST",
@@ -168,6 +168,118 @@ class TestSnapshotAlignmentProperties(unittest.TestCase):
         expected = left_snap + 0.5 * (right_snap - left_snap)
         np.testing.assert_allclose(aligned[0].hybrid_snapshot, expected, rtol=1e-6, atol=1e-6)
         np.testing.assert_allclose(aligned[0].snapshot_features[:4], expected[0], rtol=1e-6, atol=1e-6)
+
+    @settings(max_examples=_MAX_EXAMPLES, suppress_health_check=[HealthCheck.too_slow])
+    @given(
+        offsets=st.lists(
+            st.integers(min_value=0, max_value=300),
+            min_size=2,
+            max_size=15,
+            unique=True,
+        ),
+        base=st.floats(min_value=1.0, max_value=1000.0, allow_nan=False, allow_infinity=False),
+        spread=st.floats(min_value=0.01, max_value=10.0, allow_nan=False, allow_infinity=False),
+    )
+    def test_align_multi_asset_preserves_count_with_exact_matches(
+        self,
+        offsets: list[int],
+        base: float,
+        spread: float,
+    ) -> None:
+        offsets_sorted = sorted(offsets)
+        if len(offsets_sorted) < 2:
+            self.skipTest("Need at least two timestamps for alignment")
+
+        target_records = []
+        correlated_records = []
+        for offset in offsets_sorted:
+            bid = base + 0.05 * float(offset)
+            ask = bid + spread
+            features = np.array([bid, 1.0, ask, 1.0], dtype="float64")
+            target_records.append(_make_record(offset, features))
+
+            corr_bid = base + 0.07 * float(offset)
+            corr_ask = corr_bid + spread
+            corr_features = np.array([corr_bid, 2.0, corr_ask, 2.0], dtype="float64")
+            correlated_records.append(_make_record(offset, corr_features))
+
+        asset_records = {
+            "BTCUSDT": target_records,
+            "ETHUSDT": correlated_records,
+        }
+
+        alignment_cfg = {
+            "method": "interpolate",
+            "missing_policy": "forward_fill",
+            "max_gap_seconds": 10000,
+            "bucket_tolerance_seconds": 1.0,
+        }
+
+        aligned = sd._align_multi_asset_records(
+            asset_records=asset_records,
+            assets=["BTCUSDT", "ETHUSDT"],
+            target_asset="BTCUSDT",
+            alignment_cfg=alignment_cfg,
+            representation="top_of_book",
+            cadence_seconds=10,
+            hybrid_levels=None,
+            fail_on_invalid=True,
+        )
+
+        self.assertEqual(len(aligned), len(offsets_sorted))
+        for rec, corr in zip(aligned, correlated_records):
+            self.assertIn("ETHUSDT", rec.asset_snapshots)
+            np.testing.assert_allclose(
+                rec.asset_snapshots["ETHUSDT"].snapshot_features[:4],
+                corr.snapshot_features[:4],
+                rtol=1e-6,
+                atol=1e-6,
+            )
+
+    @settings(max_examples=_MAX_EXAMPLES, suppress_health_check=[HealthCheck.too_slow])
+    @given(
+        offsets=st.lists(
+            st.integers(min_value=0, max_value=300),
+            min_size=2,
+            max_size=12,
+            unique=True,
+        ),
+    )
+    def test_align_multi_asset_skip_drops_missing(self, offsets: list[int]) -> None:
+        offsets_sorted = sorted(offsets)
+        if len(offsets_sorted) < 2:
+            self.skipTest("Need at least two timestamps for alignment")
+
+        target_records = [
+            _make_record(offset, np.array([100.0, 1.0, 101.0, 1.0], dtype="float64"))
+            for offset in offsets_sorted
+        ]
+        correlated_records = [_make_record(offsets_sorted[0], np.array([200.0, 1.0, 201.0, 1.0]))]
+
+        asset_records = {
+            "BTCUSDT": target_records,
+            "ETHUSDT": correlated_records,
+        }
+
+        alignment_cfg = {
+            "method": "interpolate",
+            "missing_policy": "skip",
+            "max_gap_seconds": 60,
+            "bucket_tolerance_seconds": 1.0,
+        }
+
+        aligned = sd._align_multi_asset_records(
+            asset_records=asset_records,
+            assets=["BTCUSDT", "ETHUSDT"],
+            target_asset="BTCUSDT",
+            alignment_cfg=alignment_cfg,
+            representation="top_of_book",
+            cadence_seconds=10,
+            hybrid_levels=None,
+            fail_on_invalid=False,
+        )
+
+        self.assertEqual(len(aligned), 1)
 
 
 class TestSnapshotAlignmentBehavior(unittest.TestCase):
@@ -185,7 +297,8 @@ class TestSnapshotAlignmentBehavior(unittest.TestCase):
             records=records,
             target_times=target_ts,
             representation="top_of_book",
-            missing_policy_large="error",
+            missing_policy="error",
+            max_gap_seconds=60,
             bucket_tolerance_seconds=2.0,
             cadence_seconds=10,
             hybrid_levels=None,
@@ -195,20 +308,22 @@ class TestSnapshotAlignmentBehavior(unittest.TestCase):
 
         self.assertEqual(aligned[0].snapshot_features[:4], [100.0, 1.0, 101.0, 1.0])
 
-    def test_align_asset_bucket_zero_pad_when_missing(self) -> None:
+    def test_align_asset_bucket_forward_fill_when_missing(self) -> None:
         records = [
-            _make_record(7, np.array([100.0, 1.0, 101.0, 1.0])),
+            _make_record(0, np.array([100.0, 1.0, 101.0, 1.0])),
         ]
 
         target_ts = np.asarray([
             _BASE_TS,
+            _BASE_TS + np.timedelta64(10, "s"),
         ])
 
         aligned = sd._align_asset_bucket(
             records=records,
             target_times=target_ts,
             representation="top_of_book",
-            missing_policy_large="zero_pad",
+            missing_policy="forward_fill",
+            max_gap_seconds=30,
             bucket_tolerance_seconds=1.0,
             cadence_seconds=10,
             hybrid_levels=None,
@@ -216,10 +331,10 @@ class TestSnapshotAlignmentBehavior(unittest.TestCase):
             asset_name="TEST",
         )
 
-        self.assertEqual(aligned[0].snapshot_features[:4], [0.0, 0.0, 0.0, 0.0])
-        self.assertEqual(aligned[0].confidence, 0.0)
+        self.assertEqual(aligned[0].snapshot_features[:4], [100.0, 1.0, 101.0, 1.0])
+        self.assertEqual(aligned[1].snapshot_features[:4], [100.0, 1.0, 101.0, 1.0])
 
-    def test_align_asset_interpolate_large_gap_zero_pad(self) -> None:
+    def test_align_asset_interpolate_large_gap_forward_fill_skips(self) -> None:
         records = [
             _make_record(0, np.array([100.0, 1.0, 101.0, 1.0])),
             _make_record(1000, np.array([200.0, 1.0, 201.0, 1.0])),
@@ -233,16 +348,16 @@ class TestSnapshotAlignmentBehavior(unittest.TestCase):
             records=records,
             target_times=target_ts,
             representation="top_of_book",
-            missing_policy_large="zero_pad",
-            large_gap_seconds=100,
+            missing_policy="forward_fill",
+            max_gap_seconds=100,
             hybrid_levels=None,
             fail_on_invalid=False,
             asset_name="TEST",
         )
 
-        self.assertEqual(aligned[0].snapshot_features[:4], [0.0, 0.0, 0.0, 0.0])
+        self.assertIsNone(aligned[0])
 
-    def test_align_asset_interpolate_zero_pad_with_fail_on_invalid(self) -> None:
+    def test_align_asset_interpolate_forward_fill_with_fail_on_invalid(self) -> None:
         records = [
             _make_record(10, np.array([100.0, 1.0, 101.0, 1.0])),
         ]
@@ -251,18 +366,17 @@ class TestSnapshotAlignmentBehavior(unittest.TestCase):
             _BASE_TS,
         ])
 
-        aligned = sd._align_asset_interpolate(
-            records=records,
-            target_times=target_ts,
-            representation="top_of_book",
-            missing_policy_large="zero_pad",
-            large_gap_seconds=60,
-            hybrid_levels=None,
-            fail_on_invalid=True,
-            asset_name="TEST",
-        )
-
-        self.assertEqual(aligned[0].snapshot_features[:4], [0.0, 0.0, 0.0, 0.0])
+        with self.assertRaises(ValueError):
+            sd._align_asset_interpolate(
+                records=records,
+                target_times=target_ts,
+                representation="top_of_book",
+                missing_policy="forward_fill",
+                max_gap_seconds=60,
+                hybrid_levels=None,
+                fail_on_invalid=True,
+                asset_name="TEST",
+            )
 
     def test_align_asset_records_no_records_error(self) -> None:
         with self.assertRaises(ValueError):
@@ -271,8 +385,8 @@ class TestSnapshotAlignmentBehavior(unittest.TestCase):
                 target_times=np.asarray([_BASE_TS]),
                 method="interpolate",
                 representation="top_of_book",
-                missing_policy_large="error",
-                large_gap_seconds=60,
+                missing_policy="error",
+                max_gap_seconds=60,
                 bucket_tolerance_seconds=0.0,
                 cadence_seconds=10,
                 hybrid_levels=None,
@@ -280,7 +394,7 @@ class TestSnapshotAlignmentBehavior(unittest.TestCase):
                 asset_name="TEST",
             )
 
-    def test_align_multi_asset_zero_pad_missing_asset(self) -> None:
+    def test_align_multi_asset_forward_fill_missing_asset_skips(self) -> None:
         target_records = [
             _make_record(0, np.array([100.0, 1.0, 101.0, 1.0])),
             _make_record(10, np.array([110.0, 1.0, 111.0, 1.0])),
@@ -293,8 +407,8 @@ class TestSnapshotAlignmentBehavior(unittest.TestCase):
 
         alignment_cfg = {
             "method": "interpolate",
-            "missing_policy_large": "zero_pad",
-            "large_gap_seconds": 60,
+            "missing_policy": "forward_fill",
+            "max_gap_seconds": 60,
             "bucket_tolerance_seconds": 1.0,
         }
 
@@ -306,15 +420,10 @@ class TestSnapshotAlignmentBehavior(unittest.TestCase):
             representation="top_of_book",
             cadence_seconds=10,
             hybrid_levels=None,
-            fail_on_invalid=True,
+            fail_on_invalid=False,
         )
 
-        self.assertEqual(len(aligned), len(target_records))
-        for rec in aligned:
-            self.assertIn("ETHUSDT", rec.asset_snapshots)
-            eth = rec.asset_snapshots["ETHUSDT"]
-            self.assertEqual(eth.snapshot_features[:4], [0.0, 0.0, 0.0, 0.0])
-            self.assertEqual(eth.confidence, 0.0)
+        self.assertEqual(len(aligned), 0)
 
     def test_align_multi_asset_skip_missing_asset(self) -> None:
         target_records = [
@@ -329,8 +438,8 @@ class TestSnapshotAlignmentBehavior(unittest.TestCase):
 
         alignment_cfg = {
             "method": "interpolate",
-            "missing_policy_large": "skip",
-            "large_gap_seconds": 60,
+            "missing_policy": "skip",
+            "max_gap_seconds": 60,
             "bucket_tolerance_seconds": 1.0,
         }
 
@@ -420,7 +529,13 @@ class TestSnapshotAlignmentBehavior(unittest.TestCase):
                 "asset_pairs": {
                     "target_asset": "BTCUSDT",
                     "correlated_assets": [],
-                    "alignment": {"include_mask_channel": False},
+                    "alignment": {
+                        "method": "interpolate",
+                        "missing_policy": "forward_fill",
+                        "max_gap_seconds": 120,
+                        "bucket_tolerance_seconds": 0.0,
+                        "include_mask_channel": False,
+                    },
                 },
                 "temporal_features": {"local": [], "global": [], "market_session": {}},
             },
@@ -515,8 +630,8 @@ class TestInterpolationPrecisionDiagnostics(unittest.TestCase):
                 records=records,
                 target_times=target_ts,
                 representation="top_of_book",
-                missing_policy_large="error",
-                large_gap_seconds=3600,
+                missing_policy="error",
+                max_gap_seconds=3600,
                 hybrid_levels=None,
                 fail_on_invalid=True,
                 asset_name="TEST",

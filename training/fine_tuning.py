@@ -9,7 +9,7 @@ This module provides:
 TD-009: Fine-Tuning Support
 """
 
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import logging
 import os
 import re
@@ -348,18 +348,50 @@ def adjust_learning_rate(model: Any, factor: float) -> float:
     return new_lr
 
 
+def _normalize_shape(shape: Any) -> Tuple[int, ...]:
+    if isinstance(shape, tuple):
+        return shape
+    if isinstance(shape, list):
+        return tuple(shape)
+    try:
+        return tuple(shape)
+    except TypeError as exc:
+        raise FineTuningError(f"Invalid input shape type: {type(shape)!r}") from exc
+
+
+def _normalize_input_shapes(
+    input_shapes: Union[Tuple[int, ...], List[Tuple[int, ...]]],
+) -> List[Tuple[int, ...]]:
+    if isinstance(input_shapes, tuple):
+        return [_normalize_shape(input_shapes)]
+    if isinstance(input_shapes, list):
+        return [_normalize_shape(shape) for shape in input_shapes]
+    raise FineTuningError(
+        "Expected input shapes to be a tuple or list of tuples for fine-tuning validation"
+    )
+
+
+def _strip_batch_dim(shape: Tuple[int, ...]) -> Tuple[int, ...]:
+    if not shape:
+        return shape
+    if shape[0] is None:
+        return shape[1:]
+    return shape
+
+
 def validate_input_shape_compatibility(
     model: Any,
-    expected_input_shape: Tuple[int, ...],
+    expected_input_shape: Union[Tuple[int, ...], List[Tuple[int, ...]]],
 ) -> None:
-    """Validate that a model's input shape matches the expected shape.
+    """Validate that a model's input shape matches the expected shape(s).
 
     Parameters
     ----------
     model
         The Keras model to validate.
     expected_input_shape
-        Expected input shape (excluding batch dimension).
+        Expected input shape (excluding batch dimension), or list of shapes
+        for multi-input models.
 
     Raises
     ------
@@ -372,27 +404,31 @@ def validate_input_shape_compatibility(
             "Model has no input_shape attribute; cannot validate compatibility"
         )
 
-    # Model input_shape includes batch dimension as None
-    # e.g., (None, T, H, W, C) - we compare [1:] with expected_input_shape
-    if isinstance(model_input_shape, tuple):
-        model_shape_no_batch = model_input_shape[1:]
-    else:
-        # Handle multi-input models (list of shapes)
+    model_shapes = _normalize_input_shapes(model_input_shape)
+    expected_shapes = _normalize_input_shapes(expected_input_shape)
+
+    if len(model_shapes) != len(expected_shapes):
         raise FineTuningError(
-            "Multi-input models are not supported for fine-tuning shape validation"
+            "Model input count does not match expected input count: "
+            f"model_inputs={len(model_shapes)}, expected_inputs={len(expected_shapes)}"
         )
 
-    if model_shape_no_batch != expected_input_shape:
-        raise FineTuningError(
-            f"Model input shape {model_shape_no_batch} does not match "
-            f"expected shape {expected_input_shape}. "
-            "Ensure the base model was trained with compatible data configuration."
-        )
+    model_shapes_no_batch = [_strip_batch_dim(shape) for shape in model_shapes]
+    expected_shapes_no_batch = [_strip_batch_dim(shape) for shape in expected_shapes]
+
+    for idx, (model_shape, expected_shape) in enumerate(
+        zip(model_shapes_no_batch, expected_shapes_no_batch)
+    ):
+        if model_shape != expected_shape:
+            raise FineTuningError(
+                f"Model input shape {model_shape} does not match expected shape {expected_shape} "
+                f"for input index {idx}. Ensure the base model was trained with compatible data."
+            )
 
     logger.info(
-        "Input shape validation passed: model_shape=%s, expected=%s",
-        model_shape_no_batch,
-        expected_input_shape,
+        "Input shape validation passed: model_shapes=%s, expected_shapes=%s",
+        model_shapes_no_batch,
+        expected_shapes_no_batch,
     )
 
 
@@ -452,10 +488,100 @@ def validate_output_compatibility(
     )
 
 
+def _build_metrics_for_head(metric_specs: Any, keras: Any) -> List[Any]:
+    if isinstance(metric_specs, (list, tuple)):
+        metrics_list = list(metric_specs)
+    else:
+        metrics_list = [metric_specs]
+
+    metric_objects = []
+    for metric in metrics_list:
+        if isinstance(metric, str):
+            name_lower = metric.lower()
+            if name_lower in {"accuracy", "acc", "categorical_accuracy"}:
+                metric_objects.append(keras.metrics.CategoricalAccuracy(name=metric))
+            elif name_lower == "precision":
+                metric_objects.append(keras.metrics.Precision(name=metric))
+            elif name_lower == "recall":
+                metric_objects.append(keras.metrics.Recall(name=metric))
+            else:
+                metric_objects.append(keras.metrics.get(metric))
+        else:
+            metric_objects.append(keras.metrics.get(metric))
+
+    return metric_objects
+
+
+def _build_metrics_config(
+    metrics_cfg: Any,
+    keras: Any,
+    output_names: Optional[List[str]],
+) -> Optional[Dict[str, Any]]:
+    if isinstance(metrics_cfg, dict):
+        return metrics_cfg
+    if metrics_cfg is None:
+        return None
+
+    metrics_for_head = _build_metrics_for_head(metrics_cfg, keras)
+    if output_names and len(output_names) == 2:
+        return {output_names[0]: metrics_for_head, output_names[1]: metrics_for_head}
+    return {
+        "up_intensity": metrics_for_head,
+        "down_intensity": metrics_for_head,
+    }
+
+
+def _compile_model_for_fine_tuning(
+    config: Dict[str, Any],
+    model: Any,
+    lr_factor: float,
+) -> float:
+    model_cfg = config["model"]
+    compilation_cfg = model_cfg["compilation"]
+
+    optimizer_name = compilation_cfg["optimizer"]
+
+    learning_rate = compilation_cfg["learning_rate"]
+    base_lr = float(learning_rate)
+    if base_lr <= 0:
+        raise FineTuningError("model.compilation.learning_rate must be positive")
+
+    if lr_factor <= 0:
+        raise FineTuningError("training.fine_tuning.learning_rate_factor must be positive")
+    adjusted_lr = base_lr * lr_factor
+
+    loss = compilation_cfg["loss"]
+
+    metrics_cfg = compilation_cfg["metrics"]
+
+    try:
+        from tensorflow import keras  # type: ignore[import]
+    except Exception as exc:  # noqa: BLE001
+        raise FineTuningError("TensorFlow is required to compile the fine-tuned model") from exc
+
+    optimizer = keras.optimizers.get(
+        {"class_name": optimizer_name, "config": {"learning_rate": adjusted_lr}}
+    )
+
+    output_names = getattr(model, "output_names", None)
+    metrics = _build_metrics_config(metrics_cfg, keras, output_names)
+
+    model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
+
+    logger.info(
+        "Fine-tuning compilation complete: optimizer=%s, learning_rate=%s",
+        optimizer_name,
+        adjusted_lr,
+    )
+
+    return adjusted_lr
+
+
 def prepare_fine_tuning(
     config: Dict[str, Any],
     model: Any,
     input_shape: Optional[Tuple[int, ...]] = None,
+    long_term_input_dim: Optional[int] = None,
 ) -> Any:
     """Prepare a loaded model for fine-tuning by applying freezing and LR adjustment.
 
@@ -473,6 +599,8 @@ def prepare_fine_tuning(
         The pre-loaded Keras model.
     input_shape
         Optional expected input shape for validation (excluding batch dim).
+    long_term_input_dim
+        Optional long-term input dimension for dual-input validation.
 
     Returns
     -------
@@ -484,22 +612,27 @@ def prepare_fine_tuning(
     FineTuningError
         If preparation fails.
     """
-    training_cfg = config.get("training", {})
-    fine_tuning_cfg = training_cfg.get("fine_tuning", {})
-    model_cfg = config.get("model", {})
-    output_cfg = model_cfg.get("output", {})
+    training_cfg = config["training"]
+    fine_tuning_cfg = training_cfg["fine_tuning"]
+    model_cfg = config["model"]
+    output_cfg = model_cfg["output"]
 
     # Extract fine-tuning parameters
-    freeze_pattern = str(fine_tuning_cfg.get("freeze_layers", "none"))
-    lr_factor = float(fine_tuning_cfg.get("learning_rate_factor", 0.1))
+    freeze_pattern = str(fine_tuning_cfg["freeze_layers"])
+    lr_factor = float(fine_tuning_cfg["learning_rate_factor"])
+    if lr_factor <= 0:
+        raise FineTuningError("training.fine_tuning.learning_rate_factor must be positive")
 
     # Validate input shape if provided
     if input_shape is not None:
-        validate_input_shape_compatibility(model, input_shape)
+        expected_shape: Union[Tuple[int, ...], List[Tuple[int, ...]]] = input_shape
+        if long_term_input_dim is not None and long_term_input_dim > 0:
+            expected_shape = [input_shape, (int(long_term_input_dim),)]
+        validate_input_shape_compatibility(model, expected_shape)
 
     # Validate output configuration
-    num_classes = int(output_cfg.get("num_classes", 4))
-    output_type = str(output_cfg.get("type", "two_head_intensity"))
+    num_classes = int(output_cfg["num_classes"])
+    output_type = str(output_cfg["type"])
     validate_output_compatibility(model, num_classes, output_type)
 
     # Apply layer freezing
@@ -524,8 +657,11 @@ def prepare_fine_tuning(
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to compute parameter counts after freezing: %s", exc)
 
-    # Adjust learning rate
-    if lr_factor != 1.0:
+    # Compile model after freezing so trainable flags take effect
+    if callable(getattr(model, "compile", None)):
+        new_lr = _compile_model_for_fine_tuning(config, model, lr_factor)
+        logger.info("Fine-tuning learning rate set to: %s", new_lr)
+    elif lr_factor != 1.0:
         try:
             new_lr = adjust_learning_rate(model, lr_factor)
             logger.info("Fine-tuning learning rate set to: %s", new_lr)

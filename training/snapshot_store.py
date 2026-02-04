@@ -34,41 +34,41 @@ class SnapshotContext:
 
 
 def _snapshot_config_subset(config: Dict[str, Any]) -> Dict[str, Any]:
-    data_cfg = config.get("data", {})
-    model_cfg = config.get("model", {})
-    preprocessing_cfg = config.get("preprocessing", {})
-    targets_cfg = config.get("targets", {})
+    data_cfg = config["data"]
+    model_cfg = config["model"]
+    preprocessing_cfg = config["preprocessing"]
+    targets_cfg = config["targets"]
 
     subset = {
         "data": {
-            "asset_pairs": data_cfg.get("asset_pairs"),
-            "time_range": data_cfg.get("time_range"),
+            "asset_pairs": data_cfg["asset_pairs"],
+            "time_range": data_cfg["time_range"],
             "order_book": {
-                "depth_levels": data_cfg.get("order_book", {}).get("depth_levels"),
-                "representation": data_cfg.get("order_book", {}).get("representation"),
-                "hybrid": data_cfg.get("order_book", {}).get("hybrid"),
+                "depth_levels": data_cfg["order_book"]["depth_levels"],
+                "representation": data_cfg["order_book"]["representation"],
+                "hybrid": data_cfg["order_book"]["hybrid"],
             },
-            "temporal_features": data_cfg.get("temporal_features"),
-            "alignment": data_cfg.get("asset_pairs", {}).get("alignment"),
+            "temporal_features": data_cfg["temporal_features"],
+            "alignment": data_cfg["asset_pairs"]["alignment"],
         },
         "targets": {
-            "prediction_horizon_seconds": targets_cfg.get("prediction_horizon_seconds"),
-            "visible_window_seconds": targets_cfg.get("visible_window_seconds"),
-            "price_classes": targets_cfg.get("price_classes"),
-            "labeling": targets_cfg.get("labeling"),
+            "prediction_horizon_seconds": targets_cfg["prediction_horizon_seconds"],
+            "visible_window_seconds": targets_cfg["visible_window_seconds"],
+            "price_classes": targets_cfg["price_classes"],
+            "labeling": targets_cfg["labeling"],
         },
         "preprocessing": {
-            "normalization": preprocessing_cfg.get("normalization"),
-            "feature_engineering": preprocessing_cfg.get("feature_engineering"),
+            "normalization": preprocessing_cfg["normalization"],
+            "feature_engineering": preprocessing_cfg["feature_engineering"],
         },
         "model": {
-            "architecture": model_cfg.get("architecture"),
-            "input_representation": model_cfg.get("input_representation"),
+            "architecture": model_cfg["architecture"],
+            "input_representation": model_cfg["input_representation"],
             "cnn": {
-                "kernel_sizes": model_cfg.get("cnn", {}).get("kernel_sizes"),
-                "pool_sizes": model_cfg.get("cnn", {}).get("pool_sizes"),
+                "kernel_sizes": model_cfg["cnn"]["kernel_sizes"],
+                "pool_sizes": model_cfg["cnn"]["pool_sizes"],
             },
-            "output": model_cfg.get("output"),
+            "output": model_cfg["output"],
         },
     }
 
@@ -94,13 +94,13 @@ def _sanitize_component(value: str) -> str:
 
 
 def _build_auto_snapshot_name(config: Dict[str, Any], root_name: str, config_hash: str) -> str:
-    data_cfg = config.get("data", {})
-    asset_pairs_cfg = data_cfg.get("asset_pairs", {})
-    target_asset = str(asset_pairs_cfg.get("target_asset") or "asset")
+    data_cfg = config["data"]
+    asset_pairs_cfg = data_cfg["asset_pairs"]
+    target_asset = str(asset_pairs_cfg["target_asset"])
 
-    time_range_cfg = data_cfg.get("time_range", {})
-    start_date = str(time_range_cfg.get("start_date") or "start")
-    end_date = str(time_range_cfg.get("end_date") or "end")
+    time_range_cfg = data_cfg["time_range"]
+    start_date = str(time_range_cfg["start_date"])
+    end_date = str(time_range_cfg["end_date"])
 
     parts = [
         _sanitize_component(root_name),
@@ -133,11 +133,8 @@ def _write_manifest(path: str, manifest: Dict[str, Any]) -> None:
 def resolve_snapshot_context(config: Dict[str, Any]) -> SnapshotContext:
     """Resolve the snapshot directory and manifest for the current config."""
 
-    snapshot_cfg = config.get("snapshot")
-    if not isinstance(snapshot_cfg, dict):
-        raise ConfigError("snapshot section must be defined in configuration")
-
-    enabled = bool(snapshot_cfg.get("enabled"))
+    snapshot_cfg = config["snapshot"]
+    enabled = bool(snapshot_cfg["enabled"])
     if not enabled:
         raise ConfigError("snapshot.enabled must be true to resolve snapshot context")
 
@@ -197,8 +194,8 @@ def resolve_snapshot_context(config: Dict[str, Any]) -> SnapshotContext:
 def initialize_manifest(context: SnapshotContext, config: Dict[str, Any]) -> Dict[str, Any]:
     """Create a new manifest structure for a snapshot."""
 
-    data_cfg = config.get("data", {})
-    time_range_cfg = data_cfg.get("time_range", {})
+    data_cfg = config["data"]
+    time_range_cfg = data_cfg["time_range"]
 
     manifest = {
         "version": 1,
@@ -208,11 +205,12 @@ def initialize_manifest(context: SnapshotContext, config: Dict[str, Any]) -> Dic
         "config_hash": context.config_hash,
         "config_snapshot": context.config_snapshot,
         "time_range": {
-            "start_date": time_range_cfg.get("start_date"),
-            "end_date": time_range_cfg.get("end_date"),
+            "start_date": time_range_cfg["start_date"],
+            "end_date": time_range_cfg["end_date"],
         },
-        "assets": [str(data_cfg.get("asset_pairs", {}).get("target_asset") or "")],
+        "assets": [str(data_cfg["asset_pairs"]["target_asset"])],
         "chunks": [],
+        "series": {},
         "normalization_stats": {},
     }
 

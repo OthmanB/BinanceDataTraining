@@ -16,7 +16,6 @@ import os
 import numpy as np
 
 from utils.config_loader import ConfigError
-from preprocessing.train_test_split import chronological_split_indices
 from preprocessing.snapshot_sequence_builder import (
     build_top_of_book_sequence_tensor,
     build_hybrid_depth_sequence_tensor,
@@ -40,6 +39,11 @@ from .snapshot_dataset import (
 from .snapshot_store import load_or_create_manifest, resolve_snapshot_context, save_manifest
 from .callbacks import create_callbacks
 from .class_weights import compute_class_weights, compute_class_weights_from_counts
+from .long_term_context import (
+    compute_long_term_features_for_dataset,
+    is_long_term_enabled,
+    wrap_generator_with_long_term,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -64,13 +68,13 @@ def _compute_split_boundaries(
 
 
 def _enforce_production_sample_cap_snapshot(config: Dict[str, Any], n_samples: int) -> None:
-    run_mode_cfg = config.get("run_mode", {})
-    mode = str(run_mode_cfg.get("mode"))
+    run_mode_cfg = config["run_mode"]
+    mode = str(run_mode_cfg["mode"])
     if mode != "production":
         return
 
-    training_cfg = config.get("training", {})
-    debug_max_samples = int(training_cfg.get("debug_max_samples", 0))
+    training_cfg = config["training"]
+    debug_max_samples = int(training_cfg["debug_max_samples"])
     if debug_max_samples < n_samples:
         raise ConfigError(
             "training.debug_max_samples must be >= metadata.num_samples when run_mode.mode='production'. "
@@ -144,8 +148,8 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
             "Only model.output.type='two_head_intensity' is supported in snapshot training",
         )
 
-    class_weights_cfg = training_cfg.get("class_weights", {})
-    use_class_weights = isinstance(class_weights_cfg, dict) and class_weights_cfg.get("compute_from_train")
+    class_weights_cfg = training_cfg["class_weights"]
+    use_class_weights = bool(class_weights_cfg["compute_from_train"])
 
     snapshot_dataset = prepare_snapshot_dataset(config)
     n_samples = int(snapshot_dataset.total_samples)
@@ -185,6 +189,24 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
     if len(x_shape) != 5:
         raise ValueError("Snapshot input tensors must have rank 5")
     input_shape = tuple(int(d) for d in x_shape[1:])
+
+    long_term_features = None
+    long_term_input_dim: Optional[int] = None
+    if is_long_term_enabled(config):
+        cadence_seconds = int(config["data"]["time_range"]["cadence_seconds"])
+        long_term_features = compute_long_term_features_for_dataset(
+            config,
+            snapshot_dataset,
+            cadence_seconds=cadence_seconds,
+        )
+        if long_term_features is None:
+            raise ConfigError("Long-term features enabled but computation returned None")
+        if long_term_features.shape[0] != n_samples:
+            raise ConfigError(
+                "Long-term feature rows do not match snapshot dataset sample count: "
+                f"features={long_term_features.shape[0]}, samples={n_samples}"
+            )
+        long_term_input_dim = int(long_term_features.shape[1])
 
     context = resolve_snapshot_context(config)
     manifest = load_or_create_manifest(context, config)
@@ -274,8 +296,8 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
                 logger.warning("Failed to log class weights to MLFlow: %s", exc)
 
     # Build or load model based on fine-tuning configuration
-    fine_tuning_cfg = training_cfg.get("fine_tuning", {})
-    fine_tuning_enabled = isinstance(fine_tuning_cfg, dict) and fine_tuning_cfg.get("enabled", False)
+    fine_tuning_cfg = training_cfg["fine_tuning"]
+    fine_tuning_enabled = bool(fine_tuning_cfg["enabled"])
 
     if fine_tuning_enabled:
         from .fine_tuning import (
@@ -285,15 +307,15 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
             prepare_fine_tuning,
         )
 
-        use_registry = bool(fine_tuning_cfg.get("use_model_registry", False))
+        use_registry = bool(fine_tuning_cfg["use_model_registry"])
 
         if use_registry:
-            registry_name = fine_tuning_cfg.get("registry_name")
+            registry_name = fine_tuning_cfg["registry_name"]
             if not registry_name:
                 raise ConfigError(
                     "training.fine_tuning.registry_name is required when use_model_registry is true"
                 )
-            stage = str(fine_tuning_cfg.get("base_model_stage", "Production"))
+            stage = str(fine_tuning_cfg["base_model_stage"])
             logger.info(
                 "Fine-tuning enabled: loading model from registry. name=%s, stage=%s",
                 registry_name,
@@ -304,7 +326,7 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
             except FineTuningError as exc:
                 raise ConfigError(f"Failed to load base model for fine-tuning: {exc}") from exc
         else:
-            run_id = fine_tuning_cfg.get("base_model_run_id")
+            run_id = fine_tuning_cfg["base_model_run_id"]
             if not run_id:
                 raise ConfigError(
                     "training.fine_tuning.base_model_run_id is required when fine_tuning.enabled is true "
@@ -318,19 +340,49 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
 
         # Prepare the model for fine-tuning (freeze layers, adjust LR)
         try:
-            model = prepare_fine_tuning(config, model, input_shape=input_shape)
+            model = prepare_fine_tuning(
+                config,
+                model,
+                input_shape=input_shape,
+                long_term_input_dim=long_term_input_dim,
+            )
         except FineTuningError as exc:
             raise ConfigError(f"Failed to prepare model for fine-tuning: {exc}") from exc
 
         logger.info(
             "Model prepared for fine-tuning: freeze_layers=%s, lr_factor=%s",
-            fine_tuning_cfg.get("freeze_layers", "none"),
-            fine_tuning_cfg.get("learning_rate_factor", 0.1),
+            fine_tuning_cfg["freeze_layers"],
+            fine_tuning_cfg["learning_rate_factor"],
         )
     else:
         from models.cnn_lstm_multiclass import build_cnn_lstm_model
 
-        model = build_cnn_lstm_model(config, input_shape=input_shape)
+        model = build_cnn_lstm_model(
+            config,
+            input_shape=input_shape,
+            long_term_input_dim=long_term_input_dim,
+        )
+
+    if long_term_features is not None:
+        try:
+            input_count = len(getattr(model, "inputs", []))
+        except Exception as exc:  # noqa: BLE001
+            raise ConfigError(f"Failed to inspect model inputs for long-term features: {exc}") from exc
+        if input_count != 2:
+            raise ConfigError(
+                "Long-term features are enabled but model does not expose two inputs. "
+                "Disable model.long_term or rebuild the base model with dual inputs."
+            )
+    else:
+        try:
+            input_count = len(getattr(model, "inputs", []))
+        except Exception:
+            input_count = 1
+        if input_count == 2:
+            raise ConfigError(
+                "Model expects long-term inputs but model.long_term is disabled. "
+                "Enable model.long_term and rebuild the snapshot dataset."
+            )
 
     # Log model complexity metrics to MLFlow if available.
     try:
@@ -377,12 +429,20 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
         batch_size=batch_size,
         num_classes=int(output_cfg["num_classes"]),
         normalization=train_stats,
-        sample_weight_cfg=training_cfg.get("sample_weighting"),
+        sample_weight_cfg=training_cfg["sample_weighting"],
         mask_start=mask_start,
         mask_count=mask_count,
         class_weights_up=class_weights_up,
         class_weights_down=class_weights_down,
     )
+
+    if long_term_features is not None:
+        train_gen = wrap_generator_with_long_term(
+            train_gen,
+            long_term_features,
+            start_index=0,
+            batch_size=batch_size,
+        )
 
     fit_kwargs: Dict[str, Any] = {
         "x": train_gen,
@@ -406,6 +466,13 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
             class_weights_up=None,  # No class weights for validation
             class_weights_down=None,
         )
+        if long_term_features is not None:
+            val_gen = wrap_generator_with_long_term(
+                val_gen,
+                long_term_features,
+                start_index=val_start,
+                batch_size=batch_size,
+            )
         fit_kwargs["validation_data"] = val_gen
         fit_kwargs["validation_steps"] = val_steps
 
@@ -452,12 +519,9 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
             logger.warning("Failed to log snapshot metadata to MLFlow: %s", exc)
 
     # Conditionally log the trained model to MLFlow using the modern Keras format.
-    try:
-        mlflow_cfg = config.get("mlflow", {})
-        artifact_logging_cfg = mlflow_cfg.get("artifact_logging", {})
-        log_trained_model = bool(artifact_logging_cfg.get("trained_model"))
-    except Exception:  # noqa: BLE001
-        log_trained_model = False
+    mlflow_cfg = config["mlflow"]
+    artifact_logging_cfg = mlflow_cfg["artifact_logging"]
+    log_trained_model = bool(artifact_logging_cfg["trained_model"])
 
     if log_trained_model:
         try:
@@ -493,6 +557,13 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
                         mask_start=mask_start,
                         mask_count=mask_count,
                     )
+                    if long_term_features is not None:
+                        sample_gen = wrap_generator_with_long_term(
+                            sample_gen,
+                            long_term_features,
+                            start_index=0,
+                            batch_size=sample_n,
+                        )
                     batch = next(iter(sample_gen))
                     x_sample = batch[0]
                     y_sample = batch[1]
@@ -512,11 +583,8 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to log trained model to MLFlow: %s", exc)
 
-            try:
-                model_registry_cfg = mlflow_cfg.get("model_registry", {})
-                register_enabled = bool(model_registry_cfg.get("register_model"))
-            except Exception:  # noqa: BLE001
-                register_enabled = False
+            model_registry_cfg = mlflow_cfg["model_registry"]
+            register_enabled = bool(model_registry_cfg["register_model"])
 
             if register_enabled:
                 try:
@@ -561,94 +629,13 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Optional[Dict[str
     No actual model training is performed yet.
     """
 
-    snapshot_cfg = config.get("snapshot", {})
-    if isinstance(snapshot_cfg, dict) and snapshot_cfg.get("enabled"):
+    snapshot_cfg = config["snapshot"]
+    if bool(snapshot_cfg["enabled"]):
         return _run_snapshot_training_pipeline(config)
 
     raise ConfigError(
         "Legacy in-memory training pipeline is disabled. Set snapshot.enabled=true to use the snapshot pipeline."
     )
-
-    metadata = data_object["metadata"]
-    n_samples = int(metadata["num_samples"])
-
-    training_cfg = config["training"]
-    debug_max_samples = int(training_cfg["debug_max_samples"])
-    epochs = int(training_cfg["epochs"])
-    batch_size = int(training_cfg["batch_size"])
-    missing_snapshot_strategy = str(training_cfg["missing_snapshot_strategy"])
-
-    if missing_snapshot_strategy not in ("fail", "skip", "synthetic"):
-        raise ValueError(
-            "training.missing_snapshot_strategy must be one of 'fail', 'skip', or 'synthetic'",
-        )
-
-    if n_samples <= 0:
-        logger.info(
-            "Training pipeline invoked (Phase 3 minimal). num_samples=0, skipping training.",
-        )
-        return None
-
-    split_cfg = config["preprocessing"]["train_test_split"]
-    train_ratio = float(split_cfg["train_ratio"])
-    validation_ratio = float(split_cfg["validation_ratio"])
-    test_ratio = float(split_cfg["test_ratio"])
-
-    configured_val_split = float(training_cfg["validation_split"])
-    if abs(configured_val_split - validation_ratio) > 1e-6:
-        raise ValueError(
-            "training.validation_split must match preprocessing.train_test_split.validation_ratio in this phase",
-        )
-
-    train_idx, val_idx, _ = chronological_split_indices(
-        n_samples,
-        train_ratio,
-        validation_ratio,
-        test_ratio,
-    )
-
-    if not train_idx:
-        logger.info(
-            "Training pipeline invoked (Phase 3 minimal). no training samples available after chronological split.",
-        )
-        return None
-
-    effective_train_n = min(len(train_idx), debug_max_samples)
-    if effective_train_n <= 0:
-        logger.info(
-            "Training pipeline invoked (Phase 3 minimal). debug_max_samples=%s resulted in no training samples.",
-            debug_max_samples,
-        )
-        return None
-
-    train_indices = train_idx[:effective_train_n]
-    val_indices = val_idx
-
-    logger.info(
-        "Training pipeline invoked (Phase 3 minimal). num_samples=%s, train=%s, val=%s, debug_max_samples=%s, effective_train_n=%s",
-        n_samples,
-        len(train_idx),
-        len(val_idx),
-        debug_max_samples,
-        effective_train_n,
-    )
-
-    model_cfg = config["model"]
-    output_cfg = model_cfg["output"]
-    output_type = str(output_cfg["type"])
-    if output_type != "two_head_intensity":
-        raise ValueError(
-            "Only model.output.type='two_head_intensity' is supported in this phase of the training pipeline",
-        )
-
-    class_weights_cfg = training_cfg.get("class_weights", {})
-    if isinstance(class_weights_cfg, dict) and class_weights_cfg.get("compute_from_train"):
-        raise ConfigError(
-            "training.class_weights.compute_from_train is not supported for multi-output models in this phase. "
-            "Disable it or implement per-output sample weighting before enabling.",
-        )
-
-    cnn_cfg = model_cfg["cnn"]
     kernel_sizes = cnn_cfg["kernel_sizes"]
     pool_sizes = cnn_cfg["pool_sizes"]
 
@@ -710,8 +697,8 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Optional[Dict[str
             )
 
         # Check representation type to decide which tensor builder to use
-        order_book_cfg = data_cfg.get("order_book", {})
-        representation = str(order_book_cfg.get("representation", "top_of_book"))
+        order_book_cfg = data_cfg["order_book"]
+        representation = str(order_book_cfg["representation"])
 
         if representation == "hybrid":
             # Use hybrid depth tensor builder
@@ -814,8 +801,8 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Optional[Dict[str
     # Optionally integrate feature engineering derived features into the input.
     # This computes momentum features using anchor indices and mid_prices/volumes,
     # then broadcasts and concatenates along the channel dimension.
-    fe_cfg = config["preprocessing"].get("feature_engineering", {})
-    if isinstance(fe_cfg, dict) and fe_cfg.get("enabled"):
+    fe_cfg = config["preprocessing"]["feature_engineering"]
+    if bool(fe_cfg["enabled"]):
         try:
             feature_engineer = FeatureEngineer(config)
 
@@ -888,12 +875,8 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Optional[Dict[str
 
     # Optionally integrate temporal features into the input channels according
     # to the model.input_representation.temporal_features configuration.
-    ir_cfg = model_cfg.get("input_representation")
-    if ir_cfg is None:
-        raise ValueError("model.input_representation must be defined in configuration")
-    tf_cfg = ir_cfg.get("temporal_features")
-    if tf_cfg is None:
-        raise ValueError("model.input_representation.temporal_features must be defined in configuration")
+    ir_cfg = model_cfg["input_representation"]
+    tf_cfg = ir_cfg["temporal_features"]
     integration_mode = str(tf_cfg["integration_mode"])
     use_local = bool(tf_cfg["use_local_features"])
     use_global = bool(tf_cfg["use_global_features"])
@@ -1067,8 +1050,8 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Optional[Dict[str
     # Compute class weights for handling imbalanced labels.
     # Weights are computed on training indices only to avoid data leakage.
     class_weight_dict = None
-    class_weights_cfg = training_cfg.get("class_weights", {})
-    if isinstance(class_weights_cfg, dict) and class_weights_cfg.get("compute_from_train"):
+    class_weights_cfg = training_cfg["class_weights"]
+    if bool(class_weights_cfg["compute_from_train"]):
         train_labels_up = labels_up_arr[train_indices]
         train_labels_down = labels_down_arr[train_indices]
 
@@ -1228,7 +1211,11 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Optional[Dict[str
 
     from models.cnn_lstm_multiclass import build_cnn_lstm_model
 
-    model = build_cnn_lstm_model(config, input_shape=input_shape)
+    model = build_cnn_lstm_model(
+        config,
+        input_shape=input_shape,
+        long_term_input_dim=None,
+    )
 
     # Log model complexity metrics (parameter counts and an approximate FLOPs
     # estimate) to MLFlow if it is available.
@@ -1299,8 +1286,8 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Optional[Dict[str
 
     hpo_metric_value = None
     try:
-        hpo_cfg = config.get("hyperparameter_optimization", {})
-        if isinstance(hpo_cfg, dict) and hpo_cfg.get("enabled"):
+        hpo_cfg = config["hyperparameter_optimization"]
+        if bool(hpo_cfg["enabled"]):
             metric_name = str(hpo_cfg["metric"])
             if hasattr(history, "history") and isinstance(history.history, dict):
                 series = history.history.get(metric_name)
@@ -1349,9 +1336,9 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Optional[Dict[str
 
     # Conditionally log the trained model to MLFlow using the modern Keras format.
     try:
-        mlflow_cfg = config.get("mlflow", {})
-        artifact_logging_cfg = mlflow_cfg.get("artifact_logging", {})
-        log_trained_model = bool(artifact_logging_cfg.get("trained_model"))
+        mlflow_cfg = config["mlflow"]
+        artifact_logging_cfg = mlflow_cfg["artifact_logging"]
+        log_trained_model = bool(artifact_logging_cfg["trained_model"])
     except Exception:  # noqa: BLE001
         log_trained_model = False
 
@@ -1399,8 +1386,8 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Optional[Dict[str
             # Optionally register the model in the MLFlow model registry using
             # the configuration-driven model name pattern.
             try:
-                model_registry_cfg = mlflow_cfg.get("model_registry", {})
-                register_enabled = bool(model_registry_cfg.get("register_model"))
+                model_registry_cfg = mlflow_cfg["model_registry"]
+                register_enabled = bool(model_registry_cfg["register_model"])
             except Exception:  # noqa: BLE001
                 register_enabled = False
 

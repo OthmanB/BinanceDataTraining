@@ -92,8 +92,8 @@ class MockModel:
     def __init__(
         self,
         layers: Optional[List[MockLayer]] = None,
-        input_shape: Tuple = (None, 10, 20, 20, 4),
-        output_shape: Optional[List[Tuple]] = None,
+        input_shape: Any = (None, 10, 20, 20, 4),
+        output_shape: Any = None,
         optimizer: Optional[MockOptimizer] = None,
     ):
         self.layers = layers or []
@@ -358,6 +358,27 @@ class TestValidateInputShapeCompatibility:
             validate_input_shape_compatibility(model, (10, 20, 20, 8))
 
         assert "does not match" in str(exc_info.value)
+
+    def test_multi_input_shapes_match(self) -> None:
+        model = MockModel(input_shape=[(None, 10, 20, 20, 4), (None, 6)])
+
+        validate_input_shape_compatibility(model, [(10, 20, 20, 4), (6,)])
+
+    def test_multi_input_mismatch_raises(self) -> None:
+        model = MockModel(input_shape=[(None, 10, 20, 20, 4), (None, 6)])
+
+        with pytest.raises(FineTuningError) as exc_info:
+            validate_input_shape_compatibility(model, [(10, 20, 20, 4), (7,)])
+
+        assert "does not match" in str(exc_info.value)
+
+    def test_input_count_mismatch_raises(self) -> None:
+        model = MockModel(input_shape=[(None, 10, 20, 20, 4), (None, 6)])
+
+        with pytest.raises(FineTuningError) as exc_info:
+            validate_input_shape_compatibility(model, (10, 20, 20, 4))
+
+        assert "input count" in str(exc_info.value)
 
 
 # =============================================================================
@@ -664,6 +685,47 @@ class TestPrepareFinetuning:
             prep_ft(config, model)
 
         assert "3" in str(exc_info.value) or "classes" in str(exc_info.value)
+
+    def test_prepare_validates_dual_input_shapes(self) -> None:
+        config = self._create_config()
+        model = self._create_model_with_layers()
+        model.input_shape = [(None, 10, 20, 20, 4), (None, 6)]
+
+        prepare_fine_tuning(
+            config,
+            model,
+            input_shape=(10, 20, 20, 4),
+            long_term_input_dim=6,
+        )
+
+    def test_prepare_invokes_compile_helper_when_available(self) -> None:
+        config = self._create_config(freeze_layers="cnn", lr_factor=0.2)
+        config["model"]["compilation"] = {
+            "optimizer": "adam",
+            "learning_rate": 0.001,
+            "loss": "categorical_crossentropy",
+            "metrics": ["accuracy"],
+        }
+
+        class _CompileModel(MockModel):
+            def compile(self, *args: Any, **kwargs: Any) -> None:  # noqa: ANN401
+                return None
+
+        model = _CompileModel(
+            layers=self._create_model_with_layers().layers,
+            input_shape=(None, 10, 20, 20, 4),
+            output_shape=[(None, 4), (None, 4)],
+            optimizer=MockOptimizer(learning_rate=0.001),
+        )
+
+        with patch("training.fine_tuning._compile_model_for_fine_tuning", return_value=0.0002) as mock_compile:
+            prepare_fine_tuning(config, model)
+
+            mock_compile.assert_called_once()
+            args, _ = mock_compile.call_args
+            assert args[0] is config
+            assert args[1] is model
+            assert args[2] == pytest.approx(0.2)
 
 
 # =============================================================================

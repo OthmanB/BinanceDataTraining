@@ -147,8 +147,8 @@ def check_greptime_connectivity(config: Dict[str, Any]) -> None:
         logger.warning("Greptime connectivity check skipped: no asset pairs configured.")
         return
 
-    multi_db_cfg = data_cfg.get("multi_database")
-    if isinstance(multi_db_cfg, dict) and multi_db_cfg.get("enabled"):
+    multi_db_cfg = data_cfg["multi_database"]
+    if bool(multi_db_cfg["enabled"]):
         connections = multi_db_cfg["connections"]
         if not isinstance(connections, list) or not connections:
             raise ValueError(
@@ -281,8 +281,8 @@ def fetch_order_book_rows(config: Dict[str, Any]) -> Dict[str, List[List[Any]]]:
 
     rows_by_asset: Dict[str, List[List[Any]]] = {asset: [] for asset in assets}
 
-    multi_db_cfg = data_cfg.get("multi_database")
-    if isinstance(multi_db_cfg, dict) and multi_db_cfg.get("enabled"):
+    multi_db_cfg = data_cfg["multi_database"]
+    if bool(multi_db_cfg["enabled"]):
         connections = multi_db_cfg["connections"]
         if not isinstance(connections, list) or not connections:
             raise ValueError(
@@ -405,8 +405,8 @@ def stream_order_book_chunks(
     global_start_date = str(time_range_cfg["start_date"])
     global_end_date = str(time_range_cfg["end_date"])
 
-    multi_db_cfg = data_cfg.get("multi_database")
-    if isinstance(multi_db_cfg, dict) and multi_db_cfg.get("enabled"):
+    multi_db_cfg = data_cfg["multi_database"]
+    if bool(multi_db_cfg["enabled"]):
         connections = multi_db_cfg["connections"]
         if not isinstance(connections, list) or not connections:
             raise ValueError(
@@ -528,8 +528,8 @@ def stream_order_book_chunks_by_time(
     global_start_date = str(time_range_cfg["start_date"])
     global_end_date = str(time_range_cfg["end_date"])
 
-    multi_db_cfg = data_cfg.get("multi_database")
-    if isinstance(multi_db_cfg, dict) and multi_db_cfg.get("enabled"):
+    multi_db_cfg = data_cfg["multi_database"]
+    if bool(multi_db_cfg["enabled"]):
         connections = multi_db_cfg["connections"]
         if not isinstance(connections, list) or not connections:
             raise ValueError(

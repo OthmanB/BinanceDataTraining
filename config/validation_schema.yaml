@@ -45,11 +45,9 @@ sections:
         type: list
       asset_pairs.alignment.method:
         type: string
-      asset_pairs.alignment.missing_policy_small:
+      asset_pairs.alignment.missing_policy:
         type: string
-      asset_pairs.alignment.missing_policy_large:
-        type: string
-      asset_pairs.alignment.large_gap_seconds:
+      asset_pairs.alignment.max_gap_seconds:
         type: integer
       asset_pairs.alignment.bucket_tolerance_seconds:
         type: number
@@ -180,8 +178,26 @@ sections:
         type: boolean
       cnn.num_layers:
         type: integer
+      cnn.filters:
+        type: list
+      cnn.kernel_sizes:
+        type: list
+      cnn.pool_sizes:
+        type: list
+      cnn.activation:
+        type: string
+      cnn.dropout_rates:
+        type: list
       lstm.units:
         type: integer
+      lstm.dropout:
+        type: number
+      lstm.recurrent_dropout:
+        type: number
+      dense.layers:
+        type: list
+      dense.dropout_rates:
+        type: list
       output.type:
         type: string
       output.num_classes:
@@ -194,12 +210,8 @@ sections:
         type: number
       compilation.loss:
         type: string
-
-  # Optional keys for model.long_term (TD-019 dual-channel support)
-  # These are not required since long_term.enabled defaults to false
-  model_long_term:
-    type: dict
-    optional_keys:
+      compilation.metrics:
+        type: any
       long_term.enabled:
         type: boolean
       long_term.windows_days:
@@ -328,6 +340,20 @@ sections:
         type: string
       artifact_logging.trained_model:
         type: boolean
+      artifact_logging.model_architecture_plot:
+        type: boolean
+      artifact_logging.training_plots:
+        type: boolean
+      artifact_logging.confusion_matrix:
+        type: boolean
+      artifact_logging.class_distribution:
+        type: boolean
+      artifact_logging.feature_importance:
+        type: boolean
+      model_registry.register_model:
+        type: boolean
+      model_registry.model_name_pattern:
+        type: string
 
   evaluation:
     type: dict
@@ -356,10 +382,14 @@ sections:
         type: integer
       temporal_degradation.overlap_fraction:
         type: number
+      temporal_degradation.log_per_window_metrics:
+        type: boolean
       missing_snapshot_strategy:
         type: string
       backtesting.enabled:
         type: boolean
+      backtesting.horizon_steps:
+        type: integer
       backtesting.initial_capital:
         type: number
       backtesting.transaction_cost:

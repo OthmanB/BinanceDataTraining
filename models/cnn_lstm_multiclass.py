@@ -57,7 +57,7 @@ def build_cnn_lstm_model(
       during training and inference.
     """
 
-    model_cfg = config.get("model", {})
+    model_cfg = config["model"]
 
     try:
         import tensorflow as tf  # type: ignore[import]
@@ -74,24 +74,25 @@ def build_cnn_lstm_model(
             f"got input_shape={input_shape!r}",
         )
 
-    cnn_cfg = model_cfg.get("cnn", {})
-    lstm_cfg = model_cfg.get("lstm", {})
-    dense_cfg = model_cfg.get("dense", {})
-    output_cfg = model_cfg.get("output", {})
-    long_term_cfg = model_cfg.get("long_term", {})
+    cnn_cfg = model_cfg["cnn"]
+    lstm_cfg = model_cfg["lstm"]
+    dense_cfg = model_cfg["dense"]
+    output_cfg = model_cfg["output"]
+    long_term_cfg = model_cfg["long_term"]
 
     # Determine if long-term branch is enabled
-    long_term_enabled = bool(long_term_cfg.get("enabled", False))
+    long_term_enabled = bool(long_term_cfg["enabled"])
     if long_term_input_dim == 0:
         # Explicit override to disable long-term
         long_term_enabled = False
     elif long_term_input_dim is None and long_term_enabled:
         # Read from config
-        long_term_input_dim = int(long_term_cfg.get("input_dim", 0))
+        input_dim_cfg = long_term_cfg["input_dim"]
+        long_term_input_dim = int(input_dim_cfg) if input_dim_cfg is not None else 0
         if long_term_input_dim <= 0:
             # Auto-compute from windows and features
-            windows = long_term_cfg.get("windows_days", [7, 30, 90])
-            features = long_term_cfg.get("features", ["mean_return", "volatility", "volume_proxy", "skewness"])
+            windows = long_term_cfg["windows_days"]
+            features = long_term_cfg["features"]
             long_term_input_dim = len(windows) * len(features)
     
     if long_term_enabled and (long_term_input_dim is None or long_term_input_dim <= 0):
@@ -100,12 +101,12 @@ def build_cnn_lstm_model(
             "Set model.long_term.input_dim or ensure windows_days and features are configured."
         )
 
-    num_layers = int(cnn_cfg.get("num_layers"))
-    filters = cnn_cfg.get("filters")
-    kernel_sizes = cnn_cfg.get("kernel_sizes")
-    pool_sizes = cnn_cfg.get("pool_sizes")
-    activation = cnn_cfg.get("activation")
-    dropout_rates = cnn_cfg.get("dropout_rates")
+    num_layers = int(cnn_cfg["num_layers"])
+    filters = cnn_cfg["filters"]
+    kernel_sizes = cnn_cfg["kernel_sizes"]
+    pool_sizes = cnn_cfg["pool_sizes"]
+    activation = cnn_cfg["activation"]
+    dropout_rates = cnn_cfg["dropout_rates"]
 
     if not (isinstance(filters, list) and isinstance(kernel_sizes, list) and isinstance(pool_sizes, list)):
         raise ValueError("cnn.filters, cnn.kernel_sizes, and cnn.pool_sizes must be lists in config.model.cnn")
@@ -133,9 +134,9 @@ def build_cnn_lstm_model(
     # sequence of frame-level embeddings of shape (T, D).
     x = layers.TimeDistributed(layers.Flatten())(x)
 
-    lstm_units = int(lstm_cfg.get("units"))
-    lstm_dropout = float(lstm_cfg.get("dropout", 0.0))
-    lstm_recurrent_dropout = float(lstm_cfg.get("recurrent_dropout", 0.0))
+    lstm_units = int(lstm_cfg["units"])
+    lstm_dropout = float(lstm_cfg["dropout"])
+    lstm_recurrent_dropout = float(lstm_cfg["recurrent_dropout"])
 
     x = layers.LSTM(
         lstm_units,
@@ -153,29 +154,30 @@ def build_cnn_lstm_model(
         long_term_input = keras.Input(
             shape=(long_term_input_dim,), name="long_term_input"
         )
-        
+
         # Long-term dense layers (configurable, default to single 32-unit layer)
-        lt_dense_cfg = long_term_cfg.get("dense", {})
-        lt_dense_layers = lt_dense_cfg.get("layers", [32]) or [32]
-        lt_dropout_rates = lt_dense_cfg.get("dropout_rates", [0.2]) or [0.2]
-        
+        lt_dense_cfg = long_term_cfg["dense"]
+        lt_dense_layers = lt_dense_cfg["layers"]
+        lt_dropout_rates = lt_dense_cfg["dropout_rates"]
+
         y = long_term_input
         for i, units in enumerate(lt_dense_layers):
             y = layers.Dense(int(units), activation="relu", name=f"lt_dense_{i}")(y)
             dr = float(lt_dropout_rates[i]) if i < len(lt_dropout_rates) else 0.0
             if dr > 0:
                 y = layers.Dropout(dr, name=f"lt_dropout_{i}")(y)
-        
+
         # Merge short-term and long-term branches
         x = layers.Concatenate(name="merge_branches")([short_term_output, y])
-        
+
         logger.info(
             "Long-term branch added: input_dim=%d, dense_layers=%s",
-            long_term_input_dim, lt_dense_layers
+            long_term_input_dim,
+            lt_dense_layers,
         )
 
-    dense_layers = dense_cfg.get("layers", []) or []
-    dense_dropout_rates = dense_cfg.get("dropout_rates", []) or []
+    dense_layers = dense_cfg["layers"]
+    dense_dropout_rates = dense_cfg["dropout_rates"]
 
     for i, units in enumerate(dense_layers):
         x = layers.Dense(int(units), activation="relu")(x)
@@ -183,11 +185,11 @@ def build_cnn_lstm_model(
         if dr > 0:
             x = layers.Dropout(dr)(x)
 
-    output_type = str(output_cfg.get("type"))
+    output_type = str(output_cfg["type"])
     if output_type != "two_head_intensity":
         raise ValueError("Only model.output.type='two_head_intensity' is supported in this model builder")
 
-    num_classes = int(output_cfg.get("num_classes"))
+    num_classes = int(output_cfg["num_classes"])
     output_activation = output_cfg["activation"]
 
     up_head = layers.Dense(num_classes, activation=output_activation, name="up_intensity")(x)
@@ -203,11 +205,11 @@ def build_cnn_lstm_model(
 
     model = keras.Model(inputs=all_inputs, outputs=[up_head, down_head], name=model_name)
 
-    compilation_cfg = model_cfg.get("compilation", {})
-    optimizer_name = compilation_cfg.get("optimizer")
-    learning_rate = float(compilation_cfg.get("learning_rate"))
-    loss = compilation_cfg.get("loss")
-    metrics_cfg = compilation_cfg.get("metrics")
+    compilation_cfg = model_cfg["compilation"]
+    optimizer_name = compilation_cfg["optimizer"]
+    learning_rate = float(compilation_cfg["learning_rate"])
+    loss = compilation_cfg["loss"]
+    metrics_cfg = compilation_cfg["metrics"]
 
     optimizer = keras.optimizers.get({"class_name": optimizer_name, "config": {"learning_rate": learning_rate}})
 

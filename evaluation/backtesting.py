@@ -32,131 +32,135 @@ SIGNAL_STRATEGIES = frozenset({"net_intensity", "threshold"})
 POSITION_SIZING_METHODS = frozenset({"equal", "confidence"})
 
 
-class BacktestError(Exception):
-    """Exception raised for backtesting-related errors."""
+if "BacktestError" not in globals():
+    class BacktestError(Exception):
+        """Exception raised for backtesting-related errors."""
 
-    pass
-
-
-@dataclass
-class BacktestConfig:
-    """Configuration for backtesting simulation.
-
-    Attributes:
-        initial_capital: Starting capital for the backtest
-        transaction_cost_pct: Per-trade transaction cost as a fraction (e.g., 0.001 = 0.1%)
-        signal_strategy: Strategy for generating signals ("net_intensity" or "threshold")
-        signal_threshold: Probability threshold for threshold strategy
-        intensity_threshold: Minimum intensity class for action (0=any, 1=1%+, 2=2%+, 3=5%+)
-        position_sizing: How to size positions ("equal" or "confidence")
-        max_position_pct: Maximum capital per position as a fraction (1.0 = all-in)
-    """
-
-    initial_capital: float = 10000.0
-    transaction_cost_pct: float = 0.001
-    signal_strategy: str = "net_intensity"
-    signal_threshold: float = 0.6
-    intensity_threshold: int = 1
-    position_sizing: str = "equal"
-    max_position_pct: float = 1.0
-
-    def __post_init__(self) -> None:
-        """Validate configuration values."""
-        if self.initial_capital <= 0:
-            raise BacktestError("initial_capital must be positive")
-        if self.transaction_cost_pct < 0:
-            raise BacktestError("transaction_cost_pct cannot be negative")
-        if self.signal_strategy not in SIGNAL_STRATEGIES:
-            raise BacktestError(
-                f"signal_strategy must be one of {SIGNAL_STRATEGIES}, got {self.signal_strategy!r}"
-            )
-        if not 0 < self.signal_threshold <= 1.0:
-            raise BacktestError("signal_threshold must be in (0, 1]")
-        if not 0 <= self.intensity_threshold <= 3:
-            raise BacktestError("intensity_threshold must be in [0, 3]")
-        if self.position_sizing not in POSITION_SIZING_METHODS:
-            raise BacktestError(
-                f"position_sizing must be one of {POSITION_SIZING_METHODS}, got {self.position_sizing!r}"
-            )
-        if not 0 < self.max_position_pct <= 1.0:
-            raise BacktestError("max_position_pct must be in (0, 1]")
+        pass
 
 
-@dataclass
-class Trade:
-    """Represents a single trade in the backtest.
+if "BacktestConfig" not in globals():
+    @dataclass
+    class BacktestConfig:
+        """Configuration for backtesting simulation.
 
-    Attributes:
-        entry_idx: Sample index at trade entry
-        exit_idx: Sample index at trade exit
-        entry_time: Timestamp at trade entry (if available)
-        exit_time: Timestamp at trade exit (if available)
-        direction: Trade direction ("long" or "short")
-        entry_price: Price at entry
-        exit_price: Price at exit
-        pnl_pct: Profit/loss as a percentage
-        signal_confidence: Confidence level of the signal that triggered the trade
-    """
+        Attributes:
+            initial_capital: Starting capital for the backtest
+            transaction_cost_pct: Per-trade transaction cost as a fraction (e.g., 0.001 = 0.1%)
+            signal_strategy: Strategy for generating signals ("net_intensity" or "threshold")
+            signal_threshold: Probability threshold for threshold strategy
+            intensity_threshold: Minimum intensity class for action (0=any, 1=1%+, 2=2%+, 3=5%+)
+            position_sizing: How to size positions ("equal" or "confidence")
+            max_position_pct: Maximum capital per position as a fraction (1.0 = all-in)
+        """
 
-    entry_idx: int
-    exit_idx: int
-    entry_time: Optional[datetime] = None
-    exit_time: Optional[datetime] = None
-    direction: str = "long"
-    entry_price: float = 0.0
-    exit_price: float = 0.0
-    pnl_pct: float = 0.0
-    signal_confidence: float = 0.0
+        initial_capital: float = 10000.0
+        transaction_cost_pct: float = 0.001
+        signal_strategy: str = "net_intensity"
+        signal_threshold: float = 0.6
+        intensity_threshold: int = 1
+        position_sizing: str = "equal"
+        max_position_pct: float = 1.0
 
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert trade to dictionary for serialization."""
-        return {
-            "entry_idx": self.entry_idx,
-            "exit_idx": self.exit_idx,
-            "entry_time": self.entry_time.isoformat() if self.entry_time else None,
-            "exit_time": self.exit_time.isoformat() if self.exit_time else None,
-            "direction": self.direction,
-            "entry_price": self.entry_price,
-            "exit_price": self.exit_price,
-            "pnl_pct": self.pnl_pct,
-            "signal_confidence": self.signal_confidence,
-        }
+        def __post_init__(self) -> None:
+            """Validate configuration values."""
+            if self.initial_capital <= 0:
+                raise BacktestError("initial_capital must be positive")
+            if self.transaction_cost_pct < 0:
+                raise BacktestError("transaction_cost_pct cannot be negative")
+            if self.signal_strategy not in SIGNAL_STRATEGIES:
+                raise BacktestError(
+                    f"signal_strategy must be one of {SIGNAL_STRATEGIES}, got {self.signal_strategy!r}"
+                )
+            if not 0 < self.signal_threshold <= 1.0:
+                raise BacktestError("signal_threshold must be in (0, 1]")
+            if not 0 <= self.intensity_threshold <= 3:
+                raise BacktestError("intensity_threshold must be in [0, 3]")
+            if self.position_sizing not in POSITION_SIZING_METHODS:
+                raise BacktestError(
+                    f"position_sizing must be one of {POSITION_SIZING_METHODS}, got {self.position_sizing!r}"
+                )
+            if not 0 < self.max_position_pct <= 1.0:
+                raise BacktestError("max_position_pct must be in (0, 1]")
 
 
-@dataclass
-class BacktestResult:
-    """Results from a backtesting simulation.
+if "Trade" not in globals():
+    @dataclass
+    class Trade:
+        """Represents a single trade in the backtest.
 
-    Attributes:
-        trades: List of executed trades
-        equity_curve: Array of equity values over time
-        timestamps: Array of timestamps for equity curve (if available)
-        metrics: Dictionary of computed risk/return metrics
-        config: Configuration used for the backtest
-    """
+        Attributes:
+            entry_idx: Sample index at trade entry
+            exit_idx: Sample index at trade exit
+            entry_time: Timestamp at trade entry (if available)
+            exit_time: Timestamp at trade exit (if available)
+            direction: Trade direction ("long" or "short")
+            entry_price: Price at entry
+            exit_price: Price at exit
+            pnl_pct: Profit/loss as a percentage
+            signal_confidence: Confidence level of the signal that triggered the trade
+        """
 
-    trades: List[Trade] = field(default_factory=list)
-    equity_curve: np.ndarray = field(default_factory=lambda: np.array([]))
-    timestamps: Optional[np.ndarray] = None
-    metrics: Dict[str, float] = field(default_factory=dict)
-    config: Optional[BacktestConfig] = None
+        entry_idx: int
+        exit_idx: int
+        entry_time: Optional[datetime] = None
+        exit_time: Optional[datetime] = None
+        direction: str = "long"
+        entry_price: float = 0.0
+        exit_price: float = 0.0
+        pnl_pct: float = 0.0
+        signal_confidence: float = 0.0
 
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert result to dictionary for serialization."""
-        return {
-            "num_trades": len(self.trades),
-            "trades": [t.to_dict() for t in self.trades],
-            "metrics": self.metrics,
-            "config": {
-                "initial_capital": self.config.initial_capital if self.config else None,
-                "transaction_cost_pct": self.config.transaction_cost_pct if self.config else None,
-                "signal_strategy": self.config.signal_strategy if self.config else None,
-                "signal_threshold": self.config.signal_threshold if self.config else None,
-                "intensity_threshold": self.config.intensity_threshold if self.config else None,
-                "position_sizing": self.config.position_sizing if self.config else None,
-                "max_position_pct": self.config.max_position_pct if self.config else None,
-            },
-        }
+        def to_dict(self) -> Dict[str, Any]:
+            """Convert trade to dictionary for serialization."""
+            return {
+                "entry_idx": self.entry_idx,
+                "exit_idx": self.exit_idx,
+                "entry_time": self.entry_time.isoformat() if self.entry_time else None,
+                "exit_time": self.exit_time.isoformat() if self.exit_time else None,
+                "direction": self.direction,
+                "entry_price": self.entry_price,
+                "exit_price": self.exit_price,
+                "pnl_pct": self.pnl_pct,
+                "signal_confidence": self.signal_confidence,
+            }
+
+
+if "BacktestResult" not in globals():
+    @dataclass
+    class BacktestResult:
+        """Results from a backtesting simulation.
+
+        Attributes:
+            trades: List of executed trades
+            equity_curve: Array of equity values over time
+            timestamps: Array of timestamps for equity curve (if available)
+            metrics: Dictionary of computed risk/return metrics
+            config: Configuration used for the backtest
+        """
+
+        trades: List[Trade] = field(default_factory=list)
+        equity_curve: np.ndarray = field(default_factory=lambda: np.array([]))
+        timestamps: Optional[np.ndarray] = None
+        metrics: Dict[str, float] = field(default_factory=dict)
+        config: Optional[BacktestConfig] = None
+
+        def to_dict(self) -> Dict[str, Any]:
+            """Convert result to dictionary for serialization."""
+            return {
+                "num_trades": len(self.trades),
+                "trades": [t.to_dict() for t in self.trades],
+                "metrics": self.metrics,
+                "config": {
+                    "initial_capital": self.config.initial_capital if self.config else None,
+                    "transaction_cost_pct": self.config.transaction_cost_pct if self.config else None,
+                    "signal_strategy": self.config.signal_strategy if self.config else None,
+                    "signal_threshold": self.config.signal_threshold if self.config else None,
+                    "intensity_threshold": self.config.intensity_threshold if self.config else None,
+                    "position_sizing": self.config.position_sizing if self.config else None,
+                    "max_position_pct": self.config.max_position_pct if self.config else None,
+                },
+            }
 
 
 def generate_signals_net_intensity(
@@ -550,17 +554,17 @@ def run_backtest(
         BacktestResult with trades, equity curve, and metrics
     """
     # Extract backtest configuration
-    eval_cfg = config.get("evaluation", {})
-    backtest_cfg_dict = eval_cfg.get("backtesting", {})
+    eval_cfg = config["evaluation"]
+    backtest_cfg_dict = eval_cfg["backtesting"]
 
     bt_config = BacktestConfig(
-        initial_capital=float(backtest_cfg_dict.get("initial_capital", 10000.0)),
-        transaction_cost_pct=float(backtest_cfg_dict.get("transaction_cost", 0.001)),
-        signal_strategy=str(backtest_cfg_dict.get("signal_strategy", "net_intensity")),
-        signal_threshold=float(backtest_cfg_dict.get("signal_threshold", 0.6)),
-        intensity_threshold=int(backtest_cfg_dict.get("intensity_threshold", 1)),
-        position_sizing=str(backtest_cfg_dict.get("position_sizing", "equal")),
-        max_position_pct=float(backtest_cfg_dict.get("max_position_pct", 1.0)),
+        initial_capital=float(backtest_cfg_dict["initial_capital"]),
+        transaction_cost_pct=float(backtest_cfg_dict["transaction_cost"]),
+        signal_strategy=str(backtest_cfg_dict["signal_strategy"]),
+        signal_threshold=float(backtest_cfg_dict["signal_threshold"]),
+        intensity_threshold=int(backtest_cfg_dict["intensity_threshold"]),
+        position_sizing=str(backtest_cfg_dict["position_sizing"]),
+        max_position_pct=float(backtest_cfg_dict["max_position_pct"]),
     )
 
     # Generate signals

@@ -75,8 +75,8 @@ def main() -> int:
 
     # Start MLFlow run
     mlflow_cfg = config["mlflow"]
-    run_naming_cfg = mlflow_cfg.get("run_naming", {})
-    run_pattern = run_naming_cfg.get("pattern")
+    run_naming_cfg = mlflow_cfg["run_naming"]
+    run_pattern = run_naming_cfg["pattern"]
     if not run_pattern:
         logger.error("mlflow.run_naming.pattern is required in configuration")
         return 1
@@ -114,23 +114,10 @@ def main() -> int:
     config_for_training = config
 
     hpo_cfg = config["hyperparameter_optimization"]  # Required by schema
-    if isinstance(hpo_cfg, dict) and hpo_cfg.get("enabled"):
+    if bool(hpo_cfg["enabled"]):
         logger.error("Hyperparameter optimization is not supported when snapshot.enabled is true.")
         end_run()
         return 1
-        if data_object is None:
-            logger.error("Hyperparameter optimization requires a populated data_object.")
-            end_run()
-            return 1
-        logger.info("Hyperparameter optimization is enabled; running search before final training.")
-        try:
-            best_config = run_hyperparameter_search(config, data_object)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Hyperparameter optimization failed: %s", exc)
-            end_run()
-            return 1
-        if best_config is not None:
-            config_for_training = best_config
 
     if mode == "trial":
         logger.info(

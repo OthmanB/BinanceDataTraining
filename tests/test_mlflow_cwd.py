@@ -71,9 +71,22 @@ class TestMlflowCwdFix(unittest.TestCase):
                     "tracking_uri": "http://localhost:5000",
                     "experiment_name": "test-experiment",
                     "local_tmp_dir": tmpdir,
+                    "run_naming": {"pattern": "test-run"},
+                    "artifact_logging": {
+                        "trained_model": False,
+                        "model_architecture_plot": False,
+                        "training_plots": False,
+                        "confusion_matrix": False,
+                        "class_distribution": False,
+                        "feature_importance": False,
+                    },
+                    "model_registry": {"register_model": False, "model_name_pattern": "test"},
                 },
-                "data": {"asset_pairs": {"target_asset": "BTCUSDT"}},
-                "model": {"architecture": "cnn_lstm", "compilation": {}},
+                "data": {"asset_pairs": {"target_asset": "BTCUSDT", "correlated_assets": []}},
+                "model": {
+                    "architecture": "cnn_lstm",
+                    "compilation": {"optimizer": "adam", "learning_rate": 0.001, "loss": "mse", "metrics": ["accuracy"]},
+                },
                 "training": {"epochs": 1, "batch_size": 16, "debug_max_samples": 100},
             }
 

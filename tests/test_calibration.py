@@ -9,6 +9,7 @@ This module tests:
 
 import os
 import unittest
+from typing import Any
 
 import numpy as np
 from numpy.testing import assert_allclose
@@ -27,7 +28,7 @@ from evaluation.calibration import (
 _MAX_EXAMPLES = 10 if os.environ.get("CI") else 50
 
 try:
-    from hypothesis import given, settings, HealthCheck
+    from hypothesis import given, settings, HealthCheck, assume
     from hypothesis import strategies as st
     from hypothesis.extra.numpy import arrays
 
@@ -39,6 +40,7 @@ except ImportError:
     settings = None  # type: ignore[assignment]
     HealthCheck = None  # type: ignore[assignment,misc]
     st = None  # type: ignore[assignment]
+    assume = None  # type: ignore[assignment]
     arrays = None  # type: ignore[assignment]
 
 
@@ -626,6 +628,58 @@ class TestCalibrationProperties(unittest.TestCase):
 
         self.assertGreaterEqual(scaler.temperature, bounds[0])
         self.assertLessEqual(scaler.temperature, bounds[1])
+
+    @settings(max_examples=_MAX_EXAMPLES, suppress_health_check=[HealthCheck.too_slow])
+    @given(
+        logits=arrays(
+            dtype=np.float64,
+            shape=st.tuples(
+                st.integers(min_value=1, max_value=50),
+                st.integers(min_value=2, max_value=6),
+            ),
+            elements=st.floats(min_value=-10.0, max_value=10.0, allow_nan=False, allow_infinity=False),
+        ),
+        temperature=st.floats(min_value=0.1, max_value=10.0),
+    )
+    def test_argmax_preserved_for_logits(self, logits: np.ndarray, temperature: float) -> None:
+        """Temperature scaling should preserve argmax for logits."""
+        scaled = apply_temperature_scaling(logits, temperature)
+        scaled_argmax = np.argmax(scaled, axis=1)
+
+        max_logits = np.max(logits, axis=1)
+        tolerance = 1e-12
+        for idx, chosen in enumerate(scaled_argmax):
+            candidates = np.where((max_logits[idx] - logits[idx]) <= tolerance)[0]
+            self.assertIn(chosen, candidates)
+
+    @settings(max_examples=_MAX_EXAMPLES, suppress_health_check=[HealthCheck.too_slow])
+    @given(
+        data=st.data(),
+        temperature=st.floats(min_value=0.1, max_value=10.0),
+    )
+    def test_argmax_preserved_for_probabilities(self, data: Any, temperature: float) -> None:
+        """Temperature scaling should preserve argmax for probabilities."""
+        n_samples = data.draw(st.integers(min_value=1, max_value=50))
+        n_classes = data.draw(st.integers(min_value=2, max_value=6))
+        raw = data.draw(
+            arrays(
+                dtype=np.float64,
+                shape=(n_samples, n_classes),
+                elements=st.floats(min_value=0.0, max_value=1.0, allow_nan=False, allow_infinity=False),
+            )
+        )
+
+        row_sums = raw.sum(axis=1)
+        assume(np.all(row_sums > 0.0))
+
+        probs = raw / row_sums[:, None]
+        raw_argmax = np.argmax(probs, axis=1)
+
+        logits_proxy = probs_to_logits_proxy(probs)
+        scaled_probs = apply_temperature_scaling(logits_proxy, temperature)
+        scaled_argmax = np.argmax(scaled_probs, axis=1)
+
+        self.assertTrue(np.array_equal(raw_argmax, scaled_argmax))
 
 
 if __name__ == "__main__":

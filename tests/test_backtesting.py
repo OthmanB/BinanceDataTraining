@@ -13,6 +13,7 @@ This test suite covers:
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from datetime import datetime
@@ -21,6 +22,24 @@ from typing import Any, Dict
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+
+# Reduce hypothesis examples in CI for faster test runs
+_MAX_EXAMPLES = 10 if os.environ.get("CI") else 50
+
+try:
+    from hypothesis import given, settings, HealthCheck, assume
+    from hypothesis import strategies as st
+    from hypothesis.extra.numpy import arrays
+
+    HYPOTHESIS_AVAILABLE = True
+except ImportError:
+    HYPOTHESIS_AVAILABLE = False
+    given = None  # type: ignore[assignment]
+    settings = None  # type: ignore[assignment]
+    HealthCheck = None  # type: ignore[assignment,misc]
+    assume = None  # type: ignore[assignment]
+    st = None  # type: ignore[assignment]
+    arrays = None  # type: ignore[assignment]
 
 from evaluation.backtesting import (
     SIGNAL_STRATEGIES,
@@ -141,6 +160,95 @@ class TestTrade(unittest.TestCase):
         self.assertEqual(d["entry_idx"], 5)
         self.assertEqual(d["direction"], "short")
         self.assertIn("2024-01-01", d["entry_time"])
+
+
+@unittest.skipUnless(HYPOTHESIS_AVAILABLE, "hypothesis not installed")
+class TestSignalProperties(unittest.TestCase):
+    """Property-based tests for signal generation invariants."""
+
+    @settings(max_examples=_MAX_EXAMPLES, suppress_health_check=[HealthCheck.too_slow])
+    @given(data=st.data())
+    def test_net_intensity_signals_within_bounds(self, data: Any) -> None:
+        n_samples = data.draw(st.integers(min_value=1, max_value=50))
+        n_classes = data.draw(st.integers(min_value=2, max_value=6))
+        intensity_threshold = data.draw(st.integers(min_value=0, max_value=n_classes - 1))
+
+        raw_up = data.draw(
+            arrays(
+                dtype=np.float64,
+                shape=(n_samples, n_classes),
+                elements=st.floats(min_value=0.0, max_value=1.0, allow_nan=False, allow_infinity=False),
+            )
+        )
+        raw_down = data.draw(
+            arrays(
+                dtype=np.float64,
+                shape=(n_samples, n_classes),
+                elements=st.floats(min_value=0.0, max_value=1.0, allow_nan=False, allow_infinity=False),
+            )
+        )
+
+        up_sums = raw_up.sum(axis=1)
+        down_sums = raw_down.sum(axis=1)
+        assume(np.all(up_sums > 0.0))
+        assume(np.all(down_sums > 0.0))
+
+        y_prob_up = raw_up / up_sums[:, None]
+        y_prob_down = raw_down / down_sums[:, None]
+
+        signals, confidences = generate_signals_net_intensity(
+            y_prob_up,
+            y_prob_down,
+            intensity_threshold=intensity_threshold,
+        )
+
+        self.assertEqual(signals.shape[0], n_samples)
+        self.assertTrue(np.all(np.isin(signals, [-1, 0, 1])))
+        self.assertTrue(np.all(confidences >= 0.0))
+        self.assertTrue(np.all(confidences <= 1.0 + 1e-6))
+
+    @settings(max_examples=_MAX_EXAMPLES, suppress_health_check=[HealthCheck.too_slow])
+    @given(data=st.data())
+    def test_threshold_signals_within_bounds(self, data: Any) -> None:
+        n_samples = data.draw(st.integers(min_value=1, max_value=50))
+        n_classes = data.draw(st.integers(min_value=2, max_value=6))
+        intensity_threshold = data.draw(st.integers(min_value=0, max_value=n_classes - 1))
+        threshold = data.draw(st.floats(min_value=0.01, max_value=0.99))
+
+        raw_up = data.draw(
+            arrays(
+                dtype=np.float64,
+                shape=(n_samples, n_classes),
+                elements=st.floats(min_value=0.0, max_value=1.0, allow_nan=False, allow_infinity=False),
+            )
+        )
+        raw_down = data.draw(
+            arrays(
+                dtype=np.float64,
+                shape=(n_samples, n_classes),
+                elements=st.floats(min_value=0.0, max_value=1.0, allow_nan=False, allow_infinity=False),
+            )
+        )
+
+        up_sums = raw_up.sum(axis=1)
+        down_sums = raw_down.sum(axis=1)
+        assume(np.all(up_sums > 0.0))
+        assume(np.all(down_sums > 0.0))
+
+        y_prob_up = raw_up / up_sums[:, None]
+        y_prob_down = raw_down / down_sums[:, None]
+
+        signals, confidences = generate_signals_threshold(
+            y_prob_up,
+            y_prob_down,
+            threshold=threshold,
+            intensity_threshold=intensity_threshold,
+        )
+
+        self.assertEqual(signals.shape[0], n_samples)
+        self.assertTrue(np.all(np.isin(signals, [-1, 0, 1])))
+        self.assertTrue(np.all(confidences >= 0.0))
+        self.assertTrue(np.all(confidences <= 1.0 + 1e-6))
 
 
 class TestBacktestResult(unittest.TestCase):
@@ -594,6 +702,7 @@ class TestRunBacktest(unittest.TestCase):
         """Create a test configuration."""
         bt_cfg = {
             "enabled": True,
+            "horizon_steps": 5,
             "initial_capital": 10000,
             "transaction_cost": 0.001,
             "signal_strategy": "net_intensity",

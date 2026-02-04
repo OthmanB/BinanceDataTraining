@@ -65,9 +65,8 @@ data:  # Controls where raw data come from and over which time windows.
     correlated_assets: []
     alignment:
       method: "interpolate"  # Alignment strategy: "interpolate" (default) or "bucket".
-      missing_policy_small: "interpolate"  # Small gap handling: "interpolate", "forward_fill", "skip", "error".
-      missing_policy_large: "zero_pad"  # Large gap handling: "zero_pad", "skip", "error".
-      large_gap_seconds: 600  # Large gap threshold in seconds for zero-padding.
+      missing_policy: "forward_fill"  # Gap handling for aligned assets: "forward_fill", "skip", or "error".
+      max_gap_seconds: 600  # Max gap size (seconds) allowed for forward fill/interpolation.
       bucket_tolerance_seconds: 2  # Alignment tolerance for bucket method (seconds).
       include_mask_channel: true  # Append per-asset confidence mask channels (0..1) to inputs.
 
@@ -356,6 +355,7 @@ evaluation:  # Post-training evaluation and calibration settings.
 
   backtesting:
     enabled: false              # When true, run backtesting simulation after evaluation.
+    horizon_steps: 180           # Number of steps to hold positions in backtest (e.g., prediction_horizon_seconds / cadence_seconds).
     initial_capital: 10000      # Starting capital for backtesting simulation.
     transaction_cost: 0.001     # Per-trade proportional transaction cost (0.001 = 0.1%).
     signal_strategy: "net_intensity"  # Strategy for signal generation: "net_intensity" or "threshold".

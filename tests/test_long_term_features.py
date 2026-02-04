@@ -30,7 +30,19 @@ from preprocessing.long_term_features import (
 
 def _make_config(long_term_cfg: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """Create a minimal config dict with long_term settings."""
-    lt_cfg = long_term_cfg if long_term_cfg is not None else {}
+    lt_defaults = {
+        "enabled": False,
+        "windows_days": [7, 30, 90],
+        "resolution_days": 1,
+        "features": ["mean_return", "volatility", "volume_proxy", "skewness"],
+        "summary_method": "mean",
+        "ewma_halflife_days": 7.0,
+        "input_dim": None,
+        "dense": {"layers": [32], "dropout_rates": [0.2]},
+    }
+    lt_cfg = dict(lt_defaults)
+    if long_term_cfg is not None:
+        lt_cfg.update(long_term_cfg)
     return {
         "model": {
             "long_term": lt_cfg,

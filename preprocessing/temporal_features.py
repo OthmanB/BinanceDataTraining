@@ -157,7 +157,7 @@ def _build_global_temporal_features(
     feature_columns: List[np.ndarray] = []
 
     data_cfg = config["data"]
-    tf_cfg_all = data_cfg.get("temporal_features", {})
+    tf_cfg_all = data_cfg["temporal_features"]
 
     for name in global_cfg:
         key = str(name)
@@ -167,12 +167,7 @@ def _build_global_temporal_features(
             days_since_start = (days - first_day).astype("float64")
             feature_columns.append(days_since_start)
         elif key == "market_session":
-            ms_cfg = tf_cfg_all.get("market_session")
-            if not isinstance(ms_cfg, dict):
-                raise ValueError(
-                    "data.temporal_features.market_session must be a mapping in configuration when "
-                    "'market_session' is listed in data.temporal_features.global",
-                )
+            ms_cfg = tf_cfg_all["market_session"]
 
             try:
                 utc_offset_hours = int(ms_cfg["utc_offset_hours"])
@@ -181,7 +176,7 @@ def _build_global_temporal_features(
                     "data.temporal_features.market_session.utc_offset_hours must be an integer in configuration",
                 ) from exc
 
-            sessions_cfg = ms_cfg.get("sessions")
+            sessions_cfg = ms_cfg["sessions"]
             if not isinstance(sessions_cfg, list) or not sessions_cfg:
                 raise ValueError(
                     "data.temporal_features.market_session.sessions must be a non-empty list in configuration",
@@ -282,9 +277,9 @@ def attach_temporal_features(config: Dict[str, Any], data_object: Dict[str, Any]
         return data_object
 
     data_cfg = config["data"]
-    tf_cfg = data_cfg.get("temporal_features", {})
-    local_cfg = tf_cfg.get("local", []) or []
-    global_cfg = tf_cfg.get("global", []) or []
+    tf_cfg = data_cfg["temporal_features"]
+    local_cfg = tf_cfg["local"] or []
+    global_cfg = tf_cfg["global"] or []
 
     if not isinstance(local_cfg, list) or not isinstance(global_cfg, list):
         raise ValueError("data.temporal_features.local and data.temporal_features.global must be lists in configuration")

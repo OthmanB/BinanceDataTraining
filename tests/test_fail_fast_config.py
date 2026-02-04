@@ -140,3 +140,91 @@ class TestSchemaRequiredKeys:
         required_keys = logging_section.get("required_keys", {})
         # Check for at least one color entry
         assert "colors.info" in required_keys, "logging.colors.info should be required"
+
+    def test_alignment_keys_in_schema(self) -> None:
+        """Schema should require alignment missing_policy and max_gap_seconds."""
+        import yaml
+        from pathlib import Path
+
+        schema_path = Path(__file__).parent.parent / "config" / "validation_schema.yaml"
+        with open(schema_path) as f:
+            schema = yaml.safe_load(f)
+
+        data_section = schema["sections"]["data"]
+        required_keys = data_section.get("required_keys", {})
+        assert "asset_pairs.alignment.missing_policy" in required_keys
+        assert "asset_pairs.alignment.max_gap_seconds" in required_keys
+
+    def test_mlflow_artifact_logging_keys_in_schema(self) -> None:
+        """Schema should require MLflow artifact logging flags."""
+        import yaml
+        from pathlib import Path
+
+        schema_path = Path(__file__).parent.parent / "config" / "validation_schema.yaml"
+        with open(schema_path) as f:
+            schema = yaml.safe_load(f)
+
+        mlflow_section = schema["sections"]["mlflow"]
+        required_keys = mlflow_section.get("required_keys", {})
+        assert "artifact_logging.confusion_matrix" in required_keys
+        assert "artifact_logging.trained_model" in required_keys
+        assert "model_registry.register_model" in required_keys
+
+
+class TestFailFastAlignmentConfig:
+    """Fail-fast tests for alignment config usage."""
+
+    def test_missing_alignment_key_raises_key_error(self) -> None:
+        import numpy as np
+        from training.snapshot_dataset import SnapshotRecord, _align_multi_asset_records
+
+        t0 = np.datetime64("2024-01-01T00:00:00")
+        record = SnapshotRecord(
+            timestamp=t0,
+            snapshot_features=[1.0, 1.0, 1.0, 1.0],
+            depth=None,
+            mid_price=1.0,
+            hybrid_snapshot=None,
+            volume_proxy=0.0,
+            confidence=1.0,
+            gap_reset=False,
+        )
+
+        asset_records = {"BTCUSDT": [record], "ETHUSDT": [record]}
+        alignment_cfg = {
+            "method": "interpolate",
+            "max_gap_seconds": 60,
+            "bucket_tolerance_seconds": 1.0,
+        }
+
+        with pytest.raises(KeyError):
+            _align_multi_asset_records(
+                asset_records=asset_records,
+                assets=["BTCUSDT", "ETHUSDT"],
+                target_asset="BTCUSDT",
+                alignment_cfg=alignment_cfg,
+                representation="top_of_book",
+                cadence_seconds=10,
+                hybrid_levels=None,
+                fail_on_invalid=True,
+            )
+
+
+class TestFailFastLongTermConfig:
+    """Fail-fast tests for long-term config usage."""
+
+    def test_missing_long_term_key_raises(self) -> None:
+        from preprocessing.long_term_features import LongTermConfig, LongTermFeatureError
+
+        config = {
+            "model": {
+                "long_term": {
+                    "enabled": True,
+                    "windows_days": [7],
+                    "resolution_days": 1,
+                }
+            }
+        }
+
+        with pytest.raises(LongTermFeatureError):
+            LongTermConfig.from_config(config)

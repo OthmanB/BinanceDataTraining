@@ -22,8 +22,8 @@ class TestSnapshotDataset(unittest.TestCase):
     def test_gap_handler_forward_fill(self) -> None:
         handler = GapHandler(
             cadence_seconds=10,
-            max_gap_seconds=60,
-            large_gap_seconds=600,
+            validation_max_gap_seconds=60,
+            alignment_max_gap_seconds=600,
             handle_gaps="forward_fill",
             check_missing_data=True,
             fail_on_invalid=True,
@@ -69,8 +69,8 @@ class TestSnapshotDataset(unittest.TestCase):
     def test_gap_handler_interpolate(self) -> None:
         handler = GapHandler(
             cadence_seconds=10,
-            max_gap_seconds=60,
-            large_gap_seconds=600,
+            validation_max_gap_seconds=60,
+            alignment_max_gap_seconds=600,
             handle_gaps="interpolate",
             check_missing_data=True,
             fail_on_invalid=True,

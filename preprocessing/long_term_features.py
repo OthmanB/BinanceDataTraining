@@ -151,21 +151,28 @@ class LongTermConfig:
         LongTermConfig:
             Configured instance.
         """
-        model_cfg = config.get("model", {})
-        lt_cfg = model_cfg.get("long_term", {})
+        model_cfg = config["model"]
+        lt_cfg = model_cfg["long_term"]
+
+        try:
+            enabled = bool(lt_cfg["enabled"])
+            windows_days = list(lt_cfg["windows_days"])
+            resolution_days = int(lt_cfg["resolution_days"])
+            features = list(lt_cfg["features"])
+            summary_method = str(lt_cfg["summary_method"])
+            ewma_halflife_days = float(lt_cfg["ewma_halflife_days"])
+        except KeyError as exc:
+            raise LongTermFeatureError(
+                f"Missing required long-term config key: model.long_term.{exc.args[0]}"
+            ) from exc
 
         return cls(
-            enabled=bool(lt_cfg.get("enabled", False)),
-            windows_days=list(lt_cfg.get("windows_days", [7, 30, 90])),
-            resolution_days=int(lt_cfg.get("resolution_days", 1)),
-            features=list(
-                lt_cfg.get(
-                    "features",
-                    ["mean_return", "volatility", "volume_proxy", "skewness"],
-                )
-            ),
-            summary_method=str(lt_cfg.get("summary_method", "mean")),
-            ewma_halflife_days=float(lt_cfg.get("ewma_halflife_days", 7.0)),
+            enabled=enabled,
+            windows_days=windows_days,
+            resolution_days=resolution_days,
+            features=features,
+            summary_method=summary_method,
+            ewma_halflife_days=ewma_halflife_days,
         )
 
 

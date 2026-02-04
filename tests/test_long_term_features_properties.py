@@ -51,6 +51,8 @@ def _make_config(
                 "summary_method": summary_method,
                 "resolution_days": 1,
                 "ewma_halflife_days": 7.0,
+                "input_dim": None,
+                "dense": {"layers": [32], "dropout_rates": [0.2]},
             }
         }
     }

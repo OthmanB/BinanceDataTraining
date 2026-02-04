@@ -20,6 +20,13 @@ def _build_base_config(snapshot_dir: str) -> dict:
             "asset_pairs": {
                 "target_asset": "BTCUSDT",
                 "correlated_assets": [],
+                "alignment": {
+                    "method": "interpolate",
+                    "missing_policy": "forward_fill",
+                    "max_gap_seconds": 120,
+                    "bucket_tolerance_seconds": 0.0,
+                    "include_mask_channel": False,
+                },
             },
             "time_range": {
                 "start_date": "2024-01-01",
@@ -31,7 +38,11 @@ def _build_base_config(snapshot_dir: str) -> dict:
                 "representation": "hybrid",
                 "hybrid": {"raw_levels": 5, "aggregated_bins": 5},
             },
-            "temporal_features": {"local": [], "global": []},
+            "temporal_features": {
+                "local": [],
+                "global": [],
+                "market_session": {"utc_offset_hours": 0, "sessions": []},
+            },
         },
         "targets": {
             "prediction_horizon_seconds": 60,
@@ -60,8 +71,33 @@ def _build_base_config(snapshot_dir: str) -> dict:
                     "use_global_features": False,
                 }
             },
-            "cnn": {"kernel_sizes": [[3, 3]], "pool_sizes": [[2, 2]]},
-            "output": {"type": "two_head_intensity", "num_classes": 2},
+            "cnn": {
+                "num_layers": 1,
+                "filters": [8],
+                "kernel_sizes": [[3, 3]],
+                "pool_sizes": [[2, 2]],
+                "activation": "relu",
+                "dropout_rates": [0.0],
+            },
+            "lstm": {"units": 4, "dropout": 0.0, "recurrent_dropout": 0.0},
+            "dense": {"layers": [], "dropout_rates": []},
+            "long_term": {
+                "enabled": False,
+                "windows_days": [7, 30, 90],
+                "resolution_days": 1,
+                "features": ["mean_return", "volatility", "volume_proxy", "skewness"],
+                "summary_method": "mean",
+                "ewma_halflife_days": 7.0,
+                "input_dim": None,
+                "dense": {"layers": [32], "dropout_rates": [0.2]},
+            },
+            "output": {"type": "two_head_intensity", "num_classes": 2, "activation": "softmax"},
+            "compilation": {
+                "optimizer": "adam",
+                "learning_rate": 0.001,
+                "loss": "categorical_crossentropy",
+                "metrics": ["accuracy"],
+            },
         },
     }
 

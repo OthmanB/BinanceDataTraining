@@ -13,9 +13,9 @@ def get_metric_names_from_config(config: Dict[str, Any]) -> List[str]:
     Phase 3: helper only; no framework-specific metric objects are created.
     """
 
-    model_cfg = config.get("model", {})
-    compilation_cfg = model_cfg.get("compilation", {})
-    metrics = compilation_cfg.get("metrics", []) or []
+    model_cfg = config["model"]
+    compilation_cfg = model_cfg["compilation"]
+    metrics = compilation_cfg["metrics"]
 
     logger.info("Configured metrics: %s", metrics)
 

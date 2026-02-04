@@ -273,9 +273,9 @@ def _build_targets_from_order_book(config: Dict[str, Any], data_object: Dict[str
 
     # Determine if we need full depth data for hybrid representation
     order_book_cfg = data_cfg["order_book"]
-    representation = str(order_book_cfg.get("representation", "top_of_book"))
+    representation = str(order_book_cfg["representation"])
     collect_full_depth = representation in ("hybrid", "full")
-    depth_levels = int(order_book_cfg.get("depth_levels", 1000))
+    depth_levels = int(order_book_cfg["depth_levels"])
 
     # Build mid-prices at the snapshot level by aggregating rows that share the
     # same timestamp. The batch_id column encodes a coarse time bucket and must
@@ -583,8 +583,8 @@ def _build_targets_from_order_book(config: Dict[str, Any], data_object: Dict[str
 
     # Feature engineering: compute order book features and volume proxy per snapshot
     # if enabled in configuration. These are stored for use by the training pipeline.
-    fe_cfg = config["preprocessing"].get("feature_engineering", {})
-    if isinstance(fe_cfg, dict) and fe_cfg.get("enabled"):
+    fe_cfg = config["preprocessing"]["feature_engineering"]
+    if bool(fe_cfg["enabled"]):
         if collect_full_depth and snapshot_depth_data:
             try:
                 feature_engineer = FeatureEngineer(config)

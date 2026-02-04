@@ -104,15 +104,15 @@ class GapHandler:
     def __init__(
         self,
         cadence_seconds: int,
-        max_gap_seconds: int,
-        large_gap_seconds: int,
+        validation_max_gap_seconds: int,
+        alignment_max_gap_seconds: int,
         handle_gaps: str,
         check_missing_data: bool,
         fail_on_invalid: bool,
     ) -> None:
         self._cadence_seconds = cadence_seconds
-        self._max_gap_seconds = max_gap_seconds
-        self._large_gap_seconds = large_gap_seconds
+        self._validation_max_gap_seconds = validation_max_gap_seconds
+        self._alignment_max_gap_seconds = alignment_max_gap_seconds
         self._handle_gaps = handle_gaps
         self._check_missing_data = check_missing_data
         self._fail_on_invalid = fail_on_invalid
@@ -137,23 +137,23 @@ class GapHandler:
                 yield snapshot
                 continue
 
-            if self._check_missing_data and gap_secs > self._max_gap_seconds:
+            if self._check_missing_data and gap_secs > self._validation_max_gap_seconds:
                 message = (
                     "Snapshot timestamp gaps exceed data.validation.max_gap_seconds; "
-                    f"max_gap_seconds={self._max_gap_seconds}, observed_gap_seconds={gap_secs}"
+                    f"max_gap_seconds={self._validation_max_gap_seconds}, observed_gap_seconds={gap_secs}"
                 )
                 if self._fail_on_invalid:
                     raise ValueError(message)
                 logger.warning(message)
 
-            gap_reset = gap_secs > self._max_gap_seconds
-            if self._large_gap_seconds <= 0:
-                raise ValueError("alignment.large_gap_seconds must be positive")
-            base_confidence = max(0.0, 1.0 - (gap_secs / float(self._large_gap_seconds)))
+            gap_reset = gap_secs > self._alignment_max_gap_seconds
+            if self._alignment_max_gap_seconds <= 0:
+                raise ValueError("alignment.max_gap_seconds must be positive")
+            base_confidence = max(0.0, 1.0 - (gap_secs / float(self._alignment_max_gap_seconds)))
 
             if (
                 gap_secs > self._cadence_seconds
-                and gap_secs <= self._max_gap_seconds
+                and gap_secs <= self._alignment_max_gap_seconds
                 and self._handle_gaps in {"forward_fill", "interpolate"}
             ):
                 missing_steps = gap_secs // self._cadence_seconds - 1
@@ -248,8 +248,8 @@ class StreamingSampleBuilder:
             raise ValueError("target_asset must be included in assets for snapshot streaming")
         self._target_asset = str(target_asset)
         self._asset_indices = {asset: idx for idx, asset in enumerate(self._assets)}
-        alignment_cfg = config.get("data", {}).get("asset_pairs", {}).get("alignment", {})
-        self._include_mask_channel = bool(alignment_cfg.get("include_mask_channel"))
+        alignment_cfg = config["data"]["asset_pairs"]["alignment"]
+        self._include_mask_channel = bool(alignment_cfg["include_mask_channel"])
 
         data_cfg = config["data"]
         time_range_cfg = data_cfg["time_range"]
@@ -298,17 +298,17 @@ class StreamingSampleBuilder:
                 "model.output.num_classes must equal len(targets.price_classes.boundaries) + 1",
             )
 
-        fe_cfg = config["preprocessing"].get("feature_engineering", {})
-        self._feature_engineer = FeatureEngineer(config) if fe_cfg.get("enabled") else None
+        fe_cfg = config["preprocessing"]["feature_engineering"]
+        self._feature_engineer = FeatureEngineer(config) if bool(fe_cfg["enabled"]) else None
 
-        ir_cfg = model_cfg.get("input_representation", {})
-        tf_cfg = ir_cfg.get("temporal_features", {})
-        self._temporal_mode = str(tf_cfg.get("integration_mode", "none"))
-        self._use_local = bool(tf_cfg.get("use_local_features"))
-        self._use_global = bool(tf_cfg.get("use_global_features"))
-        self._local_features = data_cfg.get("temporal_features", {}).get("local", []) or []
-        self._global_features = data_cfg.get("temporal_features", {}).get("global", []) or []
-        self._market_session_cfg = data_cfg.get("temporal_features", {}).get("market_session", {})
+        ir_cfg = model_cfg["input_representation"]
+        tf_cfg = ir_cfg["temporal_features"]
+        self._temporal_mode = str(tf_cfg["integration_mode"])
+        self._use_local = bool(tf_cfg["use_local_features"])
+        self._use_global = bool(tf_cfg["use_global_features"])
+        self._local_features = data_cfg["temporal_features"]["local"] or []
+        self._global_features = data_cfg["temporal_features"]["global"] or []
+        self._market_session_cfg = data_cfg["temporal_features"]["market_session"]
 
         if self._temporal_mode not in {"none", "concat_channels"}:
             raise ValueError(
@@ -506,7 +506,7 @@ def prepare_snapshot_dataset(config: Dict[str, Any]) -> SnapshotDataset:
     """Prepare (build or load) a snapshot dataset for streaming training."""
 
     context = resolve_snapshot_context(config)
-    max_snapshots = int(config.get("snapshot", {}).get("max_snapshots", 0))
+    max_snapshots = int(config["snapshot"]["max_snapshots"])
     maybe_evict_snapshots(context, max_snapshots)
 
     manifest = load_or_create_manifest(context, config)
@@ -612,13 +612,13 @@ def iter_snapshot_batches(
 
 
 def get_mask_channel_info(config: Dict[str, Any]) -> Tuple[int, int]:
-    data_cfg = config.get("data", {})
-    asset_pairs_cfg = data_cfg.get("asset_pairs", {})
-    correlated_assets = asset_pairs_cfg.get("correlated_assets", []) or []
+    data_cfg = config["data"]
+    asset_pairs_cfg = data_cfg["asset_pairs"]
+    correlated_assets = asset_pairs_cfg["correlated_assets"] or []
     num_assets = 1 + len(correlated_assets)
 
-    alignment_cfg = asset_pairs_cfg.get("alignment", {})
-    include_mask = bool(alignment_cfg.get("include_mask_channel"))
+    alignment_cfg = asset_pairs_cfg["alignment"]
+    include_mask = bool(alignment_cfg["include_mask_channel"])
     if not include_mask:
         return 0, 0
     return num_assets, num_assets
@@ -1142,17 +1142,19 @@ def _align_multi_asset_records(
     if not target_records:
         return []
 
-    method = str(alignment_cfg.get("method", "interpolate"))
-    missing_policy_large = str(alignment_cfg.get("missing_policy_large", "zero_pad"))
-    large_gap_seconds = int(alignment_cfg.get("large_gap_seconds", 0))
-    bucket_tolerance_seconds = float(alignment_cfg.get("bucket_tolerance_seconds", 0.0))
+    method = str(alignment_cfg["method"])
+    missing_policy = str(alignment_cfg["missing_policy"])
+    max_gap_seconds = int(alignment_cfg["max_gap_seconds"])
+    bucket_tolerance_seconds = float(alignment_cfg["bucket_tolerance_seconds"])
 
     if method not in {"interpolate", "bucket"}:
         raise ValueError("data.asset_pairs.alignment.method must be 'interpolate' or 'bucket'")
-    if missing_policy_large not in {"zero_pad", "skip", "error"}:
-        raise ValueError("data.asset_pairs.alignment.missing_policy_large must be 'zero_pad', 'skip', or 'error'")
-    if large_gap_seconds <= 0:
-        raise ValueError("data.asset_pairs.alignment.large_gap_seconds must be positive")
+    if missing_policy not in {"forward_fill", "skip", "error"}:
+        raise ValueError(
+            "data.asset_pairs.alignment.missing_policy must be 'forward_fill', 'skip', or 'error'",
+        )
+    if max_gap_seconds <= 0:
+        raise ValueError("data.asset_pairs.alignment.max_gap_seconds must be positive")
     if bucket_tolerance_seconds < 0:
         raise ValueError("data.asset_pairs.alignment.bucket_tolerance_seconds must be >= 0")
 
@@ -1168,8 +1170,8 @@ def _align_multi_asset_records(
             target_times=target_times,
             method=method,
             representation=representation,
-            missing_policy_large=missing_policy_large,
-            large_gap_seconds=large_gap_seconds,
+            missing_policy=missing_policy,
+            max_gap_seconds=max_gap_seconds,
             bucket_tolerance_seconds=bucket_tolerance_seconds,
             cadence_seconds=cadence_seconds,
             hybrid_levels=hybrid_levels,
@@ -1195,7 +1197,7 @@ def _align_multi_asset_records(
                 "Missing aligned correlated asset snapshots for timestamp="
                 f"{target_rec.timestamp}; missing_assets={missing_assets}"
             )
-            if missing_policy_large == "error" or fail_on_invalid:
+            if missing_policy == "error" or fail_on_invalid:
                 raise ValueError(message)
             logger.warning(message)
             continue
@@ -1216,8 +1218,8 @@ def _align_asset_records(
     target_times: np.ndarray,
     method: str,
     representation: str,
-    missing_policy_large: str,
-    large_gap_seconds: int,
+    missing_policy: str,
+    max_gap_seconds: int,
     bucket_tolerance_seconds: float,
     cadence_seconds: int,
     hybrid_levels: Optional[int],
@@ -1225,12 +1227,7 @@ def _align_asset_records(
     asset_name: str,
 ) -> List[Optional[SnapshotRecord]]:
     if not records:
-        if missing_policy_large == "zero_pad":
-            return [
-                _zero_pad_record(target_times[i], representation, hybrid_levels)
-                for i in range(len(target_times))
-            ]
-        if missing_policy_large == "skip":
+        if missing_policy in {"forward_fill", "skip"}:
             return [None for _ in range(len(target_times))]
         raise ValueError(f"No records available for asset {asset_name} during alignment")
 
@@ -1239,8 +1236,8 @@ def _align_asset_records(
             records=records,
             target_times=target_times,
             representation=representation,
-            missing_policy_large=missing_policy_large,
-            large_gap_seconds=large_gap_seconds,
+            missing_policy=missing_policy,
+            max_gap_seconds=max_gap_seconds,
             hybrid_levels=hybrid_levels,
             fail_on_invalid=fail_on_invalid,
             asset_name=asset_name,
@@ -1250,7 +1247,8 @@ def _align_asset_records(
         records=records,
         target_times=target_times,
         representation=representation,
-        missing_policy_large=missing_policy_large,
+        missing_policy=missing_policy,
+        max_gap_seconds=max_gap_seconds,
         bucket_tolerance_seconds=bucket_tolerance_seconds,
         cadence_seconds=cadence_seconds,
         hybrid_levels=hybrid_levels,
@@ -1264,8 +1262,8 @@ def _align_asset_interpolate(
     records: List[SnapshotRecord],
     target_times: np.ndarray,
     representation: str,
-    missing_policy_large: str,
-    large_gap_seconds: int,
+    missing_policy: str,
+    max_gap_seconds: int,
     hybrid_levels: Optional[int],
     fail_on_invalid: bool,
     asset_name: str,
@@ -1276,17 +1274,12 @@ def _align_asset_interpolate(
 
     values, confidences = _extract_record_values(records, representation)
     if values is None:
-        if missing_policy_large == "zero_pad":
-            return [
-                _zero_pad_record(target_times[i], representation, hybrid_levels)
-                for i in range(len(target_times))
-            ]
-        if missing_policy_large == "skip":
+        if missing_policy in {"forward_fill", "skip"}:
             return [None for _ in range(len(target_times))]
         raise ValueError(f"Missing values for asset {asset_name} during alignment")
 
     aligned: List[Optional[SnapshotRecord]] = []
-    large_gap_ms = int(large_gap_seconds * 1000)
+    max_gap_ms = int(max_gap_seconds * 1000)
 
     for t_ms, t_dt in zip(target_ms, target_times):
         idx = int(np.searchsorted(times_ms, t_ms, side="left"))
@@ -1299,11 +1292,18 @@ def _align_asset_interpolate(
         left = idx - 1
         right = idx
         if left < 0 or right >= len(times_ms):
+            if missing_policy == "forward_fill" and left >= 0:
+                gap_from_left = int(t_ms - times_ms[left])
+                if gap_from_left <= max_gap_ms:
+                    value = values[left]
+                    confidence = confidences[left]
+                    aligned.append(_build_aligned_record(t_dt, value, representation, float(confidence)))
+                    continue
             aligned.append(
                 _handle_missing_alignment(
                     t_dt,
                     representation,
-                    missing_policy_large,
+                    missing_policy,
                     fail_on_invalid,
                     asset_name,
                     hybrid_levels,
@@ -1312,12 +1312,19 @@ def _align_asset_interpolate(
             continue
 
         gap_ms = int(times_ms[right] - times_ms[left])
-        if gap_ms <= 0 or gap_ms > large_gap_ms:
+        if gap_ms <= 0 or gap_ms > max_gap_ms:
+            if missing_policy == "forward_fill":
+                gap_from_left = int(t_ms - times_ms[left])
+                if gap_from_left <= max_gap_ms:
+                    value = values[left]
+                    confidence = confidences[left]
+                    aligned.append(_build_aligned_record(t_dt, value, representation, float(confidence)))
+                    continue
             aligned.append(
                 _handle_missing_alignment(
                     t_dt,
                     representation,
-                    missing_policy_large,
+                    missing_policy,
                     fail_on_invalid,
                     asset_name,
                     hybrid_levels,
@@ -1339,7 +1346,8 @@ def _align_asset_bucket(
     records: List[SnapshotRecord],
     target_times: np.ndarray,
     representation: str,
-    missing_policy_large: str,
+    missing_policy: str,
+    max_gap_seconds: int,
     bucket_tolerance_seconds: float,
     cadence_seconds: int,
     hybrid_levels: Optional[int],
@@ -1367,15 +1375,24 @@ def _align_asset_bucket(
 
     aligned: List[Optional[SnapshotRecord]] = []
     target_ms = target_times.astype("datetime64[ms]").astype("int64")
+    max_gap_ms = int(max_gap_seconds * 1000)
+    last_record: Optional[SnapshotRecord] = None
+    last_record_time_ms: Optional[int] = None
     for t_ms, t_dt in zip(target_ms, target_times):
         bucket = int((t_ms // cadence_ms) * cadence_ms)
         record_entry = bucket_map.get(bucket)
         if record_entry is None:
+            if missing_policy == "forward_fill" and last_record is not None and last_record_time_ms is not None:
+                gap_ms = int(t_ms - last_record_time_ms)
+                if 0 <= gap_ms <= max_gap_ms:
+                    value, confidence = _extract_single_record_value(last_record, representation)
+                    aligned.append(_build_aligned_record(t_dt, value, representation, confidence))
+                    continue
             aligned.append(
                 _handle_missing_alignment(
                     t_dt,
                     representation,
-                    missing_policy_large,
+                    missing_policy,
                     fail_on_invalid,
                     asset_name,
                     hybrid_levels,
@@ -1385,6 +1402,8 @@ def _align_asset_bucket(
         record = record_entry[1]
         value, confidence = _extract_single_record_value(record, representation)
         aligned.append(_build_aligned_record(t_dt, value, representation, confidence))
+        last_record = record
+        last_record_time_ms = int(record.timestamp.astype("datetime64[ms]").astype("int64"))
 
     return aligned
 
@@ -1538,21 +1557,16 @@ def _zero_pad_record(
 def _handle_missing_alignment(
     timestamp: np.datetime64,
     representation: str,
-    missing_policy_large: str,
+    missing_policy: str,
     fail_on_invalid: bool,
     asset_name: str,
     hybrid_levels: Optional[int],
 ) -> Optional[SnapshotRecord]:
     message = f"Missing aligned data for asset={asset_name} at timestamp={timestamp}"
-    if missing_policy_large == "error":
+    if missing_policy == "error" or fail_on_invalid:
         raise ValueError(message)
-    if missing_policy_large == "skip":
-        if fail_on_invalid:
-            raise ValueError(message)
-        logger.warning(message)
-        return None
-    logger.warning("Zero-padding %s", message)
-    return _zero_pad_record(timestamp, representation, hybrid_levels)
+    logger.warning(message)
+    return None
 
 
 def _build_snapshot_chunks(
@@ -1572,7 +1586,7 @@ def _build_snapshot_chunks(
 
     asset_pairs_cfg = data_cfg["asset_pairs"]
     target_asset = str(asset_pairs_cfg["target_asset"])
-    correlated_assets = [str(a) for a in asset_pairs_cfg.get("correlated_assets", [])]
+    correlated_assets = [str(a) for a in asset_pairs_cfg["correlated_assets"]]
     assets = [target_asset] + correlated_assets
     if not assets:
         raise ValueError("data.asset_pairs must define at least one asset for snapshot building")
@@ -1584,12 +1598,21 @@ def _build_snapshot_chunks(
     save_manifest(context, manifest)
 
     os.makedirs(os.path.join(context.snapshot_dir, "chunks"), exist_ok=True)
+    os.makedirs(os.path.join(context.snapshot_dir, "series"), exist_ok=True)
 
     existing_entries = _existing_chunk_entries(context, manifest)
+    existing_series_entries = _existing_series_entries(context, manifest)
     for boundary in output_boundaries:
         key = (boundary["start_str"], boundary["end_str"])
         if key in existing_entries:
             boundary["cached"] = True
+
+    series_meta = manifest.get("series")
+    if not isinstance(series_meta, dict):
+        series_meta = {}
+    series_meta["target_asset"] = target_asset
+    series_meta["cadence_seconds"] = cadence_seconds
+    manifest["series"] = series_meta
 
     sample_builder = _create_sample_builder(config)
     gap_handlers = {asset: _create_gap_handler(config) for asset in assets}
@@ -1652,7 +1675,7 @@ def _build_snapshot_chunks(
             return
 
         order_book_cfg = data_cfg["order_book"]
-        representation = str(order_book_cfg.get("representation", "top_of_book"))
+        representation = str(order_book_cfg["representation"])
         if representation == "full":
             representation = "hybrid"
 
@@ -1679,7 +1702,7 @@ def _build_snapshot_chunks(
 
         hybrid_levels = get_hybrid_output_shape(config) if representation == "hybrid" else None
 
-        alignment_cfg = asset_pairs_cfg.get("alignment", {})
+        alignment_cfg = asset_pairs_cfg["alignment"]
         multi_records = GapHandler.align_multi_asset(
             asset_records=asset_records,
             assets=assets,
@@ -1690,7 +1713,23 @@ def _build_snapshot_chunks(
             hybrid_levels=hybrid_levels,
             fail_on_invalid=fail_on_invalid,
         )
+        series_timestamps: List[int] = []
+        series_mid_prices: List[float] = []
+        series_volumes: List[float] = []
+
         for snapshot in multi_records:
+            target_snapshot = snapshot.asset_snapshots.get(target_asset)
+            if target_snapshot is None:
+                raise ValueError(
+                    f"Aligned snapshot missing target asset '{target_asset}' for chunk {chunk_key}",
+                )
+
+            series_timestamps.append(
+                int(snapshot.timestamp.astype("datetime64[s]").astype("int64"))
+            )
+            series_mid_prices.append(float(target_snapshot.mid_price))
+            series_volumes.append(float(target_snapshot.volume_proxy))
+
             for sample in sample_builder.add_snapshot(snapshot):
                 anchor_ts = sample.anchor_ts_seconds
 
@@ -1707,6 +1746,33 @@ def _build_snapshot_chunks(
                     continue
 
                 chunk_samples.append(sample)
+
+        series_filename = _chunk_filename(chunk_key[0], chunk_key[1])
+        series_rel = os.path.join("series", series_filename)
+        series_path = os.path.join(context.snapshot_dir, series_rel)
+        series_key = (chunk_key[0], chunk_key[1])
+
+        if series_key not in existing_series_entries or not os.path.exists(series_path):
+            series_ts_arr = np.asarray(series_timestamps, dtype="int64")
+            series_mid_arr = np.asarray(series_mid_prices, dtype="float64")
+            series_vol_arr = np.asarray(series_volumes, dtype="float64")
+
+            np.savez_compressed(
+                series_path,
+                timestamps=series_ts_arr,
+                mid_prices=series_mid_arr,
+                volumes=series_vol_arr,
+            )
+
+        series_entry = {
+            "start": chunk_key[0],
+            "end": chunk_key[1],
+            "file": series_rel,
+            "num_snapshots": int(len(series_timestamps)),
+            "created_at": datetime.utcnow().isoformat() + "Z",
+        }
+        _upsert_series_entry(manifest, series_entry)
+        save_manifest(context, manifest)
 
     for chunk in stream_order_book_chunks_by_time(config, assets_override=assets):
         key = (chunk.chunk_start, chunk.chunk_end)
@@ -1770,6 +1836,24 @@ def _existing_chunk_entries(context: SnapshotContext, manifest: Dict[str, Any]) 
     return existing
 
 
+def _existing_series_entries(context: SnapshotContext, manifest: Dict[str, Any]) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    existing: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    series_meta = manifest.get("series", {})
+    if not isinstance(series_meta, dict):
+        return existing
+    for entry in series_meta.get("chunks", []) or []:
+        start = entry.get("start")
+        end = entry.get("end")
+        file_rel = entry.get("file")
+        if not start or not end or not file_rel:
+            continue
+        file_path = os.path.join(context.snapshot_dir, file_rel)
+        if not os.path.exists(file_path):
+            continue
+        existing[(start, end)] = entry
+    return existing
+
+
 def _chunk_filename(start_str: str, end_str: str) -> str:
     safe_start = start_str.replace(" ", "_").replace(":", "-")
     safe_end = end_str.replace(" ", "_").replace(":", "-")
@@ -1788,6 +1872,24 @@ def _upsert_chunk_entry(manifest: Dict[str, Any], entry: Dict[str, Any]) -> None
         chunks.append(entry)
     chunks.sort(key=lambda item: item.get("start") or "")
     manifest["chunks"] = chunks
+
+
+def _upsert_series_entry(manifest: Dict[str, Any], entry: Dict[str, Any]) -> None:
+    series_meta = manifest.get("series")
+    if not isinstance(series_meta, dict):
+        series_meta = {}
+    chunks = series_meta.get("chunks", []) or []
+    replaced = False
+    for idx, existing in enumerate(chunks):
+        if existing.get("start") == entry.get("start") and existing.get("end") == entry.get("end"):
+            chunks[idx] = entry
+            replaced = True
+            break
+    if not replaced:
+        chunks.append(entry)
+    chunks.sort(key=lambda item: item.get("start") or "")
+    series_meta["chunks"] = chunks
+    manifest["series"] = series_meta
 
 
 def _create_sample_builder(config: Dict[str, Any]) -> StreamingSampleBuilder:
@@ -1814,7 +1916,7 @@ def _create_sample_builder(config: Dict[str, Any]) -> StreamingSampleBuilder:
     width = max(max(widths), min_width)
 
     data_cfg = config["data"]
-    representation = str(data_cfg.get("order_book", {}).get("representation", "top_of_book"))
+    representation = str(data_cfg["order_book"]["representation"])
     if representation not in {"top_of_book", "hybrid", "full"}:
         raise ValueError("Unsupported data.order_book.representation in snapshot mode")
     if representation == "full":
@@ -1822,7 +1924,7 @@ def _create_sample_builder(config: Dict[str, Any]) -> StreamingSampleBuilder:
 
     asset_pairs_cfg = data_cfg["asset_pairs"]
     target_asset = str(asset_pairs_cfg["target_asset"])
-    correlated_assets = [str(a) for a in asset_pairs_cfg.get("correlated_assets", [])]
+    correlated_assets = [str(a) for a in asset_pairs_cfg["correlated_assets"]]
     assets = [target_asset] + correlated_assets
 
     return StreamingSampleBuilder(
@@ -1841,24 +1943,24 @@ def _create_gap_handler(config: Dict[str, Any]) -> GapHandler:
     validation_cfg = data_cfg["validation"]
     targets_cfg = config["targets"]
     labeling_cfg = targets_cfg["labeling"]
-    alignment_cfg = data_cfg.get("asset_pairs", {}).get("alignment", {})
+    alignment_cfg = data_cfg["asset_pairs"]["alignment"]
 
     cadence_seconds = int(time_range_cfg["cadence_seconds"])
-    max_gap_seconds = int(validation_cfg["max_gap_seconds"])
+    validation_max_gap_seconds = int(validation_cfg["max_gap_seconds"])
     check_missing_data = bool(validation_cfg["check_missing_data"])
     fail_on_invalid = bool(validation_cfg["fail_on_invalid"])
-    handle_gaps = str(alignment_cfg.get("missing_policy_small") or labeling_cfg["handle_gaps"])
-    large_gap_seconds = int(alignment_cfg.get("large_gap_seconds", max_gap_seconds))
+    handle_gaps = str(labeling_cfg["handle_gaps"])
+    alignment_max_gap_seconds = int(alignment_cfg["max_gap_seconds"])
 
     if handle_gaps not in {"skip", "forward_fill", "interpolate"}:
         raise ValueError("targets.labeling.handle_gaps must be 'skip', 'forward_fill', or 'interpolate'")
-    if large_gap_seconds <= 0:
-        raise ValueError("data.asset_pairs.alignment.large_gap_seconds must be positive")
+    if alignment_max_gap_seconds <= 0:
+        raise ValueError("data.asset_pairs.alignment.max_gap_seconds must be positive")
 
     return GapHandler(
         cadence_seconds=cadence_seconds,
-        max_gap_seconds=max_gap_seconds,
-        large_gap_seconds=large_gap_seconds,
+        validation_max_gap_seconds=validation_max_gap_seconds,
+        alignment_max_gap_seconds=alignment_max_gap_seconds,
         handle_gaps=handle_gaps,
         check_missing_data=check_missing_data,
         fail_on_invalid=fail_on_invalid,
@@ -1873,9 +1975,9 @@ def _build_snapshots_from_rows(
 ) -> List[SnapshotRecord]:
     data_cfg = config["data"]
     order_book_cfg = data_cfg["order_book"]
-    representation = str(order_book_cfg.get("representation", "top_of_book"))
+    representation = str(order_book_cfg["representation"])
     collect_full_depth = representation in {"hybrid", "full"}
-    depth_levels = int(order_book_cfg.get("depth_levels", 0))
+    depth_levels = int(order_book_cfg["depth_levels"])
     if collect_full_depth and depth_levels <= 0:
         raise ValueError("data.order_book.depth_levels must be positive for hybrid representation")
 
@@ -1929,12 +2031,8 @@ def _build_snapshots_from_rows(
     sorted_keys = sorted(snapshots.keys())
     normalized_ts = normalize_timestamp_array(sorted_keys)
 
-    fe_cfg = config["preprocessing"].get("feature_engineering", {})
-    feature_engineer = (
-        FeatureEngineer(config)
-        if fe_cfg.get("enabled") and compute_volume_proxy
-        else None
-    )
+    fe_cfg = config["preprocessing"]["feature_engineering"]
+    feature_engineer = FeatureEngineer(config) if bool(fe_cfg["enabled"]) and compute_volume_proxy else None
 
     records: List[SnapshotRecord] = []
     for key, ts_norm in zip(sorted_keys, normalized_ts):

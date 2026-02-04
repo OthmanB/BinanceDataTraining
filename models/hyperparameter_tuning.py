@@ -103,12 +103,12 @@ def run_hyperparameter_search(
     config: Dict[str, Any],
     data_object: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
-    hpo_cfg = config.get("hyperparameter_optimization", {})
-    if not isinstance(hpo_cfg, dict) or not hpo_cfg.get("enabled"):
+    hpo_cfg = config["hyperparameter_optimization"]
+    if not bool(hpo_cfg["enabled"]):
         logger.info("Hyperparameter optimization disabled in configuration.")
         return None
 
-    framework = str(hpo_cfg.get("framework"))
+    framework = str(hpo_cfg["framework"])
     if framework != "optuna":
         logger.warning("Only hyperparameter_optimization.framework='optuna' is supported; got %s", framework)
         return None
@@ -141,28 +141,23 @@ def run_hyperparameter_search(
 
         # Adjust MLFlow model logging behavior for this trial without
         # affecting the base configuration used for the final production run.
-        try:
-            mlflow_cfg = trial_config["mlflow"]
-        except Exception:  # noqa: BLE001
-            mlflow_cfg = None
-        else:
-            if not trial_log_models and isinstance(mlflow_cfg, dict):
-                try:
-                    artifact_logging_cfg = mlflow_cfg.get("artifact_logging", {})
-                    artifact_logging_cfg["trained_model"] = False
-                    mlflow_cfg["artifact_logging"] = artifact_logging_cfg
+        mlflow_cfg = trial_config["mlflow"]
+        if not trial_log_models:
+            try:
+                artifact_logging_cfg = mlflow_cfg["artifact_logging"]
+                artifact_logging_cfg["trained_model"] = False
+                mlflow_cfg["artifact_logging"] = artifact_logging_cfg
 
-                    model_registry_cfg = mlflow_cfg.get("model_registry")
-                    if isinstance(model_registry_cfg, dict):
-                        model_registry_cfg["register_model"] = False
-                        mlflow_cfg["model_registry"] = model_registry_cfg
+                model_registry_cfg = mlflow_cfg["model_registry"]
+                model_registry_cfg["register_model"] = False
+                mlflow_cfg["model_registry"] = model_registry_cfg
 
-                    trial_config["mlflow"] = mlflow_cfg
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "Failed to adjust MLFlow logging configuration for HPO trial: %s",
-                        exc,
-                    )
+                trial_config["mlflow"] = mlflow_cfg
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to adjust MLFlow logging configuration for HPO trial: %s",
+                    exc,
+                )
 
         from training.pipeline import run_training_pipeline
 

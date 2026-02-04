@@ -223,8 +223,8 @@ def create_normalizer_from_config(config: Dict[str, Any]) -> Normalizer:
     logger.info(
         "Creating normalizer from config: method=%s, per_asset=%s, fit_on_train_only=%s",
         method,
-        normalization_cfg.get("per_asset"),
-        normalization_cfg.get("fit_on_train_only"),
+        normalization_cfg["per_asset"],
+        normalization_cfg["fit_on_train_only"],
     )
 
     return Normalizer(method=method)

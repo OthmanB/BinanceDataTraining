@@ -21,7 +21,21 @@ def _make_minimal_config(
     input_dim_override: int | None = None,
 ) -> Dict[str, Any]:
     """Create a minimal valid config for model building."""
-    lt_cfg = long_term_cfg if long_term_cfg is not None else {"enabled": False}
+    lt_defaults = {
+        "enabled": False,
+        "windows_days": [7, 30, 90],
+        "resolution_days": 1,
+        "features": ["mean_return", "volatility", "volume_proxy", "skewness"],
+        "summary_method": "mean",
+        "ewma_halflife_days": 7.0,
+        "input_dim": input_dim_override,
+        "dense": {"layers": [32], "dropout_rates": [0.2]},
+    }
+    lt_cfg = dict(lt_defaults)
+    if long_term_cfg is not None:
+        lt_cfg.update(long_term_cfg)
+    if input_dim_override is not None:
+        lt_cfg["input_dim"] = input_dim_override
     
     return {
         "model": {
@@ -315,8 +329,8 @@ class TestLongTermContextHelpers(unittest.TestCase):
         config_enabled = _make_minimal_config(long_term_cfg={"enabled": True})
         self.assertTrue(is_long_term_enabled(config_enabled))
 
-        config_missing = {"model": {}}
-        self.assertFalse(is_long_term_enabled(config_missing))
+        with self.assertRaises(KeyError):
+            is_long_term_enabled({"model": {}})
 
     def test_get_long_term_input_dim(self) -> None:
         """Test get_long_term_input_dim function."""

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import json
 import logging
 from pathlib import Path
@@ -22,6 +22,12 @@ from training.snapshot_dataset import (
     save_normalization_stats,
 )
 from training.snapshot_store import load_or_create_manifest, resolve_snapshot_context, save_manifest
+from training.long_term_context import (
+    compute_long_term_features_for_dataset,
+    is_long_term_enabled,
+    load_anchor_timestamps,
+    load_snapshot_series,
+)
 from preprocessing.snapshot_sequence_builder import (
     build_top_of_book_sequence_tensor,
     build_hybrid_depth_sequence_tensor,
@@ -33,15 +39,13 @@ from .calibration import (
     probs_to_logits_proxy,
     logits_to_calibrated_probs,
 )
-from .temporal_degradation import (
-    compute_temporal_degradation,
-    TemporalDegradationResult,
-)
+from .temporal_degradation import TemporalDegradationResult, WindowMetrics
 
 
 logger = logging.getLogger(__name__)
 
 CALIBRATION_MEMORY_WARN_THRESHOLD = 1_000_000
+BACKTEST_MEMORY_WARN_THRESHOLD = 1_000_000
 
 
 def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, Any]) -> None:
@@ -122,9 +126,9 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
 
     # Map snapshot-level features for the target asset into the evaluation
     # tensor, using the same snapshot index space as the labels.
-    data_cfg = config.get("data", {})
-    asset_pairs_cfg = data_cfg.get("asset_pairs", {})
-    target_asset = str(asset_pairs_cfg.get("target_asset") or "unknown")
+    data_cfg = config["data"]
+    asset_pairs_cfg = data_cfg["asset_pairs"]
+    target_asset = str(asset_pairs_cfg["target_asset"])
     order_books = data_object.get("order_books", {})
     target_book: Dict[str, Any] = order_books.get(target_asset, {})
     snapshot_features: list[Any] = target_book.get("snapshot_features") or []
@@ -133,8 +137,8 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
     eval_indices = test_idx[:eval_n]
     x_eval = None
 
-    order_book_cfg = data_cfg.get("order_book", {})
-    representation = str(order_book_cfg.get("representation", "top_of_book"))
+    order_book_cfg = data_cfg["order_book"]
+    representation = str(order_book_cfg["representation"])
 
     anchor_indices = metadata.get("anchor_indices")
     if anchor_indices is None:
@@ -261,8 +265,8 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
 
     # Optionally integrate feature engineering derived features into the input
     # channels, mirroring the training pipeline behavior.
-    fe_cfg = config["preprocessing"].get("feature_engineering", {})
-    if isinstance(fe_cfg, dict) and fe_cfg.get("enabled"):
+    fe_cfg = config["preprocessing"]["feature_engineering"]
+    if bool(fe_cfg["enabled"]):
         try:
             feature_engineer = FeatureEngineer(config)
 
@@ -316,12 +320,8 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
     # Optionally integrate temporal features into the evaluation input channels
     # according to the model.input_representation.temporal_features
     # configuration.
-    ir_cfg = model_cfg.get("input_representation")
-    if ir_cfg is None:
-        raise ValueError("model.input_representation must be defined in configuration")
-    tf_cfg = ir_cfg.get("temporal_features")
-    if tf_cfg is None:
-        raise ValueError("model.input_representation.temporal_features must be defined in configuration")
+    ir_cfg = model_cfg["input_representation"]
+    tf_cfg = ir_cfg["temporal_features"]
 
     integration_mode = str(tf_cfg["integration_mode"])
     use_local = bool(tf_cfg["use_local_features"])
@@ -640,9 +640,9 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
 
     # Optional confusion matrix artifact logging.
     try:
-        mlflow_cfg = config.get("mlflow", {})
-        artifact_logging_cfg = mlflow_cfg.get("artifact_logging", {})
-        log_confusion = bool(artifact_logging_cfg.get("confusion_matrix"))
+        mlflow_cfg = config["mlflow"]
+        artifact_logging_cfg = mlflow_cfg["artifact_logging"]
+        log_confusion = bool(artifact_logging_cfg["confusion_matrix"])
     except Exception:  # noqa: BLE001
         log_confusion = False
 
@@ -712,8 +712,8 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
             logger.warning("Failed to log calibration curve artifacts to MLFlow: %s", exc)
 
     # Backtesting integration
-    backtest_cfg = eval_cfg.get("backtesting", {})
-    if backtest_cfg.get("enabled", False):
+    backtest_cfg = eval_cfg["backtesting"]
+    if bool(backtest_cfg["enabled"]):
         try:
             from .backtesting import run_backtest, log_backtest_to_mlflow
 
@@ -731,12 +731,9 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
                     for idx in eval_indices
                 ])
 
-                # Calculate horizon steps from config
-                time_range_cfg = data_cfg.get("time_range", {})
-                cadence_seconds = int(time_range_cfg.get("cadence_seconds", 10))
-                targets_cfg = config.get("targets", {})
-                prediction_horizon_seconds = int(targets_cfg.get("prediction_horizon_seconds", 1800))
-                horizon_steps = prediction_horizon_seconds // cadence_seconds if cadence_seconds > 0 else 180
+                horizon_steps = int(backtest_cfg["horizon_steps"])
+                if horizon_steps <= 0:
+                    raise ValueError("evaluation.backtesting.horizon_steps must be positive")
 
                 # Run backtest
                 backtest_result = run_backtest(
@@ -802,6 +799,38 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
     if num_classes <= 1:
         raise ValueError("model.output.num_classes must be >= 2 for evaluation")
 
+    long_term_features: Optional[np.ndarray] = None
+    long_term_enabled = is_long_term_enabled(config)
+    if long_term_enabled:
+        cadence_seconds = int(config["data"]["time_range"]["cadence_seconds"])
+        long_term_features = compute_long_term_features_for_dataset(
+            config,
+            snapshot_dataset,
+            cadence_seconds=cadence_seconds,
+        )
+        if long_term_features is None:
+            raise ValueError("Long-term features enabled but computation returned None")
+        if long_term_features.shape[0] != n_samples:
+            raise ValueError(
+                "Long-term feature rows do not match snapshot dataset sample count: "
+                f"features={long_term_features.shape[0]}, samples={n_samples}"
+            )
+
+    try:
+        input_count = len(getattr(model, "inputs", []))
+    except Exception:
+        input_count = 1
+    if long_term_features is not None and input_count != 2:
+        raise ValueError(
+            "Long-term features are enabled but model does not expose two inputs. "
+            "Disable model.long_term or rebuild the model with dual inputs."
+        )
+    if long_term_features is None and input_count == 2:
+        raise ValueError(
+            "Model expects long-term inputs but model.long_term is disabled. "
+            "Enable model.long_term and rebuild the snapshot dataset."
+        )
+
     context = resolve_snapshot_context(config)
     manifest = load_or_create_manifest(context, config)
 
@@ -855,12 +884,89 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
     post_hoc_cfg = eval_cfg["post_hoc_calibration"]
     post_hoc_enabled = bool(post_hoc_cfg["enabled"])
 
+    long_term_test_features: Optional[np.ndarray] = None
+    if long_term_features is not None:
+        long_term_test_features = long_term_features[test_start:test_end]
+        if long_term_test_features.shape[0] != (test_end - test_start):
+            raise ValueError(
+                "Long-term feature slice does not match test range length: "
+                f"features={long_term_test_features.shape[0]}, expected={test_end - test_start}"
+            )
+
+    backtest_cfg = eval_cfg["backtesting"]
+    backtest_enabled = bool(backtest_cfg["enabled"])
+    backtest_horizon_steps = int(backtest_cfg["horizon_steps"])
+    if backtest_enabled and backtest_horizon_steps <= 0:
+        raise ValueError("evaluation.backtesting.horizon_steps must be positive")
+
+    backtest_prices: Optional[np.ndarray] = None
+    backtest_timestamps: Optional[np.ndarray] = None
+    backtest_prob_up_parts: List[np.ndarray] = []
+    backtest_prob_down_parts: List[np.ndarray] = []
+
+    def _map_anchor_timestamps_to_prices(
+        series_timestamps: np.ndarray,
+        series_prices: np.ndarray,
+        anchor_timestamps: np.ndarray,
+    ) -> np.ndarray:
+        if series_timestamps.ndim != 1 or series_prices.ndim != 1:
+            raise ValueError("Series timestamps and prices must be 1D arrays")
+        if series_timestamps.shape[0] != series_prices.shape[0]:
+            raise ValueError("Series timestamps and prices length mismatch")
+        if series_timestamps.shape[0] == 0:
+            raise ValueError("Series timestamps are empty; cannot map anchor timestamps")
+        if anchor_timestamps.ndim != 1:
+            raise ValueError("Anchor timestamps must be a 1D array")
+
+        if np.any(series_timestamps[1:] < series_timestamps[:-1]):
+            raise ValueError("Series timestamps must be sorted in ascending order")
+
+        indices = np.searchsorted(series_timestamps, anchor_timestamps)
+        valid = indices < series_timestamps.shape[0]
+        matches = np.zeros_like(valid, dtype=bool)
+        if np.any(valid):
+            matches[valid] = series_timestamps[indices[valid]] == anchor_timestamps[valid]
+        invalid = ~valid | ~matches
+        if np.any(invalid):
+            missing_count = int(np.sum(invalid))
+            raise ValueError(
+                "Anchor timestamps do not align with series timestamps: "
+                f"missing={missing_count}, total={anchor_timestamps.shape[0]}"
+            )
+
+        return series_prices[indices]
+
+    if backtest_enabled:
+        series_timestamps, series_mid_prices, _ = load_snapshot_series(snapshot_dataset)
+        anchor_timestamps = load_anchor_timestamps(snapshot_dataset)
+        if anchor_timestamps.shape[0] != n_samples:
+            raise ValueError(
+                "Anchor timestamps length does not match snapshot dataset sample count: "
+                f"anchors={anchor_timestamps.shape[0]}, samples={n_samples}"
+            )
+
+        price_by_anchor = _map_anchor_timestamps_to_prices(
+            series_timestamps.astype("int64"),
+            series_mid_prices.astype("float64"),
+            anchor_timestamps.astype("int64"),
+        )
+        backtest_prices = price_by_anchor[test_start:test_end]
+        backtest_timestamps = anchor_timestamps[test_start:test_end]
+        if backtest_prices.shape[0] != (test_end - test_start):
+            raise ValueError("Backtesting price slice does not match test range length")
+
+        if backtest_prices.shape[0] > BACKTEST_MEMORY_WARN_THRESHOLD:
+            logger.warning(
+                "Backtesting will buffer %s samples in memory; consider reducing evaluation range",
+                backtest_prices.shape[0],
+            )
+
     # Temporal degradation configuration
     temporal_cfg = eval_cfg["temporal_degradation"]
     temporal_enabled = bool(temporal_cfg["enabled"])
     temporal_num_windows = int(temporal_cfg["num_windows"])
     temporal_overlap = float(temporal_cfg["overlap_fraction"])
-    temporal_log_per_window = bool(temporal_cfg.get("log_per_window_metrics", True))
+    temporal_log_per_window = bool(temporal_cfg["log_per_window_metrics"])
 
     if temporal_enabled:
         if temporal_num_windows < 1:
@@ -895,20 +1001,53 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
     temperature_down: Optional[float] = None
     calibration_fit_summary: Optional[Dict[str, Any]] = None
 
-    # Temporal degradation prediction collection (only if enabled to save memory)
-    temporal_y_true_up: list = [] if temporal_enabled else []
-    temporal_y_true_down: list = [] if temporal_enabled else []
-    temporal_y_pred_up: list = [] if temporal_enabled else []
-    temporal_y_pred_down: list = [] if temporal_enabled else []
+    temporal_windows: list[Tuple[int, int]] = []
+    temporal_confusions_up: list[np.ndarray] = []
+    temporal_confusions_down: list[np.ndarray] = []
+    temporal_counts: list[int] = []
+
+    if temporal_enabled:
+        total_samples = test_end - test_start
+        if total_samples <= 0:
+            raise ValueError("Temporal degradation requires at least one evaluation sample")
+
+        if temporal_num_windows == 1:
+            window_size = total_samples
+            step_size = total_samples
+        else:
+            effective_units = 1 + (temporal_num_windows - 1) * (1 - temporal_overlap)
+            window_size = int(np.ceil(total_samples / effective_units))
+            step_size = int(window_size * (1 - temporal_overlap))
+            step_size = max(1, step_size)
+
+        for i in range(temporal_num_windows):
+            start_idx = i * step_size
+            end_idx = min(start_idx + window_size, total_samples)
+            if start_idx >= total_samples:
+                break
+            temporal_windows.append((start_idx, end_idx))
+            temporal_confusions_up.append(np.zeros((num_classes, num_classes), dtype=np.int64))
+            temporal_confusions_down.append(np.zeros((num_classes, num_classes), dtype=np.int64))
+            temporal_counts.append(0)
 
     def _collect_calibration_predictions(
         start_index: int,
         end_index: int,
+        lt_features: Optional[np.ndarray],
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         probs_up_parts = []
         probs_down_parts = []
         labels_up_parts = []
         labels_down_parts = []
+
+        expected_len = end_index - start_index
+        if lt_features is not None and lt_features.shape[0] != expected_len:
+            raise ValueError(
+                "Long-term feature slice length does not match calibration range: "
+                f"features={lt_features.shape[0]}, expected={expected_len}"
+            )
+
+        current_idx = 0
 
         for x_chunk, y_up_chunk, y_down_chunk, _ in iter_snapshot_batches(
             snapshot_dataset, start_index, end_index
@@ -921,7 +1060,16 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
                 y_true_up = y_up_chunk[offset : offset + batch_size]
                 y_true_down = y_down_chunk[offset : offset + batch_size]
 
-                y_pred = model.predict(x_batch, batch_size=batch_size, verbose=0)
+                model_input: Any
+                if lt_features is not None:
+                    lt_batch = lt_features[current_idx : current_idx + x_batch.shape[0]]
+                    if lt_batch.shape[0] != x_batch.shape[0]:
+                        raise ValueError("Long-term feature batch size mismatch during calibration")
+                    model_input = [x_batch, lt_batch]
+                else:
+                    model_input = x_batch
+
+                y_pred = model.predict(model_input, batch_size=batch_size, verbose=0)
                 if not isinstance(y_pred, (list, tuple)) or len(y_pred) != 2:
                     raise ValueError("Expected model.predict to return two outputs for two_head_intensity")
 
@@ -936,6 +1084,8 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
                 probs_down_parts.append(y_prob_down)
                 labels_up_parts.append(np.asarray(y_true_up, dtype="int64"))
                 labels_down_parts.append(np.asarray(y_true_down, dtype="int64"))
+
+                current_idx += x_batch.shape[0]
 
         if not probs_up_parts:
             raise ValueError("No predictions collected for post-hoc calibration fitting")
@@ -982,9 +1132,14 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
                 fit_count,
             )
 
+        long_term_fit_features: Optional[np.ndarray] = None
+        if long_term_features is not None:
+            long_term_fit_features = long_term_features[fit_start:fit_end]
+
         probs_up_fit, probs_down_fit, labels_up_fit, labels_down_fit = _collect_calibration_predictions(
             fit_start,
             fit_end,
+            long_term_fit_features,
         )
 
         fit_samples = int(probs_up_fit.shape[0])
@@ -1027,6 +1182,8 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
             "down": scaler_down.to_dict(),
         }
 
+    sample_offset = 0
+
     for x_chunk, y_up_chunk, y_down_chunk, _ in iter_snapshot_batches(
         snapshot_dataset, test_start, test_end
     ):
@@ -1038,7 +1195,16 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
             y_true_up = y_up_chunk[offset : offset + batch_size]
             y_true_down = y_down_chunk[offset : offset + batch_size]
 
-            y_pred = model.predict(x_batch, batch_size=batch_size, verbose=0)
+            model_input: Any
+            if long_term_test_features is not None:
+                lt_batch = long_term_test_features[sample_offset : sample_offset + x_batch.shape[0]]
+                if lt_batch.shape[0] != x_batch.shape[0]:
+                    raise ValueError("Long-term feature batch size mismatch during evaluation")
+                model_input = [x_batch, lt_batch]
+            else:
+                model_input = x_batch
+
+            y_pred = model.predict(model_input, batch_size=batch_size, verbose=0)
             if not isinstance(y_pred, (list, tuple)) or len(y_pred) != 2:
                 raise ValueError("Expected model.predict to return two outputs for two_head_intensity")
 
@@ -1059,12 +1225,35 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
             np.add.at(confusion_up, (y_true_up, y_pred_up), 1)
             np.add.at(confusion_down, (y_true_down, y_pred_down), 1)
 
-            # Collect predictions for temporal degradation analysis
-            if temporal_enabled:
-                temporal_y_true_up.append(np.asarray(y_true_up, dtype="int64"))
-                temporal_y_true_down.append(np.asarray(y_true_down, dtype="int64"))
-                temporal_y_pred_up.append(y_pred_up)
-                temporal_y_pred_down.append(y_pred_down)
+            batch_start = sample_offset
+            batch_end = batch_start + y_true_up.shape[0]
+
+            if temporal_enabled and temporal_windows:
+                for window_index, (win_start, win_end) in enumerate(temporal_windows):
+                    overlap_start = max(win_start, batch_start)
+                    overlap_end = min(win_end, batch_end)
+                    if overlap_start >= overlap_end:
+                        continue
+
+                    local_start = overlap_start - batch_start
+                    local_end = overlap_end - batch_start
+
+                    y_true_up_slice = y_true_up[local_start:local_end]
+                    y_pred_up_slice = y_pred_up[local_start:local_end]
+                    y_true_down_slice = y_true_down[local_start:local_end]
+                    y_pred_down_slice = y_pred_down[local_start:local_end]
+
+                    np.add.at(
+                        temporal_confusions_up[window_index],
+                        (y_true_up_slice, y_pred_up_slice),
+                        1,
+                    )
+                    np.add.at(
+                        temporal_confusions_down[window_index],
+                        (y_true_down_slice, y_pred_down_slice),
+                        1,
+                    )
+                    temporal_counts[window_index] += int(local_end - local_start)
 
             y_true_up_onehot = np.eye(num_classes, dtype="float64")[y_true_up]
             y_true_down_onehot = np.eye(num_classes, dtype="float64")[y_true_down]
@@ -1097,6 +1286,9 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
                 down_conf_sum += down_bins[0]
                 down_acc_sum += down_bins[1]
                 down_bin_count += down_bins[2]
+
+            y_prob_up_cal: Optional[np.ndarray] = None
+            y_prob_down_cal: Optional[np.ndarray] = None
 
             if post_hoc_enabled:
                 if temperature_up is None or temperature_down is None:
@@ -1138,6 +1330,18 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
                 down_conf_sum_cal += down_bins_cal[0]
                 down_acc_sum_cal += down_bins_cal[1]
                 down_bin_count_cal += down_bins_cal[2]
+
+            if backtest_enabled:
+                if post_hoc_enabled:
+                    if y_prob_up_cal is None or y_prob_down_cal is None:
+                        raise ValueError("Backtesting requires calibrated probabilities but none were produced")
+                    backtest_prob_up_parts.append(y_prob_up_cal)
+                    backtest_prob_down_parts.append(y_prob_down_cal)
+                else:
+                    backtest_prob_up_parts.append(y_prob_up)
+                    backtest_prob_down_parts.append(y_prob_down)
+
+            sample_offset += int(y_true_up.shape[0])
 
     if total_eval <= 0:
         logger.info("Snapshot evaluation found no samples after batching; skipping.")
@@ -1195,6 +1399,34 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
             down_brier_sum_cal,
             down_count_cal,
         )
+
+    if backtest_enabled:
+        if backtest_prices is None or backtest_timestamps is None:
+            raise ValueError("Backtesting is enabled but price data is missing")
+        if not backtest_prob_up_parts or not backtest_prob_down_parts:
+            raise ValueError("Backtesting is enabled but no probabilities were collected")
+
+        backtest_prob_up = np.concatenate(backtest_prob_up_parts, axis=0)
+        backtest_prob_down = np.concatenate(backtest_prob_down_parts, axis=0)
+
+        expected_len = backtest_prices.shape[0]
+        if backtest_prob_up.shape[0] != expected_len or backtest_prob_down.shape[0] != expected_len:
+            raise ValueError(
+                "Backtesting probability length mismatch: "
+                f"up={backtest_prob_up.shape[0]}, down={backtest_prob_down.shape[0]}, expected={expected_len}"
+            )
+
+        from .backtesting import log_backtest_to_mlflow, run_backtest
+
+        backtest_result = run_backtest(
+            config=config,
+            y_prob_up=backtest_prob_up,
+            y_prob_down=backtest_prob_down,
+            prices=backtest_prices,
+            horizon_steps=backtest_horizon_steps,
+            timestamps=backtest_timestamps,
+        )
+        log_backtest_to_mlflow(backtest_result)
 
     logger.info(
         "Snapshot evaluation metrics. eval_n=%s, up_accuracy=%s, down_accuracy=%s, "
@@ -1274,9 +1506,9 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
 
     # Optional confusion matrix artifact logging.
     try:
-        mlflow_cfg = config.get("mlflow", {})
-        artifact_logging_cfg = mlflow_cfg.get("artifact_logging", {})
-        log_confusion = bool(artifact_logging_cfg.get("confusion_matrix"))
+        mlflow_cfg = config["mlflow"]
+        artifact_logging_cfg = mlflow_cfg["artifact_logging"]
+        log_confusion = bool(artifact_logging_cfg["confusion_matrix"])
     except Exception:  # noqa: BLE001
         log_confusion = False
 
@@ -1332,38 +1564,129 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
     # Temporal degradation analysis
     if temporal_enabled:
         try:
-            if not temporal_y_true_up or not temporal_y_pred_up:
-                logger.warning(
-                    "Temporal degradation enabled but no predictions collected; skipping analysis."
-                )
+            if not temporal_windows:
+                logger.warning("Temporal degradation enabled but no windows were computed; skipping analysis.")
             else:
-                all_y_true_up = np.concatenate(temporal_y_true_up, axis=0)
-                all_y_pred_up = np.concatenate(temporal_y_pred_up, axis=0)
-                all_y_true_down = np.concatenate(temporal_y_true_down, axis=0)
-                all_y_pred_down = np.concatenate(temporal_y_pred_down, axis=0)
+                expected_samples = test_end - test_start
+                if sample_offset != expected_samples:
+                    logger.warning(
+                        "Temporal degradation processed %s samples but expected %s.",
+                        sample_offset,
+                        expected_samples,
+                    )
 
-                logger.info(
-                    "Computing temporal degradation analysis: num_windows=%d, overlap=%.2f, samples=%d",
-                    temporal_num_windows,
-                    temporal_overlap,
-                    len(all_y_true_up),
-                )
+                def _build_window_metrics(
+                    confusion: np.ndarray,
+                    sample_count: int,
+                    window_index: int,
+                    start_index: int,
+                    end_index: int,
+                ) -> WindowMetrics:
+                    if sample_count <= 0:
+                        return WindowMetrics(
+                            window_index=window_index,
+                            start_index=start_index,
+                            end_index=end_index,
+                            accuracy=0.0,
+                            precision_macro=0.0,
+                            recall_macro=0.0,
+                            f1_macro=0.0,
+                            num_samples=0,
+                            per_class_accuracy=[],
+                        )
 
-                temporal_result_up = compute_temporal_degradation(
-                    all_y_true_up,
-                    all_y_pred_up,
-                    num_classes=num_classes,
-                    num_windows=temporal_num_windows,
-                    overlap_fraction=temporal_overlap,
-                )
+                    accuracy = float(np.trace(confusion) / float(sample_count))
+                    per_class_precision, per_class_recall, per_class_f1 = _compute_class_metrics(confusion)
 
-                temporal_result_down = compute_temporal_degradation(
-                    all_y_true_down,
-                    all_y_pred_down,
-                    num_classes=num_classes,
-                    num_windows=temporal_num_windows,
-                    overlap_fraction=temporal_overlap,
-                )
+                    precision_macro = float(np.mean(per_class_precision)) if per_class_precision else 0.0
+                    recall_macro = float(np.mean(per_class_recall)) if per_class_recall else 0.0
+                    f1_macro = float(np.mean(per_class_f1)) if per_class_f1 else 0.0
+
+                    per_class_accuracy = []
+                    for cls in range(num_classes):
+                        class_total = float(confusion[cls, :].sum())
+                        class_acc = float(confusion[cls, cls] / class_total) if class_total > 0 else 0.0
+                        per_class_accuracy.append(class_acc)
+
+                    return WindowMetrics(
+                        window_index=window_index,
+                        start_index=start_index,
+                        end_index=end_index,
+                        accuracy=accuracy,
+                        precision_macro=precision_macro,
+                        recall_macro=recall_macro,
+                        f1_macro=f1_macro,
+                        num_samples=sample_count,
+                        per_class_accuracy=per_class_accuracy,
+                    )
+
+                def _build_temporal_result(
+                    window_metrics: list[WindowMetrics],
+                ) -> TemporalDegradationResult:
+                    if not window_metrics:
+                        return TemporalDegradationResult(
+                            window_metrics=[],
+                            overall_trend=0.0,
+                            degradation_rate=0.0,
+                            first_window_accuracy=0.0,
+                            last_window_accuracy=0.0,
+                            total_degradation=0.0,
+                        )
+
+                    accuracies = [w.accuracy for w in window_metrics]
+                    first_acc = accuracies[0]
+                    last_acc = accuracies[-1]
+                    total_degradation = first_acc - last_acc
+
+                    if len(accuracies) > 1:
+                        x = np.arange(len(accuracies), dtype="float64")
+                        y = np.array(accuracies, dtype="float64")
+
+                        x_mean = np.mean(x)
+                        y_mean = np.mean(y)
+                        numerator = np.sum((x - x_mean) * (y - y_mean))
+                        denominator = np.sum((x - x_mean) ** 2)
+
+                        slope = float(numerator / denominator) if denominator > 0 else 0.0
+                        degradation_rate = -slope
+                    else:
+                        slope = 0.0
+                        degradation_rate = 0.0
+
+                    return TemporalDegradationResult(
+                        window_metrics=window_metrics,
+                        overall_trend=slope,
+                        degradation_rate=degradation_rate,
+                        first_window_accuracy=first_acc,
+                        last_window_accuracy=last_acc,
+                        total_degradation=total_degradation,
+                    )
+
+                window_metrics_up = []
+                window_metrics_down = []
+
+                for window_index, (win_start, win_end) in enumerate(temporal_windows):
+                    window_metrics_up.append(
+                        _build_window_metrics(
+                            temporal_confusions_up[window_index],
+                            temporal_counts[window_index],
+                            window_index,
+                            win_start,
+                            win_end,
+                        )
+                    )
+                    window_metrics_down.append(
+                        _build_window_metrics(
+                            temporal_confusions_down[window_index],
+                            temporal_counts[window_index],
+                            window_index,
+                            win_start,
+                            win_end,
+                        )
+                    )
+
+                temporal_result_up = _build_temporal_result(window_metrics_up)
+                temporal_result_down = _build_temporal_result(window_metrics_down)
 
                 # Log summary metrics to MLflow
                 mlflow.log_metric("temporal_up_total_degradation", temporal_result_up.total_degradation)
@@ -1401,7 +1724,7 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
                     "config": {
                         "num_windows": temporal_num_windows,
                         "overlap_fraction": temporal_overlap,
-                        "total_samples": len(all_y_true_up),
+                        "total_samples": expected_samples,
                     },
                 }
                 with temporal_path.open("w", encoding="utf-8") as f:

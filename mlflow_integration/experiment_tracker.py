@@ -81,10 +81,10 @@ def start_run(config: Dict[str, Any], run_name: Optional[str] = None):
         The active MLFlow run object.
     """
 
-    mlflow_cfg = config.get("mlflow", {})
-    tracking_uri = mlflow_cfg.get("tracking_uri")
-    experiment_name = mlflow_cfg.get("experiment_name")
-    local_tmp_dir = mlflow_cfg.get("local_tmp_dir")
+    mlflow_cfg = config["mlflow"]
+    tracking_uri = mlflow_cfg["tracking_uri"]
+    experiment_name = mlflow_cfg["experiment_name"]
+    local_tmp_dir = mlflow_cfg["local_tmp_dir"]
 
     if not tracking_uri:
         raise ValueError("mlflow.tracking_uri must be set in configuration")
@@ -151,21 +151,21 @@ def start_run(config: Dict[str, Any], run_name: Optional[str] = None):
         logger.warning("Failed to write configuration snapshot for MLFlow logging: %s", exc)
 
     # Log a few high-level configuration parameters for convenience.
-    data_cfg = config.get("data", {})
-    asset_pairs_cfg = data_cfg.get("asset_pairs", {})
-    model_cfg = config.get("model", {})
-    compilation_cfg = model_cfg.get("compilation", {})
-    training_cfg = config.get("training", {})
+    data_cfg = config["data"]
+    asset_pairs_cfg = data_cfg["asset_pairs"]
+    model_cfg = config["model"]
+    compilation_cfg = model_cfg["compilation"]
+    training_cfg = config["training"]
 
     params = {
-        "target_asset": asset_pairs_cfg.get("target_asset"),
-        "model_architecture": model_cfg.get("architecture"),
-        "training_epochs": training_cfg.get("epochs"),
-        "training_batch_size": training_cfg.get("batch_size"),
-        "training_debug_max_samples": training_cfg.get("debug_max_samples"),
-        "optimizer": compilation_cfg.get("optimizer"),
-        "learning_rate": compilation_cfg.get("learning_rate"),
-        "loss_function": compilation_cfg.get("loss"),
+        "target_asset": asset_pairs_cfg["target_asset"],
+        "model_architecture": model_cfg["architecture"],
+        "training_epochs": training_cfg["epochs"],
+        "training_batch_size": training_cfg["batch_size"],
+        "training_debug_max_samples": training_cfg["debug_max_samples"],
+        "optimizer": compilation_cfg["optimizer"],
+        "learning_rate": compilation_cfg["learning_rate"],
+        "loss_function": compilation_cfg["loss"],
     }
 
     for name, value in params.items():
