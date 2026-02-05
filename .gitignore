@@ -75,6 +75,7 @@ checkpoints/
 data/raw/
 data/processed/
 data/cached/
+snapshots/
 *.npz
 *.npy
 *.parquet
