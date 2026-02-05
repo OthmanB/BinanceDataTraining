@@ -12,8 +12,8 @@ from .config_loader import ConfigError
 
 
 def _get_required_env_vars(config: Dict[str, Any]) -> List[str]:
-    security = config.get("security", {})
-    env_list = security.get("environment_variables", [])
+    security = config["security"]
+    env_list = security["environment_variables"]
     if not isinstance(env_list, list):
         raise ConfigError("security.environment_variables must be a list")
     return [str(v) for v in env_list]
@@ -27,11 +27,11 @@ def validate_environment(config: Dict[str, Any]) -> None:
     - security.validation.fail_if_missing
     """
 
-    security = config.get("security", {})
-    validation_cfg = security.get("validation", {})
+    security = config["security"]
+    validation_cfg = security["validation"]
 
-    check_at_start = bool(validation_cfg.get("check_env_vars_at_startup", True))
-    fail_if_missing = bool(validation_cfg.get("fail_if_missing", True))
+    check_at_start = bool(validation_cfg["check_env_vars_at_startup"])
+    fail_if_missing = bool(validation_cfg["fail_if_missing"])
 
     if not check_at_start:
         return

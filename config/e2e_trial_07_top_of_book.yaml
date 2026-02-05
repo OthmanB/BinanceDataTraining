@@ -1,0 +1,51 @@
+base_config: "training_config.yaml"
+
+run_mode:
+  mode: "production"
+
+data:
+  time_range:
+    start_date: "2024-01-01"
+    end_date: "2024-01-08"
+  asset_pairs:
+    correlated_assets: []
+  order_book:
+    representation: "top_of_book"
+  validation:
+    fail_on_invalid: false
+    max_gap_seconds: 600
+
+preprocessing:
+  feature_engineering:
+    enabled: false
+
+training:
+  epochs: 1
+  batch_size: 8
+  debug_max_samples: 100000
+
+hyperparameter_optimization:
+  enabled: false
+
+snapshot:
+  root_name: "e2e_trials_v2"
+  name: "trial_07_top_of_book_v2"
+
+evaluation:
+  calibration_analysis:
+    enabled: false
+  post_hoc_calibration:
+    enabled: false
+  temporal_degradation:
+    enabled: false
+  backtesting:
+    enabled: false
+
+mlflow:
+  artifact_logging:
+    trained_model: false
+  model_registry:
+    register_model: false
+
+diagnostics:
+  enabled: false

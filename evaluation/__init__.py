@@ -1,5 +1,56 @@
-"""Evaluation utilities for Binance ML Training Platform (skeleton)."""
+"""Evaluation utilities for Binance ML Training Platform.
 
-from .evaluator import evaluate_model
+This module provides:
+- evaluate_model: Evaluate a trained model on test data
+- evaluate_snapshot_model: Evaluate using snapshot datasets
+- calibration: Post-hoc calibration utilities (temperature scaling)
+- temporal_degradation: Temporal degradation analysis utilities
+- backtesting: Simulated trading performance evaluation
+"""
 
-__all__ = ["evaluate_model"]
+from .evaluator import evaluate_model, evaluate_snapshot_model
+from .calibration import (
+    compute_calibration_metrics,
+    probs_to_logits_proxy,
+    TemperatureScaler,
+    apply_temperature_scaling,
+    logits_to_calibrated_probs,
+    fit_temperature,
+)
+from .temporal_degradation import (
+    WindowMetrics,
+    TemporalDegradationResult,
+    compute_window_metrics,
+    compute_temporal_degradation,
+    evaluate_temporal_degradation_from_generator,
+)
+from .backtesting import (
+    BacktestError,
+    BacktestConfig,
+    Trade,
+    BacktestResult,
+    run_backtest,
+    log_backtest_to_mlflow,
+)
+
+__all__ = [
+    "evaluate_model",
+    "evaluate_snapshot_model",
+    "compute_calibration_metrics",
+    "probs_to_logits_proxy",
+    "TemperatureScaler",
+    "apply_temperature_scaling",
+    "logits_to_calibrated_probs",
+    "fit_temperature",
+    "WindowMetrics",
+    "TemporalDegradationResult",
+    "compute_window_metrics",
+    "compute_temporal_degradation",
+    "evaluate_temporal_degradation_from_generator",
+    "BacktestError",
+    "BacktestConfig",
+    "Trade",
+    "BacktestResult",
+    "run_backtest",
+    "log_backtest_to_mlflow",
+]

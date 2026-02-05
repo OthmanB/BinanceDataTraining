@@ -28,6 +28,18 @@ def _load_yaml_file(path: str) -> Any:
             raise ConfigError(f"Failed to parse YAML file {path}: {exc}") from exc
 
 
+def _deep_merge(base: Any, override: Any) -> Any:
+    if isinstance(base, dict) and isinstance(override, dict):
+        merged = dict(base)
+        for key, value in override.items():
+            if key in merged:
+                merged[key] = _deep_merge(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+    return override
+
+
 def _resolve_env_placeholders(obj: Any) -> Any:
     """Recursively resolve ${VAR} placeholders in strings using environment variables."""
 
@@ -125,6 +137,18 @@ def load_config(
     """
 
     raw_config = _load_yaml_file(config_path)
+    if "base_config" in raw_config:
+        base_config_path = raw_config["base_config"]
+        if not isinstance(base_config_path, str) or not base_config_path:
+            raise ConfigError("base_config must be a non-empty string path")
+        if not os.path.isabs(base_config_path):
+            base_config_path = os.path.join(
+                os.path.dirname(os.path.abspath(config_path)),
+                base_config_path,
+            )
+        base_config = _load_yaml_file(base_config_path)
+        override_config = {k: v for k, v in raw_config.items() if k != "base_config"}
+        raw_config = _deep_merge(base_config, override_config)
     schema = _load_yaml_file(schema_path)
 
     # Resolve environment placeholders before type checking

@@ -6,6 +6,7 @@ required_sections:
   - preprocessing
   - model
   - training
+  - snapshot
   - hyperparameter_optimization
   - mlflow
   - evaluation
@@ -24,6 +25,14 @@ sections:
         type: string
       connection.table_prefix:
         type: string
+      connection.request_timeout_seconds:
+        type: integer
+      connection.connect_timeout_seconds:
+        type: integer
+      connection.max_retries:
+        type: integer
+      connection.retry_backoff_factor:
+        type: number
       multi_database.enabled:
         type: boolean
       multi_database.strategy:
@@ -34,7 +43,21 @@ sections:
         type: string
       asset_pairs.correlated_assets:
         type: list
+      asset_pairs.alignment.method:
+        type: string
+      asset_pairs.alignment.missing_policy:
+        type: string
+      asset_pairs.alignment.max_gap_seconds:
+        type: integer
+      asset_pairs.alignment.bucket_tolerance_seconds:
+        type: number
+      asset_pairs.alignment.include_mask_channel:
+        type: boolean
       ingestion.chunk_hours:
+        type: integer
+      ingestion.chunk_delay_seconds:
+        type: number
+      ingestion.max_concurrent_chunk_fetches:
         type: integer
       time_range.start_date:
         type: string
@@ -45,6 +68,12 @@ sections:
       order_book.depth_levels:
         type: integer
       order_book.representation:
+        type: string
+      order_book.hybrid.raw_levels:
+        type: integer
+      order_book.hybrid.aggregated_bins:
+        type: integer
+      order_book.hybrid.bin_strategy:
         type: string
       order_book.schema.timestamp_column:
         type: string
@@ -103,6 +132,20 @@ sections:
         type: boolean
       normalization.fit_on_train_only:
         type: boolean
+      feature_engineering.enabled:
+        type: boolean
+      feature_engineering.order_book_features:
+        type: list
+      feature_engineering.derived_features:
+        type: list
+      feature_engineering.momentum_window_seconds:
+        type: integer
+      feature_engineering.volume_proxy_method:
+        type: string
+      feature_engineering.edge_decay.enabled:
+        type: boolean
+      feature_engineering.edge_decay.method:
+        type: string
       train_test_split.method:
         type: string
       train_test_split.train_ratio:
@@ -135,8 +178,26 @@ sections:
         type: boolean
       cnn.num_layers:
         type: integer
+      cnn.filters:
+        type: list
+      cnn.kernel_sizes:
+        type: list
+      cnn.pool_sizes:
+        type: list
+      cnn.activation:
+        type: string
+      cnn.dropout_rates:
+        type: list
       lstm.units:
         type: integer
+      lstm.dropout:
+        type: number
+      lstm.recurrent_dropout:
+        type: number
+      dense.layers:
+        type: list
+      dense.dropout_rates:
+        type: list
       output.type:
         type: string
       output.num_classes:
@@ -149,6 +210,26 @@ sections:
         type: number
       compilation.loss:
         type: string
+      compilation.metrics:
+        type: any
+      long_term.enabled:
+        type: boolean
+      long_term.windows_days:
+        type: list
+      long_term.resolution_days:
+        type: integer
+      long_term.features:
+        type: list
+      long_term.summary_method:
+        type: string
+      long_term.ewma_halflife_days:
+        type: number
+      long_term.input_dim:
+        type: any
+      long_term.dense.layers:
+        type: list
+      long_term.dense.dropout_rates:
+        type: list
 
   training:
     type: dict
@@ -195,6 +276,14 @@ sections:
         type: any
       fine_tuning.base_model_stage:
         type: string
+      fine_tuning.use_model_registry:
+        type: boolean
+      fine_tuning.registry_name:
+        type: any
+      fine_tuning.freeze_layers:
+        type: string
+      fine_tuning.learning_rate_factor:
+        type: number
       dataset_cache.enabled:
         type: boolean
       dataset_cache.directory:
@@ -203,6 +292,22 @@ sections:
         type: string
       dataset_cache.version:
         type: string
+
+  snapshot:
+    type: dict
+    required_keys:
+      enabled:
+        type: boolean
+      directory:
+        type: string
+      root_name:
+        type: string
+      name:
+        type: string
+      on_config_mismatch:
+        type: string
+      max_snapshots:
+        type: integer
 
   hyperparameter_optimization:
     type: dict
@@ -231,8 +336,24 @@ sections:
         type: string
       local_tmp_dir:
         type: string
+      run_naming.pattern:
+        type: string
       artifact_logging.trained_model:
         type: boolean
+      artifact_logging.model_architecture_plot:
+        type: boolean
+      artifact_logging.training_plots:
+        type: boolean
+      artifact_logging.confusion_matrix:
+        type: boolean
+      artifact_logging.class_distribution:
+        type: boolean
+      artifact_logging.feature_importance:
+        type: boolean
+      model_registry.register_model:
+        type: boolean
+      model_registry.model_name_pattern:
+        type: string
 
   evaluation:
     type: dict
@@ -241,8 +362,48 @@ sections:
         type: list
       calibration_analysis.enabled:
         type: boolean
+      calibration_analysis.n_bins:
+        type: integer
+      post_hoc_calibration.enabled:
+        type: boolean
+      post_hoc_calibration.method:
+        type: string
+      post_hoc_calibration.fit_on_validation:
+        type: boolean
+      post_hoc_calibration.temperature_bounds.min:
+        type: number
+      post_hoc_calibration.temperature_bounds.max:
+        type: number
+      post_hoc_calibration.min_samples:
+        type: integer
+      temporal_degradation.enabled:
+        type: boolean
+      temporal_degradation.num_windows:
+        type: integer
+      temporal_degradation.overlap_fraction:
+        type: number
+      temporal_degradation.log_per_window_metrics:
+        type: boolean
       missing_snapshot_strategy:
         type: string
+      backtesting.enabled:
+        type: boolean
+      backtesting.horizon_steps:
+        type: integer
+      backtesting.initial_capital:
+        type: number
+      backtesting.transaction_cost:
+        type: number
+      backtesting.signal_strategy:
+        type: string
+      backtesting.signal_threshold:
+        type: number
+      backtesting.intensity_threshold:
+        type: number
+      backtesting.position_sizing:
+        type: string
+      backtesting.max_position_pct:
+        type: number
 
   logging:
     type: dict

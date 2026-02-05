@@ -1,0 +1,51 @@
+base_config: "training_config.yaml"
+
+run_mode:
+  mode: "production"
+
+data:
+  time_range:
+    start_date: "2024-01-01"
+    end_date: "2024-01-08"
+  asset_pairs:
+    correlated_assets: []
+  validation:
+    fail_on_invalid: false
+    max_gap_seconds: 600
+
+training:
+  epochs: 1
+  batch_size: 8
+  debug_max_samples: 100000
+  fine_tuning:
+    enabled: true
+    use_model_registry: false
+    base_model_run_id: "37d61db007644264b6a187444126d15f"
+    freeze_layers: "cnn"
+    learning_rate_factor: 0.1
+
+hyperparameter_optimization:
+  enabled: false
+
+snapshot:
+  root_name: "e2e_trials_v2"
+  name: "trial_12_finetune_from_runid_v2"
+
+evaluation:
+  calibration_analysis:
+    enabled: false
+  post_hoc_calibration:
+    enabled: false
+  temporal_degradation:
+    enabled: false
+  backtesting:
+    enabled: false
+
+mlflow:
+  artifact_logging:
+    trained_model: false
+  model_registry:
+    register_model: false
+
+diagnostics:
+  enabled: false

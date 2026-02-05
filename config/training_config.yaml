@@ -12,6 +12,7 @@
 #   - preprocessing: controls normalization, train/validation/test splitting, etc.
 #   - model: specifies the CNN+LSTM architecture and compilation options.
 #   - training: sets batch size, epochs, weighting, dataset caching, and callbacks.
+#   - snapshot: controls derived dataset snapshots for streaming training.
 #   - hyperparameter_optimization: Optuna search behaviour and search space.
 #   - mlflow: experiment tracking options and model registry settings.
 #   - evaluation: post-training evaluation and calibration analysis.
@@ -37,6 +38,10 @@ data:  # Controls where raw data come from and over which time windows.
   connection:
     database_uri: "${DATABASE_URI}"  # URI of the main GreptimeDB instance; resolved from DATABASE_URI env var.
     table_prefix: "orderbook_"  # Common table name prefix; full table names typically prefix + asset symbol.
+    request_timeout_seconds: 30     # Timeout for HTTP requests to GreptimeDB (seconds).
+    connect_timeout_seconds: 10     # Timeout for establishing HTTP connection (seconds).
+    max_retries: 3                  # Number of retry attempts on transient failures.
+    retry_backoff_factor: 0.5       # Exponential backoff multiplier between retries.
 
   multi_database:
     enabled: false  # When true, use multiple database connections below and split time by connection; when false, use single "connection" above.
@@ -57,13 +62,13 @@ data:  # Controls where raw data come from and over which time windows.
 
   asset_pairs:
     target_asset: "BTCUSDT"  # Primary asset whose future price movement is being predicted.
-    correlated_assets:
-      - "ETHUSDT"  # Additional asset whose order-book data may be used as input features.
-      - "BNBUSDT"  # Additional correlated asset.
-      - "ADAUSDT"  # Additional correlated asset.
-      - "ETHBTC"   # Cross pair correlated with target.
-      - "BNBBTC"   # Cross pair correlated with target.
-      - "ADABTC"   # Cross pair correlated with target.
+    correlated_assets: []
+    alignment:
+      method: "interpolate"  # Alignment strategy: "interpolate" (default) or "bucket".
+      missing_policy: "forward_fill"  # Gap handling for aligned assets: "forward_fill", "skip", or "error".
+      max_gap_seconds: 600  # Max gap size (seconds) allowed for forward fill/interpolation.
+      bucket_tolerance_seconds: 2  # Alignment tolerance for bucket method (seconds).
+      include_mask_channel: true  # Append per-asset confidence mask channels (0..1) to inputs.
 
   time_range:
     start_date: "2024-01-01"  # Logical start of the dataset for this run (inclusive); used when querying raw rows.
@@ -72,10 +77,16 @@ data:  # Controls where raw data come from and over which time windows.
 
   ingestion:
     chunk_hours: 12  # Physical time span per query chunk; trade-off between request size and number of round trips.
+    chunk_delay_seconds: 0.5  # Sleep between chunk fetches to reduce pressure on live writes.
+    max_concurrent_chunk_fetches: 1  # Concurrency cap for chunk fetches; keep at 1 for low DB load.
 
   order_book:
-    depth_levels: 1000  # Maximum number of price levels per side to ingest for order-book snapshots.
+    depth_levels: 50  # Maximum number of price levels per side to ingest for order-book snapshots.
     representation: "hybrid"  # Order-book representation strategy: "full", "aggregated", or "hybrid" (current model expects hybrid).
+    hybrid:
+      raw_levels: 10           # Keep top N levels as-is (must be < depth_levels).
+      aggregated_bins: 10      # Number of bins for deeper levels (must be > 0).
+      bin_strategy: "equal_width"  # Binning strategy: "equal_width" or "log_spaced" for bin distribution.
     schema:
       timestamp_column: "ts"           # Column name in the DB table containing snapshot timestamps.
       bid_price_column: "bid_price"    # Column storing best (or aggregated) bid prices.
@@ -113,7 +124,7 @@ data:  # Controls where raw data come from and over which time windows.
 # Target Configuration
 targets:  # Defines what future event the model predicts and how labels are constructed.
   prediction_horizon_seconds: 1800  # Prediction horizon in seconds (here: 30 minutes ahead price change).
-  visible_window_seconds: 3600      # Length of past window (in seconds) visible to the model when forming a prediction.
+  visible_window_seconds: 600      # Length of past window (in seconds) visible to the model when forming a prediction.
 
   price_classes:
     definition_type: "percentage"  # How price-move bins are defined: by percentage, absolute size, or adaptive rules.
@@ -132,15 +143,23 @@ preprocessing:  # Controls normalization, feature engineering, and dataset split
     fit_on_train_only: true   # When true, compute normalization statistics on the training split only and reuse for val/test.
 
   feature_engineering:
+    enabled: true                    # When true, compute derived features from order book data.
     order_book_features:
-      - "bid_ask_spread"   # Spread features derived from best bid/ask.
-      - "volume_imbalance" # Imbalance between bid and ask quantities.
-      - "depth_imbalance"  # Imbalance across multiple depth levels.
-      - "weighted_mid_price"  # Price feature combining bid/ask with volume weights.
+      - "bid_ask_spread"             # Spread features derived from best bid/ask.
+      - "volume_imbalance"           # Imbalance between bid and ask quantities.
+      - "depth_imbalance"            # Imbalance across multiple depth levels.
+      - "weighted_mid_price"         # Price feature combining bid/ask with volume weights.
 
     derived_features:
-      - "price_momentum"   # Past price change magnitudes used as additional signals.
-      - "volume_momentum"  # Past volume change magnitudes used as additional signals.
+      - "price_momentum"             # Past price change magnitudes used as additional signals.
+      - "volume_momentum"            # Past volume change magnitudes used as additional signals.
+
+    momentum_window_seconds: 300     # Window for momentum calculations; must be <= visible_window_seconds.
+    volume_proxy_method: "top_of_book"  # Volume proxy: "top_of_book" or "total_depth".
+
+    edge_decay:
+      enabled: true                  # When true, apply decay to momentum features near t_min.
+      method: "linear"               # Edge decay method: "linear" or "exponential".
 
   train_test_split:
     method: "chronological"  # Splitting strategy; "chronological" preserves time ordering (no leakage from future to past).
@@ -183,6 +202,22 @@ model:  # Defines the neural network architecture and its compilation settings.
     layers: [64]          # Sizes of fully connected layers after the recurrent block.
     dropout_rates: [0.2]  # Dropout rates for each dense layer.
 
+  long_term:
+    enabled: false                    # When true, add long-term context branch (TD-019 dual-channel).
+    windows_days: [7, 30, 90]         # Multi-scale windows: weekly, monthly, quarterly.
+    resolution_days: 1                # Aggregation resolution (daily statistics).
+    features:                         # Features to compute per window:
+      - "mean_return"                 #   Average daily return.
+      - "volatility"                  #   Daily return standard deviation.
+      - "volume_proxy"                #   Average daily volume (from order book depth).
+      - "skewness"                    #   Return distribution skewness.
+    summary_method: "mean"            # How to summarize stats: "mean", "ewma", "last".
+    ewma_halflife_days: 7.0           # Half-life for EWMA weighting (when summary_method="ewma").
+    input_dim: null                   # Auto-computed: len(windows_days) * len(features). Set to override.
+    dense:
+      layers: [32]                    # Dense layer sizes for long-term branch.
+      dropout_rates: [0.2]            # Dropout rates for long-term dense layers.
+
   output:
     type: "two_head_intensity"  # Output head configuration: separate up/down intensity classifications.
     num_classes: 4               # Number of classes per head; should equal len(targets.price_classes.boundaries) + 1.
@@ -196,10 +231,10 @@ model:  # Defines the neural network architecture and its compilation settings.
 
 # Training Configuration
 training:  # Controls how the model is fit on the prepared dataset.
-  epochs: 50                    # Maximum number of passes over the training data (early stopping may stop earlier).
-  batch_size: 128               # Number of samples per gradient update.
+  epochs: 3                    # Maximum number of passes over the training data (early stopping may stop earlier).
+  batch_size: 16               # Number of samples per gradient update.
   validation_split: 0.15        # Must match preprocessing.train_test_split.validation_ratio in this phase.
-  debug_max_samples: 40000      # Hard cap on chronological training samples; raise for full runs, lower for quick experiments.
+  debug_max_samples: 200      # Hard cap on chronological training samples; raise for full runs, lower for quick experiments.
   missing_snapshot_strategy: "fail"  # Behaviour when snapshot-based inputs are unavailable: "fail", "skip", or "synthetic".
 
   dataset_cache:
@@ -223,7 +258,7 @@ training:  # Controls how the model is fit on the prepared dataset.
       min_lr: 0.00001         # Lower bound on the learning rate.
 
   class_weights:
-    compute_from_train: true  # When true, compute class weights from the training data (not yet fully integrated into loss).
+    compute_from_train: false  # When true, compute class weights from the training data (not yet fully integrated into loss).
 
   sample_weighting:
     enabled: false                 # When true, apply time-based exponential decay weights to samples.
@@ -233,8 +268,21 @@ training:  # Controls how the model is fit on the prepared dataset.
 
   fine_tuning:
     enabled: false              # When true, resume training from a previously saved model instead of starting from scratch.
-    base_model_run_id: null     # Required when fine_tuning.enabled is true; identifies the MLflow run/model to load.
-    base_model_stage: "binance-model-training"  # MLflow experiment/stage or registry naming context for the base model.
+    base_model_run_id: null     # Required when fine_tuning.enabled is true and use_model_registry is false; identifies the MLflow run/model to load.
+    base_model_stage: "Production"  # MLflow model registry stage to load from (e.g., "Production", "Staging", "None").
+    use_model_registry: false   # When true, load model from MLflow model registry; when false, load from run artifacts.
+    registry_name: null         # Required when use_model_registry is true; the registered model name in MLflow.
+    freeze_layers: "none"       # Layer freezing pattern: "none", "cnn", "cnn_lstm", "all_but_output".
+    learning_rate_factor: 0.1   # Multiplicative factor for learning rate when fine-tuning (e.g., 0.1 = 10x lower LR).
+
+# Snapshot Configuration
+snapshot:  # Derived dataset snapshots for streaming training/restarts.
+  enabled: true  # When true, build or reuse a snapshot dataset from GreptimeDB chunk streams.
+  directory: "snapshots"  # Root directory for snapshot datasets.
+  root_name: "baseline"  # Required root name for snapshot directories.
+  name: "auto"  # "auto" uses root_name + config hash + time range; or set a custom name.
+  on_config_mismatch: "create_new"  # "create_new" or "error" when a snapshot name already exists.
+  max_snapshots: 5  # Keep most recent N snapshots; <=0 keeps all snapshots.
 
 # Hyperparameter Optimization Configuration
 hyperparameter_optimization:  # Controls Optuna-based search over selected hyperparameters.
@@ -288,12 +336,33 @@ evaluation:  # Post-training evaluation and calibration settings.
     enabled: true  # When true, compute calibration curves and summary statistics.
     n_bins: 10     # Number of probability bins used for calibration analysis.
 
+  post_hoc_calibration:
+    enabled: false  # When true, apply temperature scaling to calibrate predictions.
+    method: "temperature_scaling"  # Calibration method: "temperature_scaling" or "isotonic" (future).
+    fit_on_validation: true  # If true, fit temperature on validation set; otherwise on test set.
+    min_samples: 500  # Minimum samples required to fit temperature scaling reliably.
+    temperature_bounds:
+      min: 0.1  # Minimum temperature value during optimization.
+      max: 10.0  # Maximum temperature value during optimization.
+
+  temporal_degradation:
+    enabled: false  # When true, analyze model performance degradation over time.
+    num_windows: 5  # Number of chronological windows to evaluate.
+    overlap_fraction: 0.0  # Overlap between consecutive windows (0.0 to 0.5).
+    log_per_window_metrics: true  # Log detailed metrics for each window to MLflow.
+
   missing_snapshot_strategy: "fail"  # Behaviour when snapshot-based inputs are unavailable during evaluation.
 
   backtesting:
-    enabled: false  # Placeholder configuration; backtesting logic is not yet implemented and should remain disabled.
-    initial_capital: 10000  # Nominal starting capital for future backtesting.
-    transaction_cost: 0.001 # Per-trade proportional transaction cost assumed in backtesting.
+    enabled: false              # When true, run backtesting simulation after evaluation.
+    horizon_steps: 180           # Number of steps to hold positions in backtest (e.g., prediction_horizon_seconds / cadence_seconds).
+    initial_capital: 10000      # Starting capital for backtesting simulation.
+    transaction_cost: 0.001     # Per-trade proportional transaction cost (0.001 = 0.1%).
+    signal_strategy: "net_intensity"  # Strategy for signal generation: "net_intensity" or "threshold".
+    signal_threshold: 0.6       # Probability threshold for threshold strategy (ignored for net_intensity).
+    intensity_threshold: 1      # Minimum intensity class for action (0=any, 1=1%+, 2=2%+, 3=5%+).
+    position_sizing: "equal"    # Position sizing method: "equal" (fixed) or "confidence" (scale by probability).
+    max_position_pct: 1.0       # Maximum capital per position as a fraction (1.0 = all-in).
 
 # Data Diagnostics Configuration
 diagnostics:  # Controls pre-training data quality checks and their logging.

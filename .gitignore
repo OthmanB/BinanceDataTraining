@@ -1,3 +1,5 @@
+tmp/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -73,6 +75,7 @@ checkpoints/
 data/raw/
 data/processed/
 data/cached/
+snapshots/
 *.npz
 *.npy
 *.parquet
@@ -156,3 +159,5 @@ dmypy.json
 
 # Profiling data
 *.prof
+
+.opencode

@@ -1,7 +1,7 @@
 import unittest
 from unittest import mock
 
-from data.greptime_client import fetch_order_book_rows
+from data.greptime_client import fetch_order_book_rows, stream_order_book_chunks
 
 
 class TestGreptimeClient(unittest.TestCase):
@@ -17,7 +17,7 @@ class TestGreptimeClient(unittest.TestCase):
 
     @mock.patch("data.greptime_client.requests.post")
     def test_fetch_order_book_rows_multi_database_time_split(self, mock_post) -> None:
-        def fake_post(url, data=None, headers=None):  # type: ignore[override]
+        def fake_post(url, data=None, headers=None, timeout=None):  # type: ignore[override]
             if "db1" in url:
                 rows = [["db1_row1"], ["db1_row2"]]
             else:
@@ -54,6 +54,11 @@ class TestGreptimeClient(unittest.TestCase):
                     "start_date": "2024-01-01",
                     "end_date": "2024-01-10",
                 },
+                "ingestion": {
+                    "chunk_hours": 240,  # 10 days - larger than date range to avoid chunking in test
+                    "chunk_delay_seconds": 0.0,
+                    "max_concurrent_chunk_fetches": 1,
+                },
                 "order_book": {
                     "schema": self._build_base_schema(),
                 },
@@ -65,6 +70,10 @@ class TestGreptimeClient(unittest.TestCase):
                             "name": "historical",
                             "database_uri": "http://db1",
                             "table_prefix": "orderbook_",
+                            "request_timeout_seconds": 30,
+                            "connect_timeout_seconds": 10,
+                            "max_retries": 3,
+                            "retry_backoff_factor": 0.5,
                             "time_range": {
                                 "start_date": "2024-01-01",
                                 "end_date": "2024-01-05",
@@ -74,6 +83,10 @@ class TestGreptimeClient(unittest.TestCase):
                             "name": "recent",
                             "database_uri": "http://db2",
                             "table_prefix": "orderbook_",
+                            "request_timeout_seconds": 30,
+                            "connect_timeout_seconds": 10,
+                            "max_retries": 3,
+                            "retry_backoff_factor": 0.5,
                             "time_range": {
                                 "start_date": "2024-01-06",
                                 "end_date": "2024-01-10",
@@ -109,6 +122,11 @@ class TestGreptimeClient(unittest.TestCase):
                     "start_date": "2024-01-01",
                     "end_date": "2024-01-10",
                 },
+                "ingestion": {
+                    "chunk_hours": 24,
+                    "chunk_delay_seconds": 0.0,
+                    "max_concurrent_chunk_fetches": 1,
+                },
                 "order_book": {
                     "schema": self._build_base_schema(),
                 },
@@ -120,6 +138,10 @@ class TestGreptimeClient(unittest.TestCase):
                             "name": "db1",
                             "database_uri": "http://db1",
                             "table_prefix": "orderbook_",
+                            "request_timeout_seconds": 30,
+                            "connect_timeout_seconds": 10,
+                            "max_retries": 3,
+                            "retry_backoff_factor": 0.5,
                             "time_range": {
                                 "start_date": "2024-01-01",
                                 "end_date": "2024-01-08",
@@ -129,6 +151,10 @@ class TestGreptimeClient(unittest.TestCase):
                             "name": "db2",
                             "database_uri": "http://db2",
                             "table_prefix": "orderbook_",
+                            "request_timeout_seconds": 30,
+                            "connect_timeout_seconds": 10,
+                            "max_retries": 3,
+                            "retry_backoff_factor": 0.5,
                             "time_range": {
                                 "start_date": "2024-01-07",
                                 "end_date": "2024-01-10",
@@ -141,6 +167,42 @@ class TestGreptimeClient(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             fetch_order_book_rows(config)
+
+    def test_stream_order_book_chunks_rejects_concurrent(self) -> None:
+        config = {
+            "data": {
+                "asset_pairs": {
+                    "target_asset": "BTCUSDT",
+                    "correlated_assets": [],
+                },
+                "time_range": {
+                    "start_date": "2024-01-01",
+                    "end_date": "2024-01-02",
+                },
+                "ingestion": {
+                    "chunk_hours": 24,
+                    "chunk_delay_seconds": 0.0,
+                    "max_concurrent_chunk_fetches": 2,
+                },
+                "order_book": {
+                    "schema": self._build_base_schema(),
+                },
+                "connection": {
+                    "database_uri": "http://db",
+                    "table_prefix": "orderbook_",
+                    "request_timeout_seconds": 30,
+                    "connect_timeout_seconds": 10,
+                    "max_retries": 3,
+                    "retry_backoff_factor": 0.5,
+                },
+                "multi_database": {
+                    "enabled": False,
+                },
+            },
+        }
+
+        with self.assertRaises(ValueError):
+            next(stream_order_book_chunks(config))
 
 
 if __name__ == "__main__":  # pragma: no cover

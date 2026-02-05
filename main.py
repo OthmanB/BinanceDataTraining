@@ -15,7 +15,9 @@ Current responsibilities (Phase 2):
 No model training is performed yet.
 """
 
+import argparse
 import sys
+from typing import Any, Dict
 from datetime import datetime
 
 from utils.config_loader import ConfigError, load_config
@@ -27,15 +29,46 @@ from preprocessing.transformer import run_preprocessing_pipeline
 from preprocessing.train_test_split import chronological_split_indices
 from diagnostics import run_data_diagnostics
 from training import run_training_pipeline
-from evaluation import evaluate_model
+from evaluation import evaluate_model, evaluate_snapshot_model
 from mlflow_integration import start_run, end_run
 from models.hyperparameter_tuning import run_hyperparameter_search
+
+
+def _enforce_production_sample_cap(config: Dict[str, Any], n_samples: int) -> None:
+    run_mode_cfg = config["run_mode"]  # Required by schema
+    mode = str(run_mode_cfg["mode"])  # Required by schema
+    if mode != "production":
+        return
+
+    training_cfg = config["training"]  # Required by schema
+    debug_max_samples = int(training_cfg["debug_max_samples"])  # Required by schema
+    if debug_max_samples < n_samples:
+        raise ConfigError(
+            "training.debug_max_samples must be >= metadata.num_samples when run_mode.mode='production'. "
+            f"debug_max_samples={debug_max_samples}, num_samples={n_samples}."
+        )
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Binance ML Training Platform")
+    parser.add_argument(
+        "--config",
+        default="config/training_config.yaml",
+        help="Path to training configuration YAML",
+    )
+    parser.add_argument(
+        "--schema",
+        default="config/validation_schema.yaml",
+        help="Path to configuration schema YAML",
+    )
+    return parser.parse_args()
 
 
 def main() -> int:
     # Initial minimal logging to stderr in case config loading fails
     try:
-        config = load_config()
+        args = _parse_args()
+        config = load_config(config_path=args.config, schema_path=args.schema)
     except ConfigError as exc:
         # Use a very simple stderr output here; colored logging is not yet available
         sys.stderr.write(f"Configuration error: {exc}\n")
@@ -51,20 +84,21 @@ def main() -> int:
         return 1
 
     # Determine run mode (production vs trial) from configuration.
-    run_mode_cfg = config.get("run_mode", {})
-    mode = str(run_mode_cfg.get("mode"))
+    run_mode_cfg = config["run_mode"]  # Required by schema
+    mode = str(run_mode_cfg["mode"])  # Required by schema
     if mode not in ("production", "trial"):
         logger.error("Invalid run_mode.mode in configuration: %r (expected 'production' or 'trial')", mode)
         return 1
 
     # Start MLFlow run
-    mlflow_cfg = config.get("mlflow", {})
-    run_pattern = (
-        mlflow_cfg.get("run_naming", {}).get("pattern")
-        or "{asset}_{model}_{timestamp}"
-    )
-    target_asset = config.get("data", {}).get("asset_pairs", {}).get("target_asset")
-    model_name = config.get("model", {}).get("architecture")
+    mlflow_cfg = config["mlflow"]
+    run_naming_cfg = mlflow_cfg["run_naming"]
+    run_pattern = run_naming_cfg["pattern"]
+    if not run_pattern:
+        logger.error("mlflow.run_naming.pattern is required in configuration")
+        return 1
+    target_asset = config["data"]["asset_pairs"]["target_asset"]
+    model_name = config["model"]["architecture"]
     timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
 
     run_name = run_pattern.format(
@@ -79,65 +113,28 @@ def main() -> int:
         logger.error("Failed to start MLFlow run: %s", exc)
         return 1
 
-    # Phase 2: execute data pipeline skeleton inside the MLFlow run
-    try:
-        data_object = load_order_book_data(config)
-        data_object = run_preprocessing_pipeline(config, data_object)
-        data_object = attach_temporal_features(config, data_object)
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Data pipeline (Phase 2 skeleton) failed: %s", exc)
+    snapshot_cfg = config["snapshot"]  # Required by schema
+    snapshot_enabled = bool(snapshot_cfg["enabled"])  # Required by schema
+
+    if not snapshot_enabled:
+        logger.error(
+            "Legacy in-memory pipeline is disabled. Set snapshot.enabled=true to use the snapshot pipeline.",
+        )
         end_run()
         return 1
 
-    metadata = data_object["metadata"]
-    n_samples = int(metadata["num_samples"])
-
-    split_cfg = config["preprocessing"]["train_test_split"]
-    train_ratio = float(split_cfg["train_ratio"])
-    validation_ratio = float(split_cfg["validation_ratio"])
-    test_ratio = float(split_cfg["test_ratio"])
-
-    train_idx, val_idx, test_idx = chronological_split_indices(
-        n_samples,
-        train_ratio,
-        validation_ratio,
-        test_ratio,
-    )
-
+    data_object = None
     logger.info(
-        "Configuration loaded and environment validated successfully. "
-        f"MLFlow tracking_uri={mlflow_cfg.get('tracking_uri')}, "
-        f"experiment_name={mlflow_cfg.get('experiment_name')}"
+        "Snapshot mode enabled; skipping Phase 2 in-memory data pipeline and diagnostics.",
     )
-    logger.info(
-        "Phase 2 data pipeline summary: n_samples=%d, train=%d, val=%d, test=%d",
-        n_samples,
-        len(train_idx),
-        len(val_idx),
-        len(test_idx),
-    )
-    logger.info("Phase 2 setup complete. Invoking data diagnostics stage before training.")
-
-    try:
-        run_data_diagnostics(config, data_object, train_idx, val_idx, test_idx)
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Data diagnostics stage failed: %s", exc)
-
-    logger.info("Data diagnostics stage complete. Invoking training pipeline (Phase 3 minimal).")
 
     config_for_training = config
 
-    hpo_cfg = config.get("hyperparameter_optimization")
-    if isinstance(hpo_cfg, dict) and hpo_cfg.get("enabled"):
-        logger.info("Hyperparameter optimization is enabled; running search before final training.")
-        try:
-            best_config = run_hyperparameter_search(config, data_object)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Hyperparameter optimization failed: %s", exc)
-            end_run()
-            return 1
-        if best_config is not None:
-            config_for_training = best_config
+    hpo_cfg = config["hyperparameter_optimization"]  # Required by schema
+    if bool(hpo_cfg["enabled"]):
+        logger.error("Hyperparameter optimization is not supported when snapshot.enabled is true.")
+        end_run()
+        return 1
 
     if mode == "trial":
         logger.info(
@@ -159,13 +156,12 @@ def main() -> int:
         end_run()
         return 0
 
-    logger.info("Phase 3 training complete. Invoking evaluation pipeline (Phase 4 minimal).")
+    logger.info("Snapshot mode enabled; invoking snapshot evaluation pipeline.")
 
-    # Phase 4: evaluation pipeline (runs inside the same MLFlow run)
     try:
-        evaluate_model(config_for_training, model, data_object)
+        evaluate_snapshot_model(config_for_training, model)
     except Exception as exc:  # noqa: BLE001
-        logger.error("Evaluation pipeline (Phase 4 minimal) failed: %s", exc)
+        logger.error("Snapshot evaluation pipeline failed: %s", exc)
         end_run()
         return 1
 

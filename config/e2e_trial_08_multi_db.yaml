@@ -1,0 +1,68 @@
+base_config: "training_config.yaml"
+
+run_mode:
+  mode: "production"
+
+data:
+  time_range:
+    start_date: "2025-06-01"
+    end_date: "2025-06-10"
+  asset_pairs:
+    correlated_assets: []
+  multi_database:
+    enabled: true
+    connections:
+      - name: "historical"
+        database_uri: "${DATABASE_URI_HIST}"
+        table_prefix: "orderbook_"
+        request_timeout_seconds: 30
+        connect_timeout_seconds: 10
+        max_retries: 3
+        retry_backoff_factor: 0.5
+        time_range:
+          start_date: "2021-04-01"
+          end_date: "2025-06-04"
+      - name: "recent"
+        database_uri: "${DATABASE_URI_LIVE}"
+        table_prefix: "orderbook_"
+        request_timeout_seconds: 30
+        connect_timeout_seconds: 10
+        max_retries: 3
+        retry_backoff_factor: 0.5
+        time_range:
+          start_date: "2025-06-04"
+          end_date: "2026-12-31"
+  validation:
+    fail_on_invalid: false
+    max_gap_seconds: 600
+
+training:
+  epochs: 1
+  batch_size: 8
+  debug_max_samples: 100000
+
+hyperparameter_optimization:
+  enabled: false
+
+snapshot:
+  root_name: "e2e_trials_v2"
+  name: "trial_08_multi_db_v2"
+
+evaluation:
+  calibration_analysis:
+    enabled: false
+  post_hoc_calibration:
+    enabled: false
+  temporal_degradation:
+    enabled: false
+  backtesting:
+    enabled: false
+
+mlflow:
+  artifact_logging:
+    trained_model: false
+  model_registry:
+    register_model: false
+
+diagnostics:
+  enabled: false

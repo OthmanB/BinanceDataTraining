@@ -9,46 +9,125 @@ In later phases this module will:
 Phase 3 only logs that the training pipeline has been invoked.
 """
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 import logging
+import os
 
 import numpy as np
 
-from preprocessing.train_test_split import chronological_split_indices
-from preprocessing.snapshot_sequence_builder import build_top_of_book_sequence_tensor
+from utils.config_loader import ConfigError
+from preprocessing.snapshot_sequence_builder import (
+    build_top_of_book_sequence_tensor,
+    build_hybrid_depth_sequence_tensor,
+)
+from preprocessing.normalizer import create_normalizer_from_config
+from preprocessing.feature_engineering import FeatureEngineer
 from mlflow_integration.model_registry import register_model
 from .dataset_cache import compute_dataset_hash, cache_dataset_to_npz
+from .snapshot_dataset import (
+    NormalizationStats,
+    build_training_generator,
+    compute_label_distribution,
+    compute_normalization_stats,
+    get_mask_channel_info,
+    load_label_stats_from_manifest,
+    load_normalization_stats,
+    prepare_snapshot_dataset,
+    save_label_stats_to_manifest,
+    save_normalization_stats,
+)
+from .snapshot_store import load_or_create_manifest, resolve_snapshot_context, save_manifest
 from .callbacks import create_callbacks
+from .class_weights import compute_class_weights, compute_class_weights_from_counts
+from .long_term_context import (
+    compute_long_term_features_for_dataset,
+    is_long_term_enabled,
+    wrap_generator_with_long_term,
+)
 
 
 logger = logging.getLogger(__name__)
 
 
-def run_training_pipeline(config: Dict[str, Any], data_object: Dict[str, Any]) -> None:
-    """Execute the training pipeline (Phase 3 skeleton).
+def _compute_split_boundaries(
+    n_samples: int,
+    train_ratio: float,
+    validation_ratio: float,
+    test_ratio: float,
+) -> Tuple[int, int, int]:
+    ratio_sum = train_ratio + validation_ratio + test_ratio
+    if abs(ratio_sum - 1.0) > 1e-6:
+        raise ValueError("train_ratio + validation_ratio + test_ratio must equal 1.0")
 
-    No actual model training is performed yet.
-    """
+    train_end = int(n_samples * train_ratio)
+    val_end = train_end + int(n_samples * validation_ratio)
+    if val_end > n_samples:
+        val_end = n_samples
+    test_end = n_samples
+    return train_end, val_end, test_end
 
-    metadata = data_object["metadata"]
-    n_samples = int(metadata["num_samples"])
 
+def _enforce_production_sample_cap_snapshot(config: Dict[str, Any], n_samples: int) -> None:
+    run_mode_cfg = config["run_mode"]
+    mode = str(run_mode_cfg["mode"])
+    if mode != "production":
+        return
+
+    training_cfg = config["training"]
+    debug_max_samples = int(training_cfg["debug_max_samples"])
+    if debug_max_samples < n_samples:
+        raise ConfigError(
+            "training.debug_max_samples must be >= metadata.num_samples when run_mode.mode='production'. "
+            f"debug_max_samples={debug_max_samples}, num_samples={n_samples}."
+        )
+
+
+def _get_normalization_stats(
+    config: Dict[str, Any],
+    context: Any,
+    manifest: Dict[str, Any],
+    dataset: Any,
+    start_index: int,
+    end_index: int,
+    stats_key: str,
+) -> NormalizationStats:
+    norm_cfg = config["preprocessing"]["normalization"]
+    method = str(norm_cfg["method"])
+    stats_path = os.path.join(context.snapshot_dir, f"normalization_stats_{stats_key}.npz")
+
+    mask_start, mask_count = get_mask_channel_info(config)
+
+    if os.path.exists(stats_path):
+        stats = load_normalization_stats(stats_path)
+    else:
+        stats = compute_normalization_stats(
+            dataset,
+            start_index,
+            end_index,
+            method,
+            mask_start=mask_start,
+            mask_count=mask_count,
+        )
+        save_normalization_stats(stats_path, stats)
+
+    stats_meta = manifest.get("normalization_stats", {})
+    stats_meta[stats_key] = {
+        "method": stats.method,
+        "path": stats_path,
+        "start_index": start_index,
+        "end_index": end_index,
+    }
+    manifest["normalization_stats"] = stats_meta
+    save_manifest(context, manifest)
+
+    return stats
+
+
+def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
     training_cfg = config["training"]
     debug_max_samples = int(training_cfg["debug_max_samples"])
     epochs = int(training_cfg["epochs"])
     batch_size = int(training_cfg["batch_size"])
-    missing_snapshot_strategy = str(training_cfg["missing_snapshot_strategy"])
-
-    if missing_snapshot_strategy not in ("fail", "skip", "synthetic"):
-        raise ValueError(
-            "training.missing_snapshot_strategy must be one of 'fail', 'skip', or 'synthetic'",
-        )
-
-    if n_samples <= 0:
-        logger.info(
-            "Training pipeline invoked (Phase 3 minimal). num_samples=0, skipping training.",
-        )
-        return None
 
     split_cfg = config["preprocessing"]["train_test_split"]
     train_ratio = float(split_cfg["train_ratio"])
@@ -61,48 +140,502 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Dict[str, Any]) -
             "training.validation_split must match preprocessing.train_test_split.validation_ratio in this phase",
         )
 
-    train_idx, val_idx, _ = chronological_split_indices(
+    model_cfg = config["model"]
+    output_cfg = model_cfg["output"]
+    output_type = str(output_cfg["type"])
+    if output_type != "two_head_intensity":
+        raise ValueError(
+            "Only model.output.type='two_head_intensity' is supported in snapshot training",
+        )
+
+    class_weights_cfg = training_cfg["class_weights"]
+    use_class_weights = bool(class_weights_cfg["compute_from_train"])
+
+    snapshot_dataset = prepare_snapshot_dataset(config)
+    n_samples = int(snapshot_dataset.total_samples)
+    if n_samples <= 0:
+        logger.info("Snapshot training skipped: snapshot dataset has no samples.")
+        return None
+
+    _enforce_production_sample_cap_snapshot(config, n_samples)
+
+    train_end, val_end, _ = _compute_split_boundaries(
         n_samples,
         train_ratio,
         validation_ratio,
         test_ratio,
     )
 
-    if not train_idx:
-        logger.info(
-            "Training pipeline invoked (Phase 3 minimal). no training samples available after chronological split.",
-        )
+    if train_end <= 0:
+        logger.info("Snapshot training skipped: no training samples available after split.")
         return None
 
-    effective_train_n = min(len(train_idx), debug_max_samples)
+    effective_train_n = min(train_end, debug_max_samples)
     if effective_train_n <= 0:
-        logger.info(
-            "Training pipeline invoked (Phase 3 minimal). debug_max_samples=%s resulted in no training samples.",
-            debug_max_samples,
-        )
+        logger.info("Snapshot training skipped: debug_max_samples=%s", debug_max_samples)
         return None
 
-    train_indices = train_idx[:effective_train_n]
-    val_indices = val_idx
+    val_start = train_end
+    val_end = min(val_end, n_samples)
+    val_count = max(0, val_end - val_start)
 
-    logger.info(
-        "Training pipeline invoked (Phase 3 minimal). num_samples=%s, train=%s, val=%s, debug_max_samples=%s, effective_train_n=%s",
-        n_samples,
-        len(train_idx),
-        len(val_idx),
-        debug_max_samples,
+    if not snapshot_dataset.chunks:
+        logger.info("Snapshot training skipped: no chunk files found.")
+        return None
+
+    first_chunk = snapshot_dataset.chunks[0]
+    with np.load(first_chunk.file_path, mmap_mode="r") as npz:
+        x_shape = npz["x"].shape
+    if len(x_shape) != 5:
+        raise ValueError("Snapshot input tensors must have rank 5")
+    input_shape = tuple(int(d) for d in x_shape[1:])
+
+    long_term_features = None
+    long_term_input_dim: Optional[int] = None
+    if is_long_term_enabled(config):
+        cadence_seconds = int(config["data"]["time_range"]["cadence_seconds"])
+        long_term_features = compute_long_term_features_for_dataset(
+            config,
+            snapshot_dataset,
+            cadence_seconds=cadence_seconds,
+        )
+        if long_term_features is None:
+            raise ConfigError("Long-term features enabled but computation returned None")
+        if long_term_features.shape[0] != n_samples:
+            raise ConfigError(
+                "Long-term feature rows do not match snapshot dataset sample count: "
+                f"features={long_term_features.shape[0]}, samples={n_samples}"
+            )
+        long_term_input_dim = int(long_term_features.shape[1])
+
+    context = resolve_snapshot_context(config)
+    manifest = load_or_create_manifest(context, config)
+
+    normalization_cfg = config["preprocessing"]["normalization"]
+    fit_on_train_only = bool(normalization_cfg["fit_on_train_only"])
+
+    train_stats = _get_normalization_stats(
+        config,
+        context,
+        manifest,
+        snapshot_dataset,
+        0,
         effective_train_n,
+        "train",
     )
 
-    model_cfg = config["model"]
-    output_cfg = model_cfg["output"]
-    output_type = str(output_cfg["type"])
-    if output_type != "two_head_intensity":
-        raise ValueError(
-            "Only model.output.type='two_head_intensity' is supported in this phase of the training pipeline",
+    mask_start, mask_count = get_mask_channel_info(config)
+
+    if fit_on_train_only:
+        val_stats = train_stats
+    else:
+        val_stats = _get_normalization_stats(
+            config,
+            context,
+            manifest,
+            snapshot_dataset,
+            val_start,
+            val_end,
+            "val",
         )
 
-    cnn_cfg = model_cfg["cnn"]
+    # Compute class weights for imbalanced label handling if configured.
+    # Class weights are computed from training data only to avoid data leakage.
+    class_weights_up: Optional[Dict[int, float]] = None
+    class_weights_down: Optional[Dict[int, float]] = None
+
+    if use_class_weights:
+        num_classes = int(output_cfg["num_classes"])
+
+        # Try to load cached label stats from manifest first
+        train_label_dist = load_label_stats_from_manifest(manifest, "train")
+
+        if train_label_dist is None:
+            # Compute label distribution by streaming through training data
+            logger.info(
+                "Computing label distribution for class weights (train samples 0 to %s)...",
+                effective_train_n,
+            )
+            train_label_dist = compute_label_distribution(
+                snapshot_dataset,
+                start_index=0,
+                end_index=effective_train_n,
+                num_classes=num_classes,
+            )
+            # Cache in manifest for future runs
+            save_label_stats_to_manifest(context, manifest, train_label_dist, "train")
+
+        # Compute class weights from label counts
+        class_weights_up = compute_class_weights_from_counts(
+            train_label_dist.up_counts,
+            num_classes,
+        )
+        class_weights_down = compute_class_weights_from_counts(
+            train_label_dist.down_counts,
+            num_classes,
+        )
+
+        logger.info(
+            "Class weights computed for two-head outputs: up_weights=%s, down_weights=%s",
+            {c: round(w, 4) for c, w in sorted(class_weights_up.items())},
+            {c: round(w, 4) for c, w in sorted(class_weights_down.items())},
+        )
+
+        # Log class weights to MLFlow if available
+        try:
+            import mlflow  # type: ignore[import]
+        except Exception:  # noqa: BLE001
+            pass
+        else:
+            try:
+                for c, w in class_weights_up.items():
+                    mlflow.log_metric(f"class_weight_up_{c}", float(w))
+                for c, w in class_weights_down.items():
+                    mlflow.log_metric(f"class_weight_down_{c}", float(w))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to log class weights to MLFlow: %s", exc)
+
+    # Build or load model based on fine-tuning configuration
+    fine_tuning_cfg = training_cfg["fine_tuning"]
+    fine_tuning_enabled = bool(fine_tuning_cfg["enabled"])
+
+    if fine_tuning_enabled:
+        from .fine_tuning import (
+            FineTuningError,
+            load_model_from_registry,
+            load_model_from_run,
+            prepare_fine_tuning,
+        )
+
+        use_registry = bool(fine_tuning_cfg["use_model_registry"])
+
+        if use_registry:
+            registry_name = fine_tuning_cfg["registry_name"]
+            if not registry_name:
+                raise ConfigError(
+                    "training.fine_tuning.registry_name is required when use_model_registry is true"
+                )
+            stage = str(fine_tuning_cfg["base_model_stage"])
+            logger.info(
+                "Fine-tuning enabled: loading model from registry. name=%s, stage=%s",
+                registry_name,
+                stage,
+            )
+            try:
+                model = load_model_from_registry(registry_name, stage=stage)
+            except FineTuningError as exc:
+                raise ConfigError(f"Failed to load base model for fine-tuning: {exc}") from exc
+        else:
+            run_id = fine_tuning_cfg["base_model_run_id"]
+            if not run_id:
+                raise ConfigError(
+                    "training.fine_tuning.base_model_run_id is required when fine_tuning.enabled is true "
+                    "and use_model_registry is false"
+                )
+            logger.info("Fine-tuning enabled: loading model from MLflow run. run_id=%s", run_id)
+            try:
+                model = load_model_from_run(run_id)
+            except FineTuningError as exc:
+                raise ConfigError(f"Failed to load base model for fine-tuning: {exc}") from exc
+
+        # Prepare the model for fine-tuning (freeze layers, adjust LR)
+        try:
+            model = prepare_fine_tuning(
+                config,
+                model,
+                input_shape=input_shape,
+                long_term_input_dim=long_term_input_dim,
+            )
+        except FineTuningError as exc:
+            raise ConfigError(f"Failed to prepare model for fine-tuning: {exc}") from exc
+
+        logger.info(
+            "Model prepared for fine-tuning: freeze_layers=%s, lr_factor=%s",
+            fine_tuning_cfg["freeze_layers"],
+            fine_tuning_cfg["learning_rate_factor"],
+        )
+    else:
+        from models.cnn_lstm_multiclass import build_cnn_lstm_model
+
+        model = build_cnn_lstm_model(
+            config,
+            input_shape=input_shape,
+            long_term_input_dim=long_term_input_dim,
+        )
+
+    if long_term_features is not None:
+        try:
+            input_count = len(getattr(model, "inputs", []))
+        except Exception as exc:  # noqa: BLE001
+            raise ConfigError(f"Failed to inspect model inputs for long-term features: {exc}") from exc
+        if input_count != 2:
+            raise ConfigError(
+                "Long-term features are enabled but model does not expose two inputs. "
+                "Disable model.long_term or rebuild the base model with dual inputs."
+            )
+    else:
+        try:
+            input_count = len(getattr(model, "inputs", []))
+        except Exception:
+            input_count = 1
+        if input_count == 2:
+            raise ConfigError(
+                "Model expects long-term inputs but model.long_term is disabled. "
+                "Enable model.long_term and rebuild the snapshot dataset."
+            )
+
+    # Log model complexity metrics to MLFlow if available.
+    try:
+        import mlflow  # type: ignore[import]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to import MLFlow for model complexity logging: %s", exc)
+    else:
+        try:
+            total_params = int(model.count_params())
+            trainable_params = int(
+                sum(int(np.prod(w.shape)) for w in getattr(model, "trainable_weights", []))
+            )
+            non_trainable_params = int(
+                sum(int(np.prod(w.shape)) for w in getattr(model, "non_trainable_weights", []))
+            )
+
+            approx_flops = float(2 * total_params)
+
+            metrics = {
+                "model_total_params": float(total_params),
+                "model_trainable_params": float(trainable_params),
+                "model_non_trainable_params": float(non_trainable_params),
+                "model_approx_flops": approx_flops,
+            }
+
+            for name, value in metrics.items():
+                try:
+                    mlflow.log_metric(name, float(value))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Failed to log MLFlow model complexity metric %s: %s",
+                        name,
+                        exc,
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to compute or log model complexity metrics: %s", exc)
+
+    callbacks = create_callbacks(config)
+
+    train_gen, train_steps = build_training_generator(
+        dataset=snapshot_dataset,
+        start_index=0,
+        end_index=effective_train_n,
+        batch_size=batch_size,
+        num_classes=int(output_cfg["num_classes"]),
+        normalization=train_stats,
+        sample_weight_cfg=training_cfg["sample_weighting"],
+        mask_start=mask_start,
+        mask_count=mask_count,
+        class_weights_up=class_weights_up,
+        class_weights_down=class_weights_down,
+    )
+
+    if long_term_features is not None:
+        train_gen = wrap_generator_with_long_term(
+            train_gen,
+            long_term_features,
+            start_index=0,
+            batch_size=batch_size,
+        )
+
+    fit_kwargs: Dict[str, Any] = {
+        "x": train_gen,
+        "epochs": epochs,
+        "steps_per_epoch": train_steps,
+        "callbacks": callbacks,
+        "verbose": 1,
+    }
+
+    if val_count > 0:
+        val_gen, val_steps = build_training_generator(
+            dataset=snapshot_dataset,
+            start_index=val_start,
+            end_index=val_end,
+            batch_size=batch_size,
+            num_classes=int(output_cfg["num_classes"]),
+            normalization=val_stats,
+            sample_weight_cfg=None,
+            mask_start=mask_start,
+            mask_count=mask_count,
+            class_weights_up=None,  # No class weights for validation
+            class_weights_down=None,
+        )
+        if long_term_features is not None:
+            val_gen = wrap_generator_with_long_term(
+                val_gen,
+                long_term_features,
+                start_index=val_start,
+                batch_size=batch_size,
+            )
+        fit_kwargs["validation_data"] = val_gen
+        fit_kwargs["validation_steps"] = val_steps
+
+    history = model.fit(**fit_kwargs)
+
+    final_loss = None
+    if hasattr(history, "history") and "loss" in history.history:
+        loss_values = history.history.get("loss") or []
+        if loss_values:
+            final_loss = loss_values[-1]
+
+    logger.info(
+        "Snapshot training completed. effective_train_n=%s, final_loss=%s",
+        effective_train_n,
+        final_loss,
+    )
+
+    try:
+        import mlflow  # type: ignore[import]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to import MLFlow for snapshot training metrics: %s", exc)
+    else:
+        if hasattr(history, "history") and isinstance(history.history, dict):
+            for metric_name, values in history.history.items():
+                try:
+                    series = list(values)  # type: ignore[arg-type]
+                except TypeError:
+                    continue
+                for step, value in enumerate(series):
+                    try:
+                        mlflow.log_metric(metric_name, float(value), step=step)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "Failed to log MLFlow metric %s at step %s: %s",
+                            metric_name,
+                            step,
+                            exc,
+                        )
+
+        try:
+            mlflow.log_param("snapshot_dir", context.snapshot_dir)
+            mlflow.log_param("snapshot_config_hash", context.config_hash)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to log snapshot metadata to MLFlow: %s", exc)
+
+    # Conditionally log the trained model to MLFlow using the modern Keras format.
+    mlflow_cfg = config["mlflow"]
+    artifact_logging_cfg = mlflow_cfg["artifact_logging"]
+    log_trained_model = bool(artifact_logging_cfg["trained_model"])
+
+    if log_trained_model:
+        try:
+            import mlflow  # type: ignore[import]
+            import mlflow.tensorflow  # type: ignore[import]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to import MLFlow TensorFlow integration for model logging: %s",
+                exc,
+            )
+        else:
+            signature = None
+            try:
+                from mlflow.models import infer_signature  # type: ignore[import]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to import MLFlow infer_signature for model logging: %s",
+                    exc,
+                )
+            else:
+                try:
+                    sample_n = effective_train_n
+                    if sample_n > batch_size:
+                        sample_n = batch_size
+                    sample_gen, _ = build_training_generator(
+                        dataset=snapshot_dataset,
+                        start_index=0,
+                        end_index=sample_n,
+                        batch_size=sample_n,
+                        num_classes=int(output_cfg["num_classes"]),
+                        normalization=train_stats,
+                        sample_weight_cfg=None,
+                        mask_start=mask_start,
+                        mask_count=mask_count,
+                    )
+                    if long_term_features is not None:
+                        sample_gen = wrap_generator_with_long_term(
+                            sample_gen,
+                            long_term_features,
+                            start_index=0,
+                            batch_size=sample_n,
+                        )
+                    batch = next(iter(sample_gen))
+                    x_sample = batch[0]
+                    y_sample = batch[1]
+                    signature = infer_signature(x_sample, model.predict(x_sample))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Failed to infer MLFlow model signature from snapshot training data: %s",
+                        exc,
+                    )
+
+            logger.info("Logging trained model to MLFlow using mlflow.tensorflow.log_model.")
+            try:
+                if signature is not None:
+                    mlflow.tensorflow.log_model(model, "model", signature=signature)  # type: ignore[attr-defined]
+                else:
+                    mlflow.tensorflow.log_model(model, "model")  # type: ignore[attr-defined]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to log trained model to MLFlow: %s", exc)
+
+            model_registry_cfg = mlflow_cfg["model_registry"]
+            register_enabled = bool(model_registry_cfg["register_model"])
+
+            if register_enabled:
+                try:
+                    model_name_pattern = model_registry_cfg["model_name_pattern"]
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "MLFlow model registry is enabled but mlflow.model_registry.model_name_pattern is missing or invalid: %s",
+                        exc,
+                    )
+                else:
+                    try:
+                        data_cfg = config["data"]
+                        asset_pairs_cfg = data_cfg["asset_pairs"]
+                        target_asset = str(asset_pairs_cfg["target_asset"])
+                        architecture_name = str(model_cfg["architecture"])
+
+                        model_name = model_name_pattern.format(
+                            asset=target_asset,
+                            model=architecture_name,
+                        )
+
+                        try:
+                            register_model(model, model_name)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning(
+                                "Failed to register model '%s' in MLFlow model registry: %s",
+                                model_name,
+                                exc,
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "Failed to prepare model name for MLFlow model registry: %s",
+                            exc,
+                        )
+
+    return model
+
+
+def run_training_pipeline(config: Dict[str, Any], data_object: Optional[Dict[str, Any]]) -> Optional[Any]:
+    """Execute the training pipeline (Phase 3 skeleton).
+
+    No actual model training is performed yet.
+    """
+
+    snapshot_cfg = config["snapshot"]
+    if bool(snapshot_cfg["enabled"]):
+        return _run_snapshot_training_pipeline(config)
+
+    raise ConfigError(
+        "Legacy in-memory training pipeline is disabled. Set snapshot.enabled=true to use the snapshot pipeline."
+    )
     kernel_sizes = cnn_cfg["kernel_sizes"]
     pool_sizes = cnn_cfg["pool_sizes"]
 
@@ -142,8 +675,10 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Dict[str, Any]) -
         order_books = data_object["order_books"]
         target_book = order_books.get(target_asset, {})
         snapshot_features = target_book.get("snapshot_features") or []
+        snapshot_depth_data = target_book.get("snapshot_depth_data") or []
     except KeyError:
         snapshot_features = []
+        snapshot_depth_data = []
 
     x_train = None
     x_val = None
@@ -161,26 +696,60 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Dict[str, Any]) -
                 "metadata.anchor_indices must be populated by the preprocessing pipeline when snapshot_features are present",
             )
 
-        x_train = build_top_of_book_sequence_tensor(
-            config=config,
-            snapshot_features=snapshot_features,
-            anchor_indices=list(anchor_indices),
-            sample_indices=train_indices,
-            height=height,
-            width=width,
-            channels=channels,
-        )
+        # Check representation type to decide which tensor builder to use
+        order_book_cfg = data_cfg["order_book"]
+        representation = str(order_book_cfg["representation"])
 
-        if val_indices:
-            x_val = build_top_of_book_sequence_tensor(
+        if representation == "hybrid":
+            # Use hybrid depth tensor builder
+            if not snapshot_depth_data:
+                raise ValueError(
+                    "data.order_book.representation is 'hybrid' but snapshot_depth_data is empty. "
+                    "Ensure the preprocessing pipeline collected full depth data.",
+                )
+
+            logger.info(
+                "Building hybrid depth tensors (representation='hybrid'). depth_snapshots=%s",
+                len(snapshot_depth_data),
+            )
+
+            x_train = build_hybrid_depth_sequence_tensor(
+                config=config,
+                snapshot_depth_data=snapshot_depth_data,
+                anchor_indices=list(anchor_indices),
+                sample_indices=train_indices,
+            )
+
+            if val_indices:
+                x_val = build_hybrid_depth_sequence_tensor(
+                    config=config,
+                    snapshot_depth_data=snapshot_depth_data,
+                    anchor_indices=list(anchor_indices),
+                    sample_indices=val_indices,
+                )
+
+        else:
+            # Use top-of-book tensor builder (default)
+            x_train = build_top_of_book_sequence_tensor(
                 config=config,
                 snapshot_features=snapshot_features,
                 anchor_indices=list(anchor_indices),
-                sample_indices=val_indices,
+                sample_indices=train_indices,
                 height=height,
                 width=width,
                 channels=channels,
             )
+
+            if val_indices:
+                x_val = build_top_of_book_sequence_tensor(
+                    config=config,
+                    snapshot_features=snapshot_features,
+                    anchor_indices=list(anchor_indices),
+                    sample_indices=val_indices,
+                    height=height,
+                    width=width,
+                    channels=channels,
+                )
 
     else:
         if missing_snapshot_strategy == "fail":
@@ -229,14 +798,85 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Dict[str, Any]) -
     if x_train is None:
         raise ValueError("Training inputs could not be constructed; x_train is None")
 
+    # Optionally integrate feature engineering derived features into the input.
+    # This computes momentum features using anchor indices and mid_prices/volumes,
+    # then broadcasts and concatenates along the channel dimension.
+    fe_cfg = config["preprocessing"]["feature_engineering"]
+    if bool(fe_cfg["enabled"]):
+        try:
+            feature_engineer = FeatureEngineer(config)
+
+            # Retrieve precomputed order book features and volume proxy from transformer
+            snapshot_derived_features = target_book.get("snapshot_derived_features")
+            volume_proxy = target_book.get("volume_proxy")
+            mid_prices_list = target_book.get("mid_prices")
+
+            if snapshot_derived_features and volume_proxy and mid_prices_list:
+                mid_prices_arr = np.asarray(mid_prices_list, dtype="float64")
+                volumes_arr = np.asarray(volume_proxy, dtype="float64")
+                anchor_indices_list = list(anchor_indices)
+                cadence_seconds = int(data_cfg["time_range"]["cadence_seconds"])
+
+                # Compute all features for all samples
+                all_features = feature_engineer.compute_all_features(
+                    snapshot_depth_data=snapshot_depth_data,
+                    mid_prices=mid_prices_arr,
+                    anchor_indices=anchor_indices_list,
+                    cadence_seconds=cadence_seconds,
+                )
+
+                if all_features is not None and all_features.shape[0] > 0:
+                    n_features = all_features.shape[1]
+
+                    # Extract features for train and val indices
+                    fe_train = all_features[train_indices].astype("float32")
+                    fe_val = None
+                    if val_indices:
+                        fe_val = all_features[val_indices].astype("float32")
+
+                    # Broadcast across time and spatial dimensions and concatenate
+                    if x_train.ndim == 5:
+                        _, t_steps, h_dim, w_dim, _ = x_train.shape
+                        fe_train_exp = fe_train[:, None, None, None, :]
+                        fe_train_broadcast = np.broadcast_to(
+                            fe_train_exp,
+                            (fe_train.shape[0], t_steps, h_dim, w_dim, n_features),
+                        )
+                        x_train = np.concatenate(
+                            [x_train, fe_train_broadcast.astype("float32")], axis=-1
+                        )
+
+                        if x_val is not None and fe_val is not None:
+                            fe_val_exp = fe_val[:, None, None, None, :]
+                            fe_val_broadcast = np.broadcast_to(
+                                fe_val_exp,
+                                (fe_val.shape[0], t_steps, h_dim, w_dim, n_features),
+                            )
+                            x_val = np.concatenate(
+                                [x_val, fe_val_broadcast.astype("float32")], axis=-1
+                            )
+
+                        logger.info(
+                            "Integrated feature engineering features into training inputs: "
+                            "n_features=%s, x_train.shape=%s",
+                            n_features,
+                            x_train.shape,
+                        )
+            else:
+                logger.info(
+                    "Feature engineering skipped: missing snapshot_derived_features, "
+                    "volume_proxy, or mid_prices from preprocessing."
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Feature engineering integration failed: %s. Continuing without derived features.",
+                exc,
+            )
+
     # Optionally integrate temporal features into the input channels according
     # to the model.input_representation.temporal_features configuration.
-    ir_cfg = model_cfg.get("input_representation")
-    if ir_cfg is None:
-        raise ValueError("model.input_representation must be defined in configuration")
-    tf_cfg = ir_cfg.get("temporal_features")
-    if tf_cfg is None:
-        raise ValueError("model.input_representation.temporal_features must be defined in configuration")
+    ir_cfg = model_cfg["input_representation"]
+    tf_cfg = ir_cfg["temporal_features"]
     integration_mode = str(tf_cfg["integration_mode"])
     use_local = bool(tf_cfg["use_local_features"])
     use_global = bool(tf_cfg["use_global_features"])
@@ -326,6 +966,36 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Dict[str, Any]) -
                 tf_all.shape[1],
             )
 
+    # Apply normalization to the input tensors based on preprocessing.normalization config.
+    # Normalization statistics are computed on training data only when fit_on_train_only is true.
+    normalization_cfg = config["preprocessing"]["normalization"]
+    fit_on_train_only = bool(normalization_cfg["fit_on_train_only"])
+
+    normalizer = create_normalizer_from_config(config)
+
+    if fit_on_train_only:
+        # Fit normalizer on training data only, then transform both train and val
+        x_train = normalizer.fit_transform(x_train)
+        if x_val is not None:
+            x_val = normalizer.transform(x_val)
+        logger.info(
+            "Applied normalization (method=%s, fit_on_train_only=True): x_train.shape=%s",
+            normalizer.method,
+            x_train.shape,
+        )
+    else:
+        # Fit and transform training data, fit and transform validation data separately
+        x_train = normalizer.fit_transform(x_train)
+        if x_val is not None:
+            # Create a new normalizer for validation data
+            val_normalizer = create_normalizer_from_config(config)
+            x_val = val_normalizer.fit_transform(x_val)
+        logger.info(
+            "Applied normalization (method=%s, fit_on_train_only=False): x_train.shape=%s",
+            normalizer.method,
+            x_train.shape,
+        )
+
     # Infer the model input shape from the constructed training tensor. This
     # must have rank 5: (N, T, H, W, C), so input_shape=(T, H, W, C).
     if x_train.ndim != 5:
@@ -376,6 +1046,28 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Dict[str, Any]) -
         y_up_val = np.eye(num_classes, dtype="float32")[labels_up_arr[val_indices]]
         y_down_val = np.eye(num_classes, dtype="float32")[labels_down_arr[val_indices]]
         y_val = [y_up_val, y_down_val]
+
+    # Compute class weights for handling imbalanced labels.
+    # Weights are computed on training indices only to avoid data leakage.
+    class_weight_dict = None
+    class_weights_cfg = training_cfg["class_weights"]
+    if bool(class_weights_cfg["compute_from_train"]):
+        train_labels_up = labels_up_arr[train_indices]
+        train_labels_down = labels_down_arr[train_indices]
+
+        up_weights = compute_class_weights(train_labels_up, num_classes)
+        down_weights = compute_class_weights(train_labels_down, num_classes)
+
+        class_weight_dict = {
+            "up_intensity": up_weights,
+            "down_intensity": down_weights,
+        }
+
+        logger.info(
+            "Class weights computed from training data: up_weights=%s, down_weights=%s",
+            {c: round(w, 4) for c, w in sorted(up_weights.items())},
+            {c: round(w, 4) for c, w in sorted(down_weights.items())},
+        )
 
     # Optional time-weighted sampling using exponential decay based on sample age
     # in days, configured via training.sample_weighting.
@@ -519,7 +1211,11 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Dict[str, Any]) -
 
     from models.cnn_lstm_multiclass import build_cnn_lstm_model
 
-    model = build_cnn_lstm_model(config, input_shape=input_shape)
+    model = build_cnn_lstm_model(
+        config,
+        input_shape=input_shape,
+        long_term_input_dim=None,
+    )
 
     # Log model complexity metrics (parameter counts and an approximate FLOPs
     # estimate) to MLFlow if it is available.
@@ -574,6 +1270,9 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Dict[str, Any]) -
     if sample_weight_train is not None:
         fit_kwargs["sample_weight"] = [sample_weight_train, sample_weight_train]
 
+    if class_weight_dict is not None:
+        fit_kwargs["class_weight"] = class_weight_dict
+
     if x_val is not None and y_val is not None:
         fit_kwargs["validation_data"] = (x_val, y_val)
 
@@ -587,8 +1286,8 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Dict[str, Any]) -
 
     hpo_metric_value = None
     try:
-        hpo_cfg = config.get("hyperparameter_optimization", {})
-        if isinstance(hpo_cfg, dict) and hpo_cfg.get("enabled"):
+        hpo_cfg = config["hyperparameter_optimization"]
+        if bool(hpo_cfg["enabled"]):
             metric_name = str(hpo_cfg["metric"])
             if hasattr(history, "history") and isinstance(history.history, dict):
                 series = history.history.get(metric_name)
@@ -637,9 +1336,9 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Dict[str, Any]) -
 
     # Conditionally log the trained model to MLFlow using the modern Keras format.
     try:
-        mlflow_cfg = config.get("mlflow", {})
-        artifact_logging_cfg = mlflow_cfg.get("artifact_logging", {})
-        log_trained_model = bool(artifact_logging_cfg.get("trained_model"))
+        mlflow_cfg = config["mlflow"]
+        artifact_logging_cfg = mlflow_cfg["artifact_logging"]
+        log_trained_model = bool(artifact_logging_cfg["trained_model"])
     except Exception:  # noqa: BLE001
         log_trained_model = False
 
@@ -687,8 +1386,8 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Dict[str, Any]) -
             # Optionally register the model in the MLFlow model registry using
             # the configuration-driven model name pattern.
             try:
-                model_registry_cfg = mlflow_cfg.get("model_registry", {})
-                register_enabled = bool(model_registry_cfg.get("register_model"))
+                model_registry_cfg = mlflow_cfg["model_registry"]
+                register_enabled = bool(model_registry_cfg["register_model"])
             except Exception:  # noqa: BLE001
                 register_enabled = False
 

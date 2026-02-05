@@ -6,6 +6,11 @@ This module provides thin wrappers around MLFlow to:
 
 It assumes that environment variables required for authentication are
 validated at startup by the env_validator utilities.
+
+TD-018 FIX: This module no longer changes the working directory.
+Instead, it uses absolute paths for all file operations and stores
+the original CWD for reference. This prevents issues with relative
+paths (e.g., snapshot.directory) resolving to unexpected locations.
 """
 
 from typing import Any, Dict, Optional
@@ -16,6 +21,40 @@ import yaml
 
 
 logger = logging.getLogger(__name__)
+
+# Store the original working directory at module load time
+_ORIGINAL_CWD: Path = Path.cwd().resolve()
+
+
+def get_original_cwd() -> Path:
+    """Return the original working directory from application startup.
+    
+    This is useful for resolving relative paths that were specified
+    relative to the application's original working directory.
+    """
+    return _ORIGINAL_CWD
+
+
+def resolve_path_from_original_cwd(path: str) -> Path:
+    """Resolve a path relative to the original working directory.
+    
+    If the path is absolute, it's returned as-is.
+    If relative, it's resolved against the original CWD.
+    
+    Parameters
+    ----------
+    path:
+        A file or directory path (may be relative or absolute).
+        
+    Returns
+    -------
+    Path:
+        Absolute, resolved path.
+    """
+    p = Path(path)
+    if p.is_absolute():
+        return p.resolve()
+    return (_ORIGINAL_CWD / p).resolve()
 
 
 def _import_mlflow():
@@ -42,10 +81,10 @@ def start_run(config: Dict[str, Any], run_name: Optional[str] = None):
         The active MLFlow run object.
     """
 
-    mlflow_cfg = config.get("mlflow", {})
-    tracking_uri = mlflow_cfg.get("tracking_uri")
-    experiment_name = mlflow_cfg.get("experiment_name")
-    local_tmp_dir = mlflow_cfg.get("local_tmp_dir")
+    mlflow_cfg = config["mlflow"]
+    tracking_uri = mlflow_cfg["tracking_uri"]
+    experiment_name = mlflow_cfg["experiment_name"]
+    local_tmp_dir = mlflow_cfg["local_tmp_dir"]
 
     if not tracking_uri:
         raise ValueError("mlflow.tracking_uri must be set in configuration")
@@ -62,14 +101,22 @@ def start_run(config: Dict[str, Any], run_name: Optional[str] = None):
     # Configure the local temporary directory for MLflow client-side operations.
     # This directory is only used as a staging area on the training machine;
     # the authoritative artifact store remains the server-side default_artifact_root.
-    tmp_path = Path(local_tmp_dir).expanduser().resolve()
+    tmp_path = Path(local_tmp_dir).expanduser()
+    if not tmp_path.is_absolute():
+        # Resolve relative paths against the original CWD
+        tmp_path = _ORIGINAL_CWD / tmp_path
+    tmp_path = tmp_path.resolve()
     tmp_path.mkdir(parents=True, exist_ok=True)
 
-    try:
-        os.chdir(tmp_path)
-        logger.info("Set MLFlow local temporary directory to %s", tmp_path)
-    except OSError as exc:  # noqa: BLE001
-        logger.warning("Failed to change working directory to MLFlow local_tmp_dir %s: %s", tmp_path, exc)
+    # TD-018 FIX: Do NOT change the working directory.
+    # Previously this code did `os.chdir(tmp_path)`, which caused relative paths
+    # like `snapshot.directory` to resolve incorrectly.
+    # Instead, we use absolute paths for all MLflow-related file operations.
+    logger.info(
+        "MLFlow local temporary directory: %s (CWD unchanged at %s)",
+        tmp_path,
+        Path.cwd(),
+    )
 
     # Enable TensorFlow/Keras autologging so that training metrics, parameters,
     # and model artifacts are automatically captured in MLFlow.
@@ -104,21 +151,21 @@ def start_run(config: Dict[str, Any], run_name: Optional[str] = None):
         logger.warning("Failed to write configuration snapshot for MLFlow logging: %s", exc)
 
     # Log a few high-level configuration parameters for convenience.
-    data_cfg = config.get("data", {})
-    asset_pairs_cfg = data_cfg.get("asset_pairs", {})
-    model_cfg = config.get("model", {})
-    compilation_cfg = model_cfg.get("compilation", {})
-    training_cfg = config.get("training", {})
+    data_cfg = config["data"]
+    asset_pairs_cfg = data_cfg["asset_pairs"]
+    model_cfg = config["model"]
+    compilation_cfg = model_cfg["compilation"]
+    training_cfg = config["training"]
 
     params = {
-        "target_asset": asset_pairs_cfg.get("target_asset"),
-        "model_architecture": model_cfg.get("architecture"),
-        "training_epochs": training_cfg.get("epochs"),
-        "training_batch_size": training_cfg.get("batch_size"),
-        "training_debug_max_samples": training_cfg.get("debug_max_samples"),
-        "optimizer": compilation_cfg.get("optimizer"),
-        "learning_rate": compilation_cfg.get("learning_rate"),
-        "loss_function": compilation_cfg.get("loss"),
+        "target_asset": asset_pairs_cfg["target_asset"],
+        "model_architecture": model_cfg["architecture"],
+        "training_epochs": training_cfg["epochs"],
+        "training_batch_size": training_cfg["batch_size"],
+        "training_debug_max_samples": training_cfg["debug_max_samples"],
+        "optimizer": compilation_cfg["optimizer"],
+        "learning_rate": compilation_cfg["learning_rate"],
+        "loss_function": compilation_cfg["loss"],
     }
 
     for name, value in params.items():
@@ -139,4 +186,4 @@ def end_run() -> None:
     mlflow.end_run()
 
 
-__all__ = ["start_run", "end_run"]
+__all__ = ["start_run", "end_run", "get_original_cwd", "resolve_path_from_original_cwd"]

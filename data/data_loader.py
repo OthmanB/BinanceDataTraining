@@ -20,10 +20,10 @@ logger = logging.getLogger(__name__)
 
 
 def _get_asset_pairs_from_config(config: Dict[str, Any]) -> List[str]:
-    data_cfg = config.get("data", {})
-    asset_pairs_cfg = data_cfg.get("asset_pairs", {})
-    target_asset = asset_pairs_cfg.get("target_asset")
-    correlated_assets = asset_pairs_cfg.get("correlated_assets", []) or []
+    data_cfg = config["data"]
+    asset_pairs_cfg = data_cfg["asset_pairs"]
+    target_asset = asset_pairs_cfg["target_asset"]
+    correlated_assets = asset_pairs_cfg["correlated_assets"] or []
 
     assets: List[str] = []
     if target_asset is not None:
@@ -40,22 +40,22 @@ def create_empty_data_object_from_config(config: Dict[str, Any]) -> DataObject:
     fetch any real data yet.
     """
 
-    data_cfg = config.get("data", {})
-    time_range_cfg = data_cfg.get("time_range", {})
-    order_book_cfg = data_cfg.get("order_book", {})
-    targets_cfg = config.get("targets", {})
+    data_cfg = config["data"]
+    time_range_cfg = data_cfg["time_range"]
+    order_book_cfg = data_cfg["order_book"]
+    targets_cfg = config["targets"]
 
     asset_pairs = _get_asset_pairs_from_config(config)
 
     metadata: Dict[str, Any] = {
         "asset_pairs": asset_pairs,
         "time_range": {
-            "start": time_range_cfg.get("start_date"),
-            "end": time_range_cfg.get("end_date"),
-            "cadence_seconds": time_range_cfg.get("cadence_seconds"),
+            "start": time_range_cfg["start_date"],
+            "end": time_range_cfg["end_date"],
+            "cadence_seconds": time_range_cfg["cadence_seconds"],
         },
         "num_samples": 0,
-        "order_book_depth": order_book_cfg.get("depth_levels"),
+        "order_book_depth": order_book_cfg["depth_levels"],
     }
 
     temporal_features: Dict[str, Any] = {
@@ -64,10 +64,10 @@ def create_empty_data_object_from_config(config: Dict[str, Any]) -> DataObject:
     }
 
     targets: Dict[str, Any] = {
-        "asset": data_cfg.get("asset_pairs", {}).get("target_asset"),
+        "asset": data_cfg["asset_pairs"]["target_asset"],
         "labels": None,
         "price_changes": None,
-        "delta_t_seconds": targets_cfg.get("prediction_horizon_seconds"),
+        "delta_t_seconds": targets_cfg["prediction_horizon_seconds"],
     }
 
     external_data: Dict[str, Any] = {}

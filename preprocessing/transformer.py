@@ -13,6 +13,7 @@ import numpy as np
 
 from .validator import validate_data_object
 from .time_utils import normalize_timestamp_array
+from .feature_engineering import FeatureEngineer
 
 
 logger = logging.getLogger(__name__)
@@ -20,10 +21,6 @@ logger = logging.getLogger(__name__)
 
 def run_preprocessing_pipeline(config: Dict[str, Any], data_object: Dict[str, Any]) -> Dict[str, Any]:
     """Run the preprocessing pipeline on a DataObject.
-
-    Phase 2 implementation only performs structural validation and returns the
-    DataObject unchanged. Future phases will add numeric transformations and
-    feature engineering steps informed by the configuration.
     """
 
     validate_data_object(data_object)
@@ -274,12 +271,22 @@ def _build_targets_from_order_book(config: Dict[str, Any], data_object: Dict[str
             f"visible_window_seconds={visible_window_seconds}, cadence_seconds={cadence_seconds}",
         )
 
+    # Determine if we need full depth data for hybrid representation
+    order_book_cfg = data_cfg["order_book"]
+    representation = str(order_book_cfg["representation"])
+    collect_full_depth = representation in ("hybrid", "full")
+    depth_levels = int(order_book_cfg["depth_levels"])
+
     # Build mid-prices at the snapshot level by aggregating rows that share the
     # same timestamp. The batch_id column encodes a coarse time bucket and must
     # not be used to define snapshot identity.
+    #
+    # When collect_full_depth is True, we also collect all bid/ask levels per
+    # timestamp to support hybrid depth representation.
     snapshots = {}
     snapshot_features = []
     snapshot_timestamps = []
+    snapshot_depth_data = []  # List of dicts with full depth arrays per snapshot
     for row_index, row in enumerate(target_rows):
         if len(row) < 6:
             raise ValueError(
@@ -297,6 +304,9 @@ def _build_targets_from_order_book(config: Dict[str, Any], data_object: Dict[str
                 "best_bid_qty": None,
                 "best_ask_price": None,
                 "best_ask_qty": None,
+                # Full depth arrays for hybrid representation
+                "bid_levels": [],  # List of (price, qty) tuples
+                "ask_levels": [],  # List of (price, qty) tuples
             }
             snapshots[key] = snapshot_state
 
@@ -313,12 +323,18 @@ def _build_targets_from_order_book(config: Dict[str, Any], data_object: Dict[str
             if current_bid_price is None or bid_price > current_bid_price:
                 snapshot_state["best_bid_price"] = bid_price
                 snapshot_state["best_bid_qty"] = bid_qty
+            # Collect for full depth if needed
+            if collect_full_depth:
+                snapshot_state["bid_levels"].append((bid_price, bid_qty))
 
         if ask_price > 0.0 and ask_qty >= 0.0:
             current_ask_price = snapshot_state["best_ask_price"]
             if current_ask_price is None or ask_price < current_ask_price:
                 snapshot_state["best_ask_price"] = ask_price
                 snapshot_state["best_ask_qty"] = ask_qty
+            # Collect for full depth if needed
+            if collect_full_depth:
+                snapshot_state["ask_levels"].append((ask_price, ask_qty))
 
     if not snapshots:
         logger.info(
@@ -359,6 +375,37 @@ def _build_targets_from_order_book(config: Dict[str, Any], data_object: Dict[str
         ])
         snapshot_timestamps.append(ts_norm)
 
+        # Build depth data dict for this snapshot if collecting full depth
+        if collect_full_depth:
+            bid_levels = snapshot_state["bid_levels"]
+            ask_levels = snapshot_state["ask_levels"]
+
+            # Sort bids descending by price (best bid first)
+            bid_levels_sorted = sorted(bid_levels, key=lambda x: -x[0])
+            # Sort asks ascending by price (best ask first)
+            ask_levels_sorted = sorted(ask_levels, key=lambda x: x[0])
+
+            # Initialize arrays with zeros, then fill from sorted levels
+            bid_prices = np.zeros(depth_levels, dtype="float64")
+            bid_quantities = np.zeros(depth_levels, dtype="float64")
+            ask_prices = np.zeros(depth_levels, dtype="float64")
+            ask_quantities = np.zeros(depth_levels, dtype="float64")
+
+            for i, (p, q) in enumerate(bid_levels_sorted[:depth_levels]):
+                bid_prices[i] = p
+                bid_quantities[i] = q
+
+            for i, (p, q) in enumerate(ask_levels_sorted[:depth_levels]):
+                ask_prices[i] = p
+                ask_quantities[i] = q
+
+            snapshot_depth_data.append({
+                "bid_prices": bid_prices,
+                "bid_quantities": bid_quantities,
+                "ask_prices": ask_prices,
+                "ask_quantities": ask_quantities,
+            })
+
     if not mid_price_values:
         logger.info(
             "Target construction skipped: no snapshots with valid mid-prices for target asset %s.",
@@ -381,8 +428,18 @@ def _build_targets_from_order_book(config: Dict[str, Any], data_object: Dict[str
     mid_prices = np.asarray(mid_price_values, dtype="float64")
     num_snapshots = int(mid_prices.shape[0])
 
+    # Store mid_prices for feature engineering (P2.1)
+    target_book["mid_prices"] = mid_prices.tolist()
+
     target_book["snapshot_features"] = snapshot_features
     target_book["snapshot_timestamps"] = snapshot_timestamps
+    if collect_full_depth and snapshot_depth_data:
+        target_book["snapshot_depth_data"] = snapshot_depth_data
+        logger.info(
+            "Collected full depth data for hybrid representation: num_snapshots=%s, depth_levels=%s",
+            len(snapshot_depth_data),
+            depth_levels,
+        )
     order_books[target_asset] = target_book
     data_object["order_books"] = order_books
 
@@ -523,6 +580,47 @@ def _build_targets_from_order_book(config: Dict[str, Any], data_object: Dict[str
     targets["labels_down_intensity"] = labels_down_intensity.tolist()
     targets["delta_t_seconds"] = prediction_horizon_seconds
     data_object["targets"] = targets
+
+    # Feature engineering: compute order book features and volume proxy per snapshot
+    # if enabled in configuration. These are stored for use by the training pipeline.
+    fe_cfg = config["preprocessing"]["feature_engineering"]
+    if bool(fe_cfg["enabled"]):
+        if collect_full_depth and snapshot_depth_data:
+            try:
+                feature_engineer = FeatureEngineer(config)
+
+                # Compute order book features per snapshot
+                snapshot_derived_features = []
+                volume_proxy_values = []
+
+                for depth_dict in snapshot_depth_data:
+                    ob_features = feature_engineer.compute_order_book_features(depth_dict)
+                    snapshot_derived_features.append(ob_features)
+
+                    vol_proxy = feature_engineer.compute_volume_proxy(depth_dict)
+                    volume_proxy_values.append(vol_proxy)
+
+                target_book["snapshot_derived_features"] = snapshot_derived_features
+                target_book["volume_proxy"] = volume_proxy_values
+                order_books[target_asset] = target_book
+                data_object["order_books"] = order_books
+
+                logger.info(
+                    "Feature engineering completed: num_snapshots=%s, "
+                    "order_book_features=%s, volume_proxy_method=%s",
+                    len(snapshot_derived_features),
+                    feature_engineer._order_book_features,
+                    feature_engineer._volume_proxy_method,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Feature engineering failed: %s. Continuing without derived features.",
+                    exc,
+                )
+        else:
+            logger.info(
+                "Feature engineering skipped: snapshot_depth_data not available."
+            )
 
     logger.info(
         "Targets constructed for asset=%s. num_samples=%s, horizon_seconds=%s, num_classes=%s",
