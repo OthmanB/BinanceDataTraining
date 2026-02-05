@@ -43,6 +43,7 @@ def _make_record(
         volume_proxy=0.0,
         confidence=float(confidence),
         gap_reset=bool(gap_reset),
+        observed=True,
     )
 
 
@@ -67,6 +68,7 @@ def _make_hybrid_record(
         volume_proxy=0.0,
         confidence=float(confidence),
         gap_reset=False,
+        observed=True,
     )
 
 
@@ -483,7 +485,14 @@ class TestSnapshotAlignmentBehavior(unittest.TestCase):
             anchor_ts = np.arange(4, dtype="int64")
 
             chunk_path = os.path.join(tmp_dir, "chunk.npz")
-            np.savez_compressed(chunk_path, x=x, y_up=y_up, y_down=y_down, anchor_ts=anchor_ts)
+            np.savez_compressed(
+                chunk_path,
+                x=x,
+                y_up=y_up,
+                y_down=y_down,
+                anchor_ts=anchor_ts,
+                duty_cycle=np.ones((x.shape[0],), dtype="float32"),
+            )
 
             chunk = sd.SnapshotChunk(
                 start="2024-01-01 00:00:00",

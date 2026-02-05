@@ -1049,7 +1049,7 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
 
         current_idx = 0
 
-        for x_chunk, y_up_chunk, y_down_chunk, _ in iter_snapshot_batches(
+        for x_chunk, y_up_chunk, y_down_chunk, _, _ in iter_snapshot_batches(
             snapshot_dataset, start_index, end_index
         ):
             x_chunk = _apply_normalization_snapshot(x_chunk, eval_stats, mask_start, mask_count)
@@ -1184,7 +1184,7 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
 
     sample_offset = 0
 
-    for x_chunk, y_up_chunk, y_down_chunk, _ in iter_snapshot_batches(
+    for x_chunk, y_up_chunk, y_down_chunk, _, _ in iter_snapshot_batches(
         snapshot_dataset, test_start, test_end
     ):
         x_chunk = _apply_normalization_snapshot(x_chunk, eval_stats, mask_start, mask_count)

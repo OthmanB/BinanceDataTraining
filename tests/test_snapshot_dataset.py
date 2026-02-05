@@ -41,6 +41,7 @@ class TestSnapshotDataset(unittest.TestCase):
             volume_proxy=10.0,
             confidence=1.0,
             gap_reset=False,
+            observed=True,
         )
         rec1 = SnapshotRecord(
             timestamp=t1,
@@ -51,6 +52,7 @@ class TestSnapshotDataset(unittest.TestCase):
             volume_proxy=12.0,
             confidence=1.0,
             gap_reset=False,
+            observed=True,
         )
 
         output = list(handler.iter_gap_handled([rec0, rec1]))
@@ -88,6 +90,7 @@ class TestSnapshotDataset(unittest.TestCase):
             volume_proxy=10.0,
             confidence=1.0,
             gap_reset=False,
+            observed=True,
         )
         rec1 = SnapshotRecord(
             timestamp=t1,
@@ -98,6 +101,7 @@ class TestSnapshotDataset(unittest.TestCase):
             volume_proxy=12.0,
             confidence=1.0,
             gap_reset=False,
+            observed=True,
         )
 
         output = list(handler.iter_gap_handled([rec0, rec1]))
@@ -119,9 +123,17 @@ class TestSnapshotDataset(unittest.TestCase):
             y_up = np.zeros((4,), dtype="int64")
             y_down = np.zeros((4,), dtype="int64")
             anchor_ts = np.arange(4, dtype="int64")
+            duty_cycle = np.ones((4,), dtype="float32")
 
             chunk_path = os.path.join(tmp_dir, "chunk.npz")
-            np.savez_compressed(chunk_path, x=x, y_up=y_up, y_down=y_down, anchor_ts=anchor_ts)
+            np.savez_compressed(
+                chunk_path,
+                x=x,
+                y_up=y_up,
+                y_down=y_down,
+                anchor_ts=anchor_ts,
+                duty_cycle=duty_cycle,
+            )
 
             chunk = SnapshotChunk(
                 start="2024-01-01 00:00:00",
@@ -175,6 +187,7 @@ class TestSnapshotDataset(unittest.TestCase):
                     y_up=np.zeros((n,), dtype="int64"),
                     y_down=np.zeros((n,), dtype="int64"),
                     anchor_ts=np.arange(n, dtype="int64"),
+                    duty_cycle=np.ones((n,), dtype="float32"),
                 )
 
             chunk1_path = os.path.join(tmp_dir, "chunk1.npz")
@@ -206,12 +219,67 @@ class TestSnapshotDataset(unittest.TestCase):
             )
 
             collected = []
-            for x_batch, _, _, _ in iter_snapshot_batches(dataset, 2, 5):
+            for x_batch, _, _, _, _ in iter_snapshot_batches(dataset, 2, 5):
                 collected.append(x_batch)
 
             result = np.concatenate(collected, axis=0)
             expected = np.concatenate([x1[2:3], x2[:2]], axis=0)
             np.testing.assert_allclose(result, expected)
+
+    def test_build_training_generator_applies_duty_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            x = np.asarray(
+                [
+                    [[[[1.0]]]],
+                    [[[[2.0]]]],
+                ],
+                dtype="float32",
+            )
+            y_up = np.asarray([0, 1], dtype="int64")
+            y_down = np.asarray([1, 0], dtype="int64")
+            anchor_ts = np.asarray([0, 10], dtype="int64")
+            duty_cycle = np.asarray([1.0, 0.5], dtype="float32")
+
+            chunk_path = os.path.join(tmp_dir, "chunk.npz")
+            np.savez_compressed(
+                chunk_path,
+                x=x,
+                y_up=y_up,
+                y_down=y_down,
+                anchor_ts=anchor_ts,
+                duty_cycle=duty_cycle,
+            )
+
+            chunk = SnapshotChunk(
+                start="2024-01-01 00:00:00",
+                end="2024-01-01 01:00:00",
+                file_path=chunk_path,
+                num_samples=2,
+                start_index=0,
+            )
+            dataset = SnapshotDataset(
+                snapshot_dir=tmp_dir,
+                manifest={"chunks": []},
+                chunks=[chunk],
+                total_samples=2,
+                config_hash="hash",
+            )
+
+            gen, steps = build_training_generator(
+                dataset=dataset,
+                start_index=0,
+                end_index=2,
+                batch_size=2,
+                num_classes=2,
+                normalization=None,
+                sample_weight_cfg=None,
+            )
+
+            self.assertEqual(steps, 1)
+            batch = next(iter(gen))
+            weights = batch[2]
+            np.testing.assert_allclose(weights[0], duty_cycle)
+            np.testing.assert_allclose(weights[1], duty_cycle)
 
     def test_build_training_generator_with_weights(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -228,7 +296,14 @@ class TestSnapshotDataset(unittest.TestCase):
             anchor_ts = np.asarray([0, 86400, 2 * 86400], dtype="int64")
 
             chunk_path = os.path.join(tmp_dir, "chunk.npz")
-            np.savez_compressed(chunk_path, x=x, y_up=y_up, y_down=y_down, anchor_ts=anchor_ts)
+            np.savez_compressed(
+                chunk_path,
+                x=x,
+                y_up=y_up,
+                y_down=y_down,
+                anchor_ts=anchor_ts,
+                duty_cycle=np.ones((x.shape[0],), dtype="float32"),
+            )
 
             chunk = SnapshotChunk(
                 start="2024-01-01 00:00:00",

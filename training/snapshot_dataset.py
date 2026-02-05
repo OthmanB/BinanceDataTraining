@@ -67,6 +67,7 @@ class SnapshotRecord:
     volume_proxy: float
     confidence: float
     gap_reset: bool
+    observed: bool
 
 
 @dataclass
@@ -85,6 +86,7 @@ class SampleRecord:
     y_up: int
     y_down: int
     anchor_ts_seconds: int
+    duty_cycle: float
 
 
 @dataclass(frozen=True)
@@ -171,6 +173,7 @@ class GapHandler:
                             volume_proxy=prev.volume_proxy,
                             confidence=confidence,
                             gap_reset=False,
+                            observed=False,
                         )
                     else:
                         alpha = step / float(missing_steps + 1)
@@ -185,6 +188,7 @@ class GapHandler:
                             volume_proxy=(1.0 - alpha) * prev.volume_proxy + alpha * snapshot.volume_proxy,
                             confidence=confidence,
                             gap_reset=False,
+                            observed=False,
                         )
 
             self._prev_snapshot = snapshot
@@ -198,6 +202,7 @@ class GapHandler:
                     volume_proxy=snapshot.volume_proxy,
                     confidence=snapshot.confidence,
                     gap_reset=True,
+                    observed=snapshot.observed,
                 )
             else:
                 yield snapshot
@@ -427,11 +432,19 @@ class StreamingSampleBuilder:
             .astype("int64")
         )
 
+        observed_count = sum(
+            1
+            for rec in window_records
+            if rec.asset_snapshots[self._target_asset].observed
+        )
+        duty_cycle = float(observed_count) / float(self._window_steps)
+
         return SampleRecord(
             x=x_seq.astype("float32"),
             y_up=int(y_up),
             y_down=int(y_down),
             anchor_ts_seconds=anchor_ts_seconds,
+            duty_cycle=duty_cycle,
         )
 
     def _build_input_sequence(self, window_records: List[MultiAssetSnapshotRecord]) -> Optional[np.ndarray]:
@@ -583,8 +596,11 @@ def iter_snapshot_batches(
     dataset: SnapshotDataset,
     start_index: int,
     end_index: int,
-) -> Iterator[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
-    """Iterate slices of snapshot chunks for a global index range."""
+) -> Iterator[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    """Iterate slices of snapshot chunks for a global index range.
+
+    Returns x, y_up, y_down, anchor_ts, duty_cycle arrays.
+    """
 
     if start_index < 0 or end_index < 0 or start_index > end_index:
         raise ValueError("Invalid start_index/end_index for snapshot batch iteration")
@@ -607,8 +623,18 @@ def iter_snapshot_batches(
             y_up = npz["y_up"][local_start:local_end]
             y_down = npz["y_down"][local_start:local_end]
             anchor_ts = npz["anchor_ts"][local_start:local_end]
+            if "duty_cycle" not in npz:
+                raise ConfigError(
+                    "Snapshot chunk missing duty_cycle. Rebuild snapshot dataset to enable duty-cycle weighting."
+                )
+            duty_cycle = npz["duty_cycle"][local_start:local_end]
 
-        yield x, y_up, y_down, anchor_ts
+        if duty_cycle.shape[0] != x.shape[0]:
+            raise ConfigError(
+                "Snapshot chunk duty_cycle length does not match x length. Rebuild snapshot dataset."
+            )
+
+        yield x, y_up, y_down, anchor_ts, duty_cycle
 
 
 def get_mask_channel_info(config: Dict[str, Any]) -> Tuple[int, int]:
@@ -673,8 +699,9 @@ def build_training_generator(
 
     Notes
     -----
-    When both sample_weight_cfg (exponential decay) and class weights are
-    provided, the final sample weight is the product of both weights.
+    Duty-cycle weighting is always applied. When both sample_weight_cfg
+    (exponential decay) and class weights are provided, the final sample
+    weight is the product of duty_cycle * decay * class weight.
     Class weights are converted to per-sample weights by looking up each
     sample's label in the class_weights dict.
     """
@@ -702,8 +729,8 @@ def build_training_generator(
     # Determine if class weighting is enabled
     use_class_weights = class_weights_up is not None or class_weights_down is not None
 
-    # Combined: any weighting active?
-    use_weights = use_decay_weights or use_class_weights
+    # Duty-cycle weighting is always applied
+    use_weights = True
 
     eye = np.eye(num_classes, dtype="float32")
 
@@ -733,52 +760,8 @@ def build_training_generator(
 
         return weights_up, weights_down
 
-    if use_weights:
-        def _generator_with_weights() -> Iterator[Tuple[np.ndarray, Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]]:
-            for x_chunk, y_up_chunk, y_down_chunk, anchor_ts in iter_snapshot_batches(
-                dataset, start_index, end_index
-            ):
-                x_chunk = _apply_normalization(x_chunk, normalization, mask_start, mask_count)
-
-                n_chunk = x_chunk.shape[0]
-                for offset in range(0, n_chunk, batch_size):
-                    x_batch = x_chunk[offset : offset + batch_size]
-                    y_up = y_up_chunk[offset : offset + batch_size]
-                    y_down = y_down_chunk[offset : offset + batch_size]
-
-                    y_up_oh = eye[y_up]
-                    y_down_oh = eye[y_down]
-                    y_batch = (y_up_oh, y_down_oh)
-
-                    # Start with ones
-                    batch_len = x_batch.shape[0]
-                    weights_up = np.ones(batch_len, dtype="float32")
-                    weights_down = np.ones(batch_len, dtype="float32")
-
-                    # Apply exponential decay if enabled
-                    if use_decay_weights:
-                        if current_day is None or decay_const is None:
-                            raise ValueError("Sample weighting requires current_day and decay_const")
-                        anchor_slice = anchor_ts[offset : offset + batch_size]
-                        anchor_days = (anchor_slice // 86400).astype("float64")
-                        age_days = float(current_day) - anchor_days
-                        decay_weights = np.exp(-age_days * float(decay_const)).astype("float32")
-                        weights_up = weights_up * decay_weights
-                        weights_down = weights_down * decay_weights
-
-                    # Apply class weights if enabled
-                    if use_class_weights:
-                        class_w_up, class_w_down = _compute_class_sample_weights(y_up, y_down)
-                        weights_up = weights_up * class_w_up
-                        weights_down = weights_down * class_w_down
-
-                    sample_weight = (weights_up, weights_down)
-                    yield x_batch, y_batch, sample_weight
-
-        return _generator_with_weights(), steps
-
-    def _generator_no_weights() -> Iterator[Tuple[np.ndarray, Tuple[np.ndarray, np.ndarray]]]:
-        for x_chunk, y_up_chunk, y_down_chunk, anchor_ts in iter_snapshot_batches(
+    def _generator_with_weights() -> Iterator[Tuple[np.ndarray, Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]]:
+        for x_chunk, y_up_chunk, y_down_chunk, anchor_ts, duty_cycle_chunk in iter_snapshot_batches(
             dataset, start_index, end_index
         ):
             x_chunk = _apply_normalization(x_chunk, normalization, mask_start, mask_count)
@@ -788,14 +771,37 @@ def build_training_generator(
                 x_batch = x_chunk[offset : offset + batch_size]
                 y_up = y_up_chunk[offset : offset + batch_size]
                 y_down = y_down_chunk[offset : offset + batch_size]
+                duty_cycle = duty_cycle_chunk[offset : offset + batch_size].astype("float32")
 
                 y_up_oh = eye[y_up]
                 y_down_oh = eye[y_down]
                 y_batch = (y_up_oh, y_down_oh)
 
-                yield x_batch, y_batch
+                # Start with duty-cycle weights
+                weights_up = duty_cycle
+                weights_down = duty_cycle.copy()
 
-    return _generator_no_weights(), steps
+                # Apply exponential decay if enabled
+                if use_decay_weights:
+                    if current_day is None or decay_const is None:
+                        raise ValueError("Sample weighting requires current_day and decay_const")
+                    anchor_slice = anchor_ts[offset : offset + batch_size]
+                    anchor_days = (anchor_slice // 86400).astype("float64")
+                    age_days = float(current_day) - anchor_days
+                    decay_weights = np.exp(-age_days * float(decay_const)).astype("float32")
+                    weights_up = weights_up * decay_weights
+                    weights_down = weights_down * decay_weights
+
+                # Apply class weights if enabled
+                if use_class_weights:
+                    class_w_up, class_w_down = _compute_class_sample_weights(y_up, y_down)
+                    weights_up = weights_up * class_w_up
+                    weights_down = weights_down * class_w_down
+
+                sample_weight = (weights_up, weights_down)
+                yield x_batch, y_batch, sample_weight
+
+    return _generator_with_weights(), steps
 
 
 def compute_normalization_stats(
@@ -819,7 +825,7 @@ def compute_normalization_stats(
     m2_vals: Optional[np.ndarray] = None
     count = 0
 
-    for x_chunk, _, _, _ in iter_snapshot_batches(dataset, start_index, end_index):
+    for x_chunk, _, _, _, _ in iter_snapshot_batches(dataset, start_index, end_index):
         if x_chunk.size == 0:
             continue
         x_non_mask, _ = _strip_mask_channels(x_chunk, mask_start, mask_count)
@@ -939,7 +945,7 @@ def compute_label_distribution(
     down_counts: Dict[int, int] = {c: 0 for c in range(num_classes)}
     total_samples = 0
 
-    for _, y_up_chunk, y_down_chunk, _ in iter_snapshot_batches(
+    for _, y_up_chunk, y_down_chunk, _, _ in iter_snapshot_batches(
         dataset, start_index, end_index
     ):
         for y_up_val in y_up_chunk:
@@ -1116,7 +1122,7 @@ def _strip_mask_channels(
 
 def _compute_current_day(dataset: SnapshotDataset, start_index: int, end_index: int) -> int:
     max_day = None
-    for _, _, _, anchor_ts in iter_snapshot_batches(dataset, start_index, end_index):
+    for _, _, _, anchor_ts, _ in iter_snapshot_batches(dataset, start_index, end_index):
         if anchor_ts.size == 0:
             continue
         days = (anchor_ts // 86400).astype("int64")
@@ -1284,9 +1290,17 @@ def _align_asset_interpolate(
     for t_ms, t_dt in zip(target_ms, target_times):
         idx = int(np.searchsorted(times_ms, t_ms, side="left"))
         if idx < len(times_ms) and times_ms[idx] == t_ms:
-            value = values[idx]
-            confidence = confidences[idx]
-            aligned.append(_build_aligned_record(t_dt, value, representation, confidence))
+            record = records[idx]
+            value, confidence = _extract_single_record_value(record, representation)
+            aligned.append(
+                _build_aligned_record(
+                    t_dt,
+                    value,
+                    representation,
+                    confidence,
+                    observed=record.observed,
+                )
+            )
             continue
 
         left = idx - 1
@@ -1297,7 +1311,15 @@ def _align_asset_interpolate(
                 if gap_from_left <= max_gap_ms:
                     value = values[left]
                     confidence = confidences[left]
-                    aligned.append(_build_aligned_record(t_dt, value, representation, float(confidence)))
+                    aligned.append(
+                        _build_aligned_record(
+                            t_dt,
+                            value,
+                            representation,
+                            float(confidence),
+                            observed=False,
+                        )
+                    )
                     continue
             aligned.append(
                 _handle_missing_alignment(
@@ -1318,7 +1340,15 @@ def _align_asset_interpolate(
                 if gap_from_left <= max_gap_ms:
                     value = values[left]
                     confidence = confidences[left]
-                    aligned.append(_build_aligned_record(t_dt, value, representation, float(confidence)))
+                    aligned.append(
+                        _build_aligned_record(
+                            t_dt,
+                            value,
+                            representation,
+                            float(confidence),
+                            observed=False,
+                        )
+                    )
                     continue
             aligned.append(
                 _handle_missing_alignment(
@@ -1336,7 +1366,15 @@ def _align_asset_interpolate(
         value = values[left] + alpha * (values[right] - values[left])
         confidence = float(confidences[left] + alpha * (confidences[right] - confidences[left]))
         confidence = float(np.clip(confidence, 0.0, 1.0))
-        aligned.append(_build_aligned_record(t_dt, value, representation, confidence))
+        aligned.append(
+            _build_aligned_record(
+                t_dt,
+                value,
+                representation,
+                confidence,
+                observed=False,
+            )
+        )
 
     return aligned
 
@@ -1386,7 +1424,15 @@ def _align_asset_bucket(
                 gap_ms = int(t_ms - last_record_time_ms)
                 if 0 <= gap_ms <= max_gap_ms:
                     value, confidence = _extract_single_record_value(last_record, representation)
-                    aligned.append(_build_aligned_record(t_dt, value, representation, confidence))
+                    aligned.append(
+                        _build_aligned_record(
+                            t_dt,
+                            value,
+                            representation,
+                            confidence,
+                            observed=False,
+                        )
+                    )
                     continue
             aligned.append(
                 _handle_missing_alignment(
@@ -1401,7 +1447,15 @@ def _align_asset_bucket(
             continue
         record = record_entry[1]
         value, confidence = _extract_single_record_value(record, representation)
-        aligned.append(_build_aligned_record(t_dt, value, representation, confidence))
+        aligned.append(
+            _build_aligned_record(
+                t_dt,
+                value,
+                representation,
+                confidence,
+                observed=record.observed,
+            )
+        )
         last_record = record
         last_record_time_ms = int(record.timestamp.astype("datetime64[ms]").astype("int64"))
 
@@ -1447,6 +1501,7 @@ def _build_aligned_record(
     value: np.ndarray,
     representation: str,
     confidence: float,
+    observed: bool,
 ) -> SnapshotRecord:
     confidence = float(np.clip(confidence, 0.0, 1.0))
     if representation == "hybrid":
@@ -1467,6 +1522,7 @@ def _build_aligned_record(
             volume_proxy=0.0,
             confidence=confidence,
             gap_reset=False,
+            observed=observed,
         )
 
     features = np.asarray(value, dtype="float32")
@@ -1486,6 +1542,7 @@ def _build_aligned_record(
         volume_proxy=0.0,
         confidence=confidence,
         gap_reset=False,
+        observed=observed,
     )
 
 
@@ -1540,6 +1597,7 @@ def _zero_pad_record(
             volume_proxy=0.0,
             confidence=0.0,
             gap_reset=False,
+            observed=False,
         )
 
     return SnapshotRecord(
@@ -1551,6 +1609,7 @@ def _zero_pad_record(
         volume_proxy=0.0,
         confidence=0.0,
         gap_reset=False,
+        observed=False,
     )
 
 
@@ -1647,8 +1706,16 @@ def _build_snapshot_chunks(
         y_up = np.asarray([s.y_up for s in chunk_samples], dtype="int64")
         y_down = np.asarray([s.y_down for s in chunk_samples], dtype="int64")
         anchor_ts = np.asarray([s.anchor_ts_seconds for s in chunk_samples], dtype="int64")
+        duty_cycle = np.asarray([s.duty_cycle for s in chunk_samples], dtype="float32")
 
-        np.savez_compressed(file_path, x=x, y_up=y_up, y_down=y_down, anchor_ts=anchor_ts)
+        np.savez_compressed(
+            file_path,
+            x=x,
+            y_up=y_up,
+            y_down=y_down,
+            anchor_ts=anchor_ts,
+            duty_cycle=duty_cycle,
+        )
 
         entry = {
             "start": chunk_start,
@@ -2103,6 +2170,7 @@ def _build_snapshots_from_rows(
                 volume_proxy=volume_proxy,
                 confidence=1.0,
                 gap_reset=False,
+                observed=True,
             )
         )
 

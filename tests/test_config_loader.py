@@ -1,5 +1,7 @@
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from utils.config_loader import ConfigError, _resolve_env_placeholders, load_config
@@ -33,6 +35,32 @@ class TestConfigLoader(unittest.TestCase):
     def test_resolve_env_placeholders_missing_variable_raises(self) -> None:
         with self.assertRaises(ConfigError):
             _resolve_env_placeholders("${MISSING_ENV_VAR}")
+
+    def test_base_config_override_merges(self) -> None:
+        base_config_path = os.path.abspath("config/training_config.yaml")
+        override_yaml = f"""
+base_config: "{base_config_path}"
+training:
+  epochs: 2
+"""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            override_path = Path(tmpdir) / "override.yaml"
+            override_path.write_text(override_yaml, encoding="utf-8")
+
+            env = {
+                "DATABASE_URI": "http://example-db",
+                "DATABASE_URI_HIST": "http://example-db-hist",
+                "DATABASE_URI_LIVE": "http://example-db-live",
+                "MLFLOW_TRACKING_URI": "http://mlflow",
+            }
+            with mock.patch.dict(os.environ, env, clear=False):
+                config = load_config(
+                    config_path=str(override_path),
+                    schema_path="config/validation_schema.yaml",
+                )
+
+            self.assertEqual(int(config["training"]["epochs"]), 2)
 
 
 if __name__ == "__main__":  # pragma: no cover

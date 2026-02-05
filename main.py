@@ -15,6 +15,7 @@ Current responsibilities (Phase 2):
 No model training is performed yet.
 """
 
+import argparse
 import sys
 from typing import Any, Dict
 from datetime import datetime
@@ -48,10 +49,26 @@ def _enforce_production_sample_cap(config: Dict[str, Any], n_samples: int) -> No
         )
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Binance ML Training Platform")
+    parser.add_argument(
+        "--config",
+        default="config/training_config.yaml",
+        help="Path to training configuration YAML",
+    )
+    parser.add_argument(
+        "--schema",
+        default="config/validation_schema.yaml",
+        help="Path to configuration schema YAML",
+    )
+    return parser.parse_args()
+
+
 def main() -> int:
     # Initial minimal logging to stderr in case config loading fails
     try:
-        config = load_config()
+        args = _parse_args()
+        config = load_config(config_path=args.config, schema_path=args.schema)
     except ConfigError as exc:
         # Use a very simple stderr output here; colored logging is not yet available
         sys.stderr.write(f"Configuration error: {exc}\n")

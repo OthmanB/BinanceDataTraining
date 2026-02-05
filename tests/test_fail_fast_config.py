@@ -188,6 +188,7 @@ class TestFailFastAlignmentConfig:
             volume_proxy=0.0,
             confidence=1.0,
             gap_reset=False,
+            observed=True,
         )
 
         asset_records = {"BTCUSDT": [record], "ETHUSDT": [record]}

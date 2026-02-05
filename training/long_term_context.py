@@ -299,7 +299,7 @@ def wrap_generator_with_long_term(
 
         # Replace x with [x, lt_batch]
         x_short = batch_data[0]
-        x_dual = [x_short, lt_batch]
+        x_dual = (x_short, lt_batch)
 
         if len(batch_data) == 2:
             # (x, y) -> ([x, lt], y)

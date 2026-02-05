@@ -185,7 +185,7 @@ class TestWrapGeneratorWithLongTerm(unittest.TestCase):
         self.assertEqual(len(result), 2)  # ([x, lt], y)
 
         x_dual, y_out = result
-        self.assertIsInstance(x_dual, list)
+        self.assertIsInstance(x_dual, tuple)
         self.assertEqual(len(x_dual), 2)
         np.testing.assert_array_equal(x_dual[0], x)
         np.testing.assert_array_equal(x_dual[1], long_term_features)
@@ -209,7 +209,7 @@ class TestWrapGeneratorWithLongTerm(unittest.TestCase):
         self.assertEqual(len(result), 3)  # ([x, lt], y, sw)
 
         x_dual, y_out, sw_out = result
-        self.assertIsInstance(x_dual, list)
+        self.assertIsInstance(x_dual, tuple)
         self.assertEqual(len(x_dual), 2)
         np.testing.assert_array_equal(x_dual[0], x)
         np.testing.assert_array_equal(x_dual[1], long_term_features)
