@@ -1,10 +1,7 @@
-"""Configuration loading and validation utilities for Binance ML Training Platform.
+"""Configuration loading and validation utilities.
 
-Phase 1 responsibilities:
-- Load training_config.yaml
-- Resolve environment variables in ${VAR} placeholders
-- Validate against validation_schema.yaml
-- Fail fast on missing or invalid parameters
+Loads YAML configuration, resolves environment placeholders, validates against
+the schema, and fails fast on invalid or missing parameters.
 """
 
 import os

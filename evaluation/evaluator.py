@@ -1,4 +1,4 @@
-"""Model evaluation skeleton."""
+"""Model evaluation utilities."""
 
 from __future__ import annotations
 
@@ -49,10 +49,7 @@ BACKTEST_MEMORY_WARN_THRESHOLD = 1_000_000
 
 
 def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, Any]) -> None:
-    """Evaluate a trained model.
-
-    Phase 3: placeholder that logs invocation only.
-    """
+    """Evaluate a trained model."""
 
     metadata = data_object["metadata"]
     n_samples = int(metadata["num_samples"])
@@ -754,6 +751,14 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
 def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
     """Evaluate a trained model using snapshot datasets."""
 
+    writer = None
+    try:
+        from observability.run_state import get_run_state_writer
+
+        writer = get_run_state_writer()
+    except Exception:
+        writer = None
+
     snapshot_dataset = prepare_snapshot_dataset(config)
     n_samples = int(snapshot_dataset.total_samples)
     if n_samples <= 0:
@@ -873,6 +878,15 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
     batch_size = int(training_cfg["batch_size"])
     if batch_size <= 0:
         raise ValueError("training.batch_size must be positive")
+
+    total_eval_samples = test_end - test_start
+    total_eval_batches = int(np.ceil(total_eval_samples / float(batch_size))) if total_eval_samples > 0 else 0
+    eval_batches_done = 0
+    if writer is not None:
+        try:
+            writer.update_eval_progress(processed=0, total=total_eval_batches)
+        except Exception:
+            pass
 
     eval_cfg = config["evaluation"]
     calib_cfg = eval_cfg["calibration_analysis"]
@@ -1342,6 +1356,12 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
                     backtest_prob_down_parts.append(y_prob_down)
 
             sample_offset += int(y_true_up.shape[0])
+            eval_batches_done += 1
+            if writer is not None:
+                try:
+                    writer.update_eval_progress(processed=eval_batches_done, total=total_eval_batches)
+                except Exception:
+                    pass
 
     if total_eval <= 0:
         logger.info("Snapshot evaluation found no samples after batching; skipping.")

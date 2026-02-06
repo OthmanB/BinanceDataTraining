@@ -1,12 +1,7 @@
-"""Data loading utilities for Binance ML Training Platform (Phase 2 skeleton).
+"""Data loading utilities for Binance ML Training Platform.
 
-In later phases this module will:
-- Connect to configured data sources (e.g., GreptimeDB instances)
-- Fetch raw order book and auxiliary data
-- Build fully populated DataObject instances
-
-For Phase 2, it constructs an empty-but-structurally valid DataObject from configuration
-metadata, to be used for wiring and testing the pipeline.
+Connects to configured data sources, fetches raw order book data, and constructs
+DataObject instances for downstream preprocessing and training.
 """
 
 from typing import Any, Dict, List
@@ -34,11 +29,7 @@ def _get_asset_pairs_from_config(config: Dict[str, Any]) -> List[str]:
 
 
 def create_empty_data_object_from_config(config: Dict[str, Any]) -> DataObject:
-    """Create an empty DataObject using configuration metadata.
-
-    This is a Phase 2 placeholder that sets up the expected structure but does not
-    fetch any real data yet.
-    """
+    """Create an empty DataObject using configuration metadata."""
 
     data_cfg = config["data"]
     time_range_cfg = data_cfg["time_range"]
@@ -91,16 +82,9 @@ def create_empty_data_object_from_config(config: Dict[str, Any]) -> DataObject:
 
 
 def load_order_book_data(config: Dict[str, Any]) -> DataObject:
-    """Load order book data and return a DataObject.
+    """Load order book data and return a DataObject."""
 
-    Phase 2 implementation:
-    - Performs a minimal GreptimeDB connectivity check using the HTTP SQL API
-    - Returns a structurally valid but empty DataObject.
-    Future phases will connect to real data sources based on the configuration
-    and populate the DataObject with actual samples.
-    """
-
-    logger.info("Loading order book data using Phase 2.5 real ingestion from GreptimeDB.")
+    logger.info("Loading order book data from GreptimeDB.")
 
     # Connectivity check to the configured GreptimeDB instance
     check_greptime_connectivity(config)
@@ -124,7 +108,7 @@ def load_order_book_data(config: Dict[str, Any]) -> DataObject:
 
     data_object["order_books"] = order_books
 
-    # num_samples is defined as the number of rows for the target asset at this phase
+    # num_samples is defined as the number of rows for the target asset
     metadata = data_object.get("metadata", {})
     metadata["num_samples"] = len(target_rows)
     data_object["metadata"] = metadata

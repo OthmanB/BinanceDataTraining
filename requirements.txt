@@ -33,3 +33,6 @@ tensorflow==2.16.2; sys_platform == "linux" and python_version >= "3.12" and pyt
 
 # tests
 pytest>=9.0.2
+
+# observability
+prometheus-client==0.20.0

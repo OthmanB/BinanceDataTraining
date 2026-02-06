@@ -1,17 +1,7 @@
-"""Minimal GreptimeDB HTTP client.
+"""GreptimeDB HTTP client.
 
-Phase: connectivity check only.
-
-This module uses the existing YAML configuration fields:
-- data.connection.database_uri
-- data.connection.table_prefix
-- data.asset_pairs.target_asset
-- data.asset_pairs.correlated_assets
-
-to derive per-asset table names (e.g. ``orderbook_btcusdt``) and issue
-lightweight SQL queries via the GreptimeDB HTTP API (``/v1/sql``). It logs
-whether the endpoint is reachable but does **not** yet fetch real training
-samples into the DataObject.
+Uses configuration to derive per-asset table names (e.g. ``orderbook_btcusdt``)
+and stream order book chunks via the GreptimeDB HTTP SQL API (``/v1/sql``).
 """
 
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -264,7 +254,7 @@ def fetch_order_book_rows(config: Dict[str, Any]) -> Dict[str, List[List[Any]]]:
     max_concurrent = int(ingestion_cfg["max_concurrent_chunk_fetches"])
     if max_concurrent != 1:
         raise ValueError(
-            "data.ingestion.max_concurrent_chunk_fetches must be 1 in this phase; "
+            "data.ingestion.max_concurrent_chunk_fetches must be 1; "
             f"got {max_concurrent}"
         )
 
@@ -388,7 +378,7 @@ def stream_order_book_chunks(
     max_concurrent = int(ingestion_cfg["max_concurrent_chunk_fetches"])
     if max_concurrent != 1:
         raise ValueError(
-            "data.ingestion.max_concurrent_chunk_fetches must be 1 in this phase; "
+            "data.ingestion.max_concurrent_chunk_fetches must be 1; "
             f"got {max_concurrent}"
         )
 
@@ -511,7 +501,7 @@ def stream_order_book_chunks_by_time(
     max_concurrent = int(ingestion_cfg["max_concurrent_chunk_fetches"])
     if max_concurrent != 1:
         raise ValueError(
-            "data.ingestion.max_concurrent_chunk_fetches must be 1 in this phase; "
+            "data.ingestion.max_concurrent_chunk_fetches must be 1; "
             f"got {max_concurrent}"
         )
 

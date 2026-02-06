@@ -1,8 +1,7 @@
-"""Colored logging setup for Binance ML Training Platform.
+"""Logging utilities for colorized output.
 
-Phase 1 responsibilities:
-- Configure Python logging based on YAML config
-- Add colored output and function/module context
+Configures Python logging based on YAML settings and adds colored output with
+function/module context.
 """
 
 import logging
@@ -21,11 +20,17 @@ class ColoredFormatter(logging.Formatter):
         level_color = self.colors.get(level, "white")
         func_color = self.colors.get("function_names", "cyan")
 
-        # Colorize level name and function name
-        record.levelname = colored(record.levelname, level_color)
-        record.funcName = colored(record.funcName, func_color)
-
-        return super().format(record)
+        # Colorize level name and function name for this formatter only.
+        # Avoid mutating the LogRecord shared across handlers (e.g., file logs).
+        original_levelname = record.levelname
+        original_func_name = record.funcName
+        try:
+            record.levelname = colored(original_levelname, level_color)
+            record.funcName = colored(original_func_name, func_color)
+            return super().format(record)
+        finally:
+            record.levelname = original_levelname
+            record.funcName = original_func_name
 
 
 def setup_colored_logging(config: Dict[str, Any]) -> logging.Logger:

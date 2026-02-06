@@ -1,0 +1,33 @@
+# Observability server configuration (non-secrets)
+#
+# Secrets (Basic Auth) must be provided via environment variables:
+#   - OBSERVABILITY_USER
+#   - OBSERVABILITY_PASSWORD
+#
+# These settings can also be overridden via environment variables:
+#   - OBSERVABILITY_HOST, OBSERVABILITY_PORT
+#   - RUN_STATE_PATH, RUN_LOG_PATH
+#   - OBSERVABILITY_ALLOW_RUN_CONTROL
+#   - OBSERVABILITY_ALLOWED_CONFIGS_GLOB
+#   - OBSERVABILITY_STATIC_DIR
+#   - OBSERVABILITY_TAIL_MAX_LINES
+
+host: "0.0.0.0"
+port: 8008
+
+# Paths for run state JSON and plain-text run logs.
+# Use absolute paths in production; relative paths are resolved from repo root.
+run_state_path: "tmp/observability/run_state.json"
+run_log_path: "tmp/observability/run.log"
+
+# When true, enables starting/stopping `main.py` runs from the UI.
+allow_run_control: false
+
+# Allow-listed training configs for run control.
+allowed_configs_glob: "config/e2e_trial_*.yaml"
+
+# Static directory served under /static/ (must contain htmx.min.js).
+static_dir: "static"
+
+# Max lines to show in log tail.
+tail_max_lines: 200

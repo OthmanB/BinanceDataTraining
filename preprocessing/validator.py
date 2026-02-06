@@ -1,6 +1,6 @@
 """Preprocessing validation utilities.
 
-Phase 2 focuses on structural validation of DataObject instances.
+Focuses on structural validation of DataObject instances.
 """
 
 from typing import Any, Dict

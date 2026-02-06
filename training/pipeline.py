@@ -1,12 +1,7 @@
-"""Training pipeline skeleton.
+"""Training pipeline for snapshot-based datasets.
 
-In later phases this module will:
-- Transform DataObject into model-ready tensors
-- Build and compile models
-- Run training, validation, and evaluation
-- Integrate with MLFlow for experiment tracking
-
-Phase 3 only logs that the training pipeline has been invoked.
+Builds training datasets from snapshots, trains models, and logs metrics and
+artifacts to MLflow when configured.
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -137,7 +132,7 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
     configured_val_split = float(training_cfg["validation_split"])
     if abs(configured_val_split - validation_ratio) > 1e-6:
         raise ValueError(
-            "training.validation_split must match preprocessing.train_test_split.validation_ratio in this phase",
+            "training.validation_split must match preprocessing.train_test_split.validation_ratio",
         )
 
     model_cfg = config["model"]
@@ -444,6 +439,24 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
             batch_size=batch_size,
         )
 
+    writer = None
+    try:
+        from observability.run_state import get_run_state_writer
+
+        writer = get_run_state_writer()
+    except Exception:
+        writer = None
+
+    if writer is not None and epochs > 0 and train_steps > 0:
+        try:
+            from observability.training_progress import create_training_progress_callback
+
+            progress_cb = create_training_progress_callback(writer, epochs=epochs, steps_per_epoch=train_steps)
+        except Exception:
+            progress_cb = None
+        if progress_cb is not None:
+            callbacks.append(progress_cb)
+
     fit_kwargs: Dict[str, Any] = {
         "x": train_gen,
         "epochs": epochs,
@@ -577,9 +590,9 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
             logger.info("Logging trained model to MLFlow using mlflow.tensorflow.log_model.")
             try:
                 if signature is not None:
-                    mlflow.tensorflow.log_model(model, "model", signature=signature)  # type: ignore[attr-defined]
+                    mlflow.tensorflow.log_model(model, "model", signature=signature)  # type: ignore[attr-defined,unused-ignore]
                 else:
-                    mlflow.tensorflow.log_model(model, "model")  # type: ignore[attr-defined]
+                    mlflow.tensorflow.log_model(model, "model")  # type: ignore[attr-defined,unused-ignore]
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to log trained model to MLFlow: %s", exc)
 
@@ -624,10 +637,7 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
 
 
 def run_training_pipeline(config: Dict[str, Any], data_object: Optional[Dict[str, Any]]) -> Optional[Any]:
-    """Execute the training pipeline (Phase 3 skeleton).
-
-    No actual model training is performed yet.
-    """
+    """Execute the training pipeline."""
 
     snapshot_cfg = config["snapshot"]
     if bool(snapshot_cfg["enabled"]):
@@ -682,7 +692,6 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Optional[Dict[str
 
     x_train = None
     x_val = None
-
     if snapshot_features:
         logger.info(
             "Using snapshot_features for training inputs (target_asset=%s). available_snapshots=%s",
@@ -1304,7 +1313,7 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Optional[Dict[str
         data_object["metadata"] = metadata
 
     logger.info(
-        "Training pipeline completed (Phase 3 minimal). effective_train_n=%s, final_loss=%s",
+        "Training pipeline completed. effective_train_n=%s, final_loss=%s",
         effective_train_n,
         final_loss,
     )

@@ -1,8 +1,7 @@
 """Environment variable validation utilities.
 
-Phase 1 responsibilities:
-- Read required environment variables from configuration
-- Enforce presence at startup when requested
+Reads required environment variables from configuration and enforces presence
+at startup when requested.
 """
 
 import os

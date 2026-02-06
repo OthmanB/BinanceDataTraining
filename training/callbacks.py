@@ -1,7 +1,6 @@
-"""Training callbacks skeleton.
+"""Training callbacks utilities.
 
-Phase 3 defines the interface for creating Keras callbacks based on the
-configuration but does not instantiate any real callbacks yet.
+Creates Keras callbacks based on configuration when TensorFlow is available.
 """
 
 from typing import Any, Dict, List
@@ -12,18 +11,14 @@ logger = logging.getLogger(__name__)
 
 
 def create_callbacks(config: Dict[str, Any]) -> List[Any]:
-    """Create a list of training callbacks.
-
-    Phase 3: returns an empty list and logs the configuration options that
-    would be used to create callbacks in later phases.
-    """
+    """Create a list of training callbacks."""
 
     callbacks_cfg = config["training"]["callbacks"]
     es_cfg = callbacks_cfg["early_stopping"]
     rl_cfg = callbacks_cfg["reduce_lr"]
 
     logger.info(
-        "create_callbacks called (Phase 3 skeleton). early_stopping.enabled=%s, reduce_lr.enabled=%s",
+        "Creating callbacks. early_stopping.enabled=%s, reduce_lr.enabled=%s",
         es_cfg["enabled"],
         rl_cfg["enabled"],
     )

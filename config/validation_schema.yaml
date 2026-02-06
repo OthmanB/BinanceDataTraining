@@ -242,6 +242,10 @@ sections:
         type: integer
       missing_snapshot_strategy:
         type: string
+      runtime.device:
+        type: string
+      runtime.gpu_visible_devices:
+        type: any
       callbacks.early_stopping.enabled:
         type: boolean
       callbacks.early_stopping.monitor:

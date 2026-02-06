@@ -1,4 +1,4 @@
-"""MLFlow integration utilities (skeleton)."""
+"""MLFlow integration utilities."""
 
 from .experiment_tracker import (
     start_run,

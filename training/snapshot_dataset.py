@@ -1628,11 +1628,55 @@ def _handle_missing_alignment(
     return None
 
 
+class _DutyCycleAccumulator:
+    def __init__(self, bins: int = 200) -> None:
+        if bins < 2:
+            raise ValueError("bins must be >= 2")
+        self._bins = bins
+        self._counts = np.zeros(bins, dtype="int64")
+        self._min: Optional[float] = None
+        self._total = 0
+
+    def add_values(self, values: np.ndarray) -> None:
+        values = np.asarray(values, dtype="float64")
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            return
+        values = np.clip(values, 0.0, 1.0)
+        current_min = float(values.min())
+        self._min = current_min if self._min is None else min(self._min, current_min)
+        self._total += int(values.size)
+        indices = np.clip((values * (self._bins - 1)).astype("int64"), 0, self._bins - 1)
+        counts = np.bincount(indices, minlength=self._bins).astype("int64")
+        self._counts += counts
+
+    def summary(self) -> Optional[Tuple[float, float, float]]:
+        if self._total == 0 or self._min is None:
+            return None
+        median = self._quantile(0.5)
+        p95 = self._quantile(0.95)
+        return float(self._min), float(median), float(p95)
+
+    def _quantile(self, q: float) -> float:
+        target = max(1, int(math.ceil(q * self._total)))
+        cumulative = np.cumsum(self._counts)
+        idx = int(np.searchsorted(cumulative, target, side="left"))
+        idx = min(max(idx, 0), self._bins - 1)
+        return idx / float(self._bins - 1)
+
+
 def _build_snapshot_chunks(
     config: Dict[str, Any],
     context: SnapshotContext,
     manifest: Dict[str, Any],
 ) -> Dict[str, Any]:
+    writer = None
+    try:
+        from observability.run_state import get_run_state_writer
+
+        writer = get_run_state_writer()
+    except Exception:
+        writer = None
     data_cfg = config["data"]
     time_range_cfg = data_cfg["time_range"]
     start_date = str(time_range_cfg["start_date"])
@@ -1652,6 +1696,27 @@ def _build_snapshot_chunks(
 
     output_chunks = _generate_time_chunks(start_date, end_date, chunk_hours)
     output_boundaries = _build_output_boundaries(output_chunks)
+    chunks_total = len(output_boundaries)
+    chunks_processed = 0
+
+    if writer is not None:
+        try:
+            writer.update_snapshot_progress(processed=0, total=chunks_total)
+        except Exception:
+            pass
+
+    duty_cycle_stats = _DutyCycleAccumulator()
+
+    def _update_duty_cycle_writer() -> None:
+        if writer is None:
+            return
+        summary = duty_cycle_stats.summary()
+        if summary is None:
+            return
+        try:
+            writer.update_duty_cycle_stats(*summary)
+        except Exception:  # noqa: BLE001
+            pass
 
     manifest["complete"] = False
     save_manifest(context, manifest)
@@ -1683,17 +1748,42 @@ def _build_snapshot_chunks(
 
     def flush_chunk(index: int) -> None:
         nonlocal chunk_samples
+        nonlocal chunks_processed
         if index >= len(output_boundaries):
             chunk_samples = []
             return
 
         boundary = output_boundaries[index]
         if boundary["cached"]:
+            key = (boundary["start_str"], boundary["end_str"])
+            entry = existing_entries.get(key, {})
+            file_rel = entry.get("file")
+            if file_rel:
+                file_path = os.path.join(context.snapshot_dir, file_rel)
+                try:
+                    with np.load(file_path) as npz:
+                        if "duty_cycle" in npz:
+                            duty_cycle_stats.add_values(npz["duty_cycle"])
+                            _update_duty_cycle_writer()
+                except Exception:  # noqa: BLE001
+                    logger.warning("Failed to load duty_cycle from cached chunk: %s", file_path)
             chunk_samples = []
+            chunks_processed += 1
+            if writer is not None:
+                try:
+                    writer.update_snapshot_progress(processed=chunks_processed, total=chunks_total)
+                except Exception:
+                    pass
             return
 
         if not chunk_samples:
             chunk_samples = []
+            chunks_processed += 1
+            if writer is not None:
+                try:
+                    writer.update_snapshot_progress(processed=chunks_processed, total=chunks_total)
+                except Exception:
+                    pass
             return
 
         chunk_start = boundary["start_str"]
@@ -1707,6 +1797,9 @@ def _build_snapshot_chunks(
         y_down = np.asarray([s.y_down for s in chunk_samples], dtype="int64")
         anchor_ts = np.asarray([s.anchor_ts_seconds for s in chunk_samples], dtype="int64")
         duty_cycle = np.asarray([s.duty_cycle for s in chunk_samples], dtype="float32")
+
+        duty_cycle_stats.add_values(duty_cycle)
+        _update_duty_cycle_writer()
 
         np.savez_compressed(
             file_path,
@@ -1727,6 +1820,13 @@ def _build_snapshot_chunks(
         _upsert_chunk_entry(manifest, entry)
         save_manifest(context, manifest)
         chunk_samples = []
+
+        chunks_processed += 1
+        if writer is not None:
+            try:
+                writer.update_snapshot_progress(processed=chunks_processed, total=chunks_total)
+            except Exception:
+                pass
 
     current_chunk_key: Optional[Tuple[str, str]] = None
     chunk_rows: Dict[str, List[List[Any]]] = {}
