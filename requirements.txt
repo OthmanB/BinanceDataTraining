@@ -24,7 +24,8 @@ hypothesis>=6.100.0
 tensorflow==2.15.0; sys_platform == "darwin" and python_version >= "3.9" and python_version < "3.12"
 tensorflow==2.15.0; sys_platform == "linux" and python_version >= "3.9" and python_version < "3.12"
 tensorflow==2.16.2; sys_platform == "darwin" and python_version >= "3.12" and python_version < "3.13"
-tensorflow==2.16.2; sys_platform == "linux" and python_version >= "3.12" and python_version < "3.13"
+# Linux Python 3.12+: include CUDA runtime/cuDNN wheels for reproducible GPU setup in .venv.
+tensorflow[and-cuda]==2.16.2; sys_platform == "linux" and python_version >= "3.12" and python_version < "3.13"
 
 # Optional: if you later use numpy/pandas explicitly, they will be pulled in by TF/MLflow,
 # but you can pin them here if you want deterministic versions.

@@ -1,0 +1,62 @@
+base_config: "training_config.yaml"
+
+run_mode:
+  mode: "production"
+
+data:
+  time_range:
+    start_date: "2024-01-01"
+    end_date: "2024-01-06"
+  asset_pairs:
+    correlated_assets: []
+  validation:
+    fail_on_invalid: false
+    max_gap_seconds: 600
+
+training:
+  epochs: 1
+  batch_size: 8
+  debug_max_samples: 100000
+  sequential_training:
+    enabled: true
+    window_days: 5
+    cleanup_completed_windows: false
+
+hyperparameter_optimization:
+  enabled: true
+  framework: "optuna"
+  n_trials: 1
+  direction: "minimize"
+  metric: "loss"
+  trial_model_logging:
+    enabled: false
+  search_space:
+    cnn_filters_1: [32, 64]
+    cnn_filters_2: [64, 128]
+    lstm_units: [64, 96]
+    learning_rate: [0.0005, 0.001]
+    batch_size: [8, 16]
+
+snapshot:
+  enabled: true
+  root_name: "e2e_trials_v2"
+  name: "trial_14_snapshot_hpo_production"
+
+evaluation:
+  calibration_analysis:
+    enabled: false
+  post_hoc_calibration:
+    enabled: false
+  temporal_degradation:
+    enabled: false
+  backtesting:
+    enabled: false
+
+mlflow:
+  artifact_logging:
+    trained_model: false
+  model_registry:
+    register_model: false
+
+diagnostics:
+  enabled: false

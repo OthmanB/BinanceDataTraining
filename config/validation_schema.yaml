@@ -296,6 +296,25 @@ sections:
         type: string
       dataset_cache.version:
         type: string
+    optional_keys:
+      runtime.gpu_memory_growth:
+        type: boolean
+      runtime.gpu_allocator:
+        type: string
+      runtime.gpu_init_lock_enabled:
+        type: boolean
+      runtime.gpu_init_stagger_seconds:
+        type: number
+      sequential_training.enabled:
+        type: boolean
+      sequential_training.window_days:
+        type: integer
+      sequential_training.cleanup_completed_windows:
+        type: boolean
+      sequential_training.cleanup_keep_last_windows:
+        type: integer
+      sequential_training.resume_enabled:
+        type: boolean
 
   snapshot:
     type: dict
@@ -329,6 +348,47 @@ sections:
       search_space:
         type: dict
       trial_model_logging.enabled:
+        type: boolean
+    optional_keys:
+      parallel.enabled:
+        type: boolean
+      parallel.resources:
+        type: list
+      parallel.storage_uri:
+        type: any
+      parallel.study_name:
+        type: any
+      regime.enabled:
+        type: boolean
+      regime.retry_on_oom:
+        type: boolean
+      regime.max_retry_attempts:
+        type: integer
+      regime.batch_backoff_factor:
+        type: number
+      regime.min_batch_size:
+        type: integer
+      regime.failure_policy:
+        type: string
+      regime.failure_penalty_value:
+        type: number
+      regime.max_vram_fraction:
+        type: any
+      regime.vram_penalty_weight:
+        type: number
+      regime.low_utilization_penalty.enabled:
+        type: boolean
+      regime.low_utilization_penalty.min_samples_per_second:
+        type: number
+      regime.low_utilization_penalty.weight:
+        type: number
+      regime.safe_envelope.enabled:
+        type: boolean
+      regime.safe_envelope.min_success_trials:
+        type: integer
+      regime.safe_envelope.headroom_fraction:
+        type: number
+      regime.safe_envelope.persistence_enabled:
         type: boolean
 
   mlflow:

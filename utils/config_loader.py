@@ -87,6 +87,16 @@ def _get_nested(config: Dict[str, Any], dotted_key: str) -> Any:
     return current
 
 
+def _has_nested(config: Dict[str, Any], dotted_key: str) -> bool:
+    parts = dotted_key.split(".")
+    current: Any = config
+    for part in parts:
+        if not isinstance(current, dict) or part not in current:
+            return False
+        current = current[part]
+    return True
+
+
 def _validate_section(config: Dict[str, Any], section_name: str, section_schema: Dict[str, Any]) -> None:
     if section_name not in config:
         raise ConfigError(f"Missing required section in configuration: '{section_name}'")
@@ -101,6 +111,20 @@ def _validate_section(config: Dict[str, Any], section_name: str, section_schema:
     required_keys = section_schema.get("required_keys", {})
     for dotted_key, key_schema in required_keys.items():
         full_key = f"{section_name}.{dotted_key}" if dotted_key else section_name
+        value = _get_nested(config, full_key)
+        expected_type_name = key_schema.get("type", "any")
+        expected_py_type = _TYPE_MAP.get(expected_type_name)
+        if expected_py_type is not None and not isinstance(value, expected_py_type):
+            raise ConfigError(
+                f"Configuration key '{full_key}' must be of type {expected_type_name} "
+                f"but got {type(value).__name__}"
+            )
+
+    optional_keys = section_schema.get("optional_keys", {})
+    for dotted_key, key_schema in optional_keys.items():
+        full_key = f"{section_name}.{dotted_key}" if dotted_key else section_name
+        if not _has_nested(config, full_key):
+            continue
         value = _get_nested(config, full_key)
         expected_type_name = key_schema.get("type", "any")
         expected_py_type = _TYPE_MAP.get(expected_type_name)

@@ -240,6 +240,17 @@ training:  # Controls how the model is fit on the prepared dataset.
   runtime:
     device: "gpu"  # Compute device target for training: "cpu" or "gpu".
     gpu_visible_devices: null  # Optional CUDA device list (e.g. "0" or "0,1"); null uses default visibility.
+    gpu_memory_growth: false  # When true, enable TensorFlow memory growth on visible GPUs (recommended for parallel workers).
+    gpu_allocator: "default"  # GPU allocator policy: "default" or "cuda_malloc_async".
+    gpu_init_lock_enabled: false  # When true in parallel HPO workers, serialize initial TensorFlow GPU context setup.
+    gpu_init_stagger_seconds: 0  # Optional startup delay (seconds) before GPU worker initialization.
+
+  sequential_training:
+    enabled: false  # When true, split data.time_range into rolling day windows and train continuously window-by-window.
+    window_days: 7  # Window size in days used when sequential_training.enabled is true.
+    cleanup_completed_windows: false  # When true, delete each completed window snapshot directory after training on it.
+    cleanup_keep_last_windows: 0  # Number of most-recent completed windows to retain when cleanup_completed_windows is true.
+    resume_enabled: false  # When true, persist sequential progress/model checkpoints and resume interrupted runs.
 
   dataset_cache:
     enabled: false                                  # When true, cache constructed datasets to NPZ files for reuse.
@@ -298,6 +309,32 @@ hyperparameter_optimization:  # Controls Optuna-based search over selected hyper
 
   trial_model_logging:
     enabled: false  # When false, HPO trials do not log or register models in MLflow; set true only when inspecting per-trial models.
+
+  parallel:
+    enabled: false  # When true, distribute HPO trials across multiple worker processes/resources.
+    resources: []  # Resource list like ["gpu:0", "gpu:1", "cpu"]; each worker is pinned to one entry.
+    storage_uri: null  # Optional Optuna storage URI (e.g. sqlite:///tmp/optuna/hpo.db); null auto-creates local SQLite.
+    study_name: null  # Optional Optuna study name used by parallel workers; null defaults to "binance_hpo".
+
+  regime:
+    enabled: false  # When true, apply adaptive safeguards/penalties to keep HPO trials in stable GPU/CPU operating regimes.
+    retry_on_oom: true  # Retry trial training after memory-related failures by reducing batch size.
+    max_retry_attempts: 2  # Maximum number of OOM-triggered retries per trial.
+    batch_backoff_factor: 0.5  # Multiplicative batch-size reduction applied on each retry.
+    min_batch_size: 4  # Lower bound for adaptive batch backoff.
+    failure_policy: "prune"  # "prune" marks exhausted trials as pruned; "penalize" returns a large synthetic objective.
+    failure_penalty_value: 1000000.0  # Objective magnitude used when failure_policy="penalize".
+    max_vram_fraction: null  # Optional soft VRAM usage cap in [0,1]; penalties apply when exceeded and telemetry is available.
+    vram_penalty_weight: 1.0  # Weight multiplier for VRAM-overuse penalty.
+    low_utilization_penalty:
+      enabled: false  # When true, penalize trials with low throughput estimates.
+      min_samples_per_second: 0.0  # Throughput target; no penalty when <= 0.
+      weight: 0.0  # Penalty weight applied to throughput deficit.
+    safe_envelope:
+      enabled: true  # Clamp sampled batch sizes to empirically safe ranges learned from prior runs.
+      min_success_trials: 2  # Minimum successful observations before success-based envelope capping activates.
+      headroom_fraction: 1.0  # Fraction in (0,1] applied to learned cap for additional safety margin.
+      persistence_enabled: true  # Persist learned envelope memory to disk for reuse in future runs.
 
   search_space:
     cnn_filters_1: [16, 128]      # Integer range [low, high] for the first CNN filter size.

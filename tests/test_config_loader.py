@@ -62,6 +62,34 @@ training:
 
             self.assertEqual(int(config["training"]["epochs"]), 2)
 
+    def test_optional_schema_key_type_is_validated_when_present(self) -> None:
+        base_config_path = os.path.abspath("config/training_config.yaml")
+        override_yaml = f"""
+base_config: "{base_config_path}"
+training:
+  sequential_training:
+    enabled: true
+    window_days: "seven"
+    cleanup_completed_windows: false
+"""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            override_path = Path(tmpdir) / "override_bad_optional.yaml"
+            override_path.write_text(override_yaml, encoding="utf-8")
+
+            env = {
+                "DATABASE_URI": "http://example-db",
+                "DATABASE_URI_HIST": "http://example-db-hist",
+                "DATABASE_URI_LIVE": "http://example-db-live",
+                "MLFLOW_TRACKING_URI": "http://mlflow",
+            }
+            with mock.patch.dict(os.environ, env, clear=False):
+                with self.assertRaises(ConfigError):
+                    load_config(
+                        config_path=str(override_path),
+                        schema_path="config/validation_schema.yaml",
+                    )
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
