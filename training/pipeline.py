@@ -4,8 +4,9 @@ Builds training datasets from snapshots, trains models, and logs metrics and
 artifacts to MLflow when configured.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 from datetime import datetime, timedelta
+import contextlib
 import copy
 import hashlib
 import json
@@ -38,6 +39,11 @@ from .snapshot_dataset import (
 from .snapshot_store import load_or_create_manifest, resolve_snapshot_context, save_manifest
 from .callbacks import create_callbacks
 from .class_weights import compute_class_weights, compute_class_weights_from_counts
+from .distributed import (
+    DistributedContext,
+    build_distributed_context,
+    wrap_generator_as_dataset,
+)
 from .long_term_context import (
     compute_long_term_features_for_dataset,
     is_long_term_enabled,
@@ -754,7 +760,11 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
     training_cfg = config["training"]
     debug_max_samples = int(training_cfg["debug_max_samples"])
     epochs = int(training_cfg["epochs"])
-    batch_size = int(training_cfg["batch_size"])
+    batch_size = int(training_cfg["batch_size"])  # per-replica batch size
+
+    # Distributed training setup (opt-in via config)
+    runtime_cfg = training_cfg.get("runtime") or {}
+    dist_ctx: Optional[DistributedContext] = build_distributed_context(runtime_cfg)
 
     split_cfg = config["preprocessing"]["train_test_split"]
     train_ratio = float(split_cfg["train_ratio"])
@@ -926,73 +936,78 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to log class weights to MLFlow: %s", exc)
 
-    # Build or load model based on fine-tuning configuration
+    # Build or load model based on fine-tuning configuration.
+    # When distributed training is enabled, model must be built/compiled
+    # inside strategy.scope() so variables are mirrored across replicas.
+    strategy_scope = dist_ctx.scope() if dist_ctx is not None else contextlib.nullcontext()
+
     fine_tuning_cfg = training_cfg["fine_tuning"]
     fine_tuning_enabled = bool(fine_tuning_cfg["enabled"])
 
-    if fine_tuning_enabled:
-        from .fine_tuning import (
-            FineTuningError,
-            load_model_from_registry,
-            load_model_from_run,
-            prepare_fine_tuning,
-        )
-
-        use_registry = bool(fine_tuning_cfg["use_model_registry"])
-
-        if use_registry:
-            registry_name = fine_tuning_cfg["registry_name"]
-            if not registry_name:
-                raise ConfigError(
-                    "training.fine_tuning.registry_name is required when use_model_registry is true"
-                )
-            stage = str(fine_tuning_cfg["base_model_stage"])
-            logger.info(
-                "Fine-tuning enabled: loading model from registry. name=%s, stage=%s",
-                registry_name,
-                stage,
+    with strategy_scope:
+        if fine_tuning_enabled:
+            from .fine_tuning import (
+                FineTuningError,
+                load_model_from_registry,
+                load_model_from_run,
+                prepare_fine_tuning,
             )
-            try:
-                model = load_model_from_registry(registry_name, stage=stage)
-            except FineTuningError as exc:
-                raise ConfigError(f"Failed to load base model for fine-tuning: {exc}") from exc
-        else:
-            run_id = fine_tuning_cfg["base_model_run_id"]
-            if not run_id:
-                raise ConfigError(
-                    "training.fine_tuning.base_model_run_id is required when fine_tuning.enabled is true "
-                    "and use_model_registry is false"
-                )
-            logger.info("Fine-tuning enabled: loading model from MLflow run. run_id=%s", run_id)
-            try:
-                model = load_model_from_run(run_id)
-            except FineTuningError as exc:
-                raise ConfigError(f"Failed to load base model for fine-tuning: {exc}") from exc
 
-        # Prepare the model for fine-tuning (freeze layers, adjust LR)
-        try:
-            model = prepare_fine_tuning(
+            use_registry = bool(fine_tuning_cfg["use_model_registry"])
+
+            if use_registry:
+                registry_name = fine_tuning_cfg["registry_name"]
+                if not registry_name:
+                    raise ConfigError(
+                        "training.fine_tuning.registry_name is required when use_model_registry is true"
+                    )
+                stage = str(fine_tuning_cfg["base_model_stage"])
+                logger.info(
+                    "Fine-tuning enabled: loading model from registry. name=%s, stage=%s",
+                    registry_name,
+                    stage,
+                )
+                try:
+                    model = load_model_from_registry(registry_name, stage=stage)
+                except FineTuningError as exc:
+                    raise ConfigError(f"Failed to load base model for fine-tuning: {exc}") from exc
+            else:
+                run_id = fine_tuning_cfg["base_model_run_id"]
+                if not run_id:
+                    raise ConfigError(
+                        "training.fine_tuning.base_model_run_id is required when fine_tuning.enabled is true "
+                        "and use_model_registry is false"
+                    )
+                logger.info("Fine-tuning enabled: loading model from MLflow run. run_id=%s", run_id)
+                try:
+                    model = load_model_from_run(run_id)
+                except FineTuningError as exc:
+                    raise ConfigError(f"Failed to load base model for fine-tuning: {exc}") from exc
+
+            # Prepare the model for fine-tuning (freeze layers, adjust LR)
+            try:
+                model = prepare_fine_tuning(
+                    config,
+                    model,
+                    input_shape=input_shape,
+                    long_term_input_dim=long_term_input_dim,
+                )
+            except FineTuningError as exc:
+                raise ConfigError(f"Failed to prepare model for fine-tuning: {exc}") from exc
+
+            logger.info(
+                "Model prepared for fine-tuning: freeze_layers=%s, lr_factor=%s",
+                fine_tuning_cfg["freeze_layers"],
+                fine_tuning_cfg["learning_rate_factor"],
+            )
+        else:
+            from models.cnn_lstm_multiclass import build_cnn_lstm_model
+
+            model = build_cnn_lstm_model(
                 config,
-                model,
                 input_shape=input_shape,
                 long_term_input_dim=long_term_input_dim,
             )
-        except FineTuningError as exc:
-            raise ConfigError(f"Failed to prepare model for fine-tuning: {exc}") from exc
-
-        logger.info(
-            "Model prepared for fine-tuning: freeze_layers=%s, lr_factor=%s",
-            fine_tuning_cfg["freeze_layers"],
-            fine_tuning_cfg["learning_rate_factor"],
-        )
-    else:
-        from models.cnn_lstm_multiclass import build_cnn_lstm_model
-
-        model = build_cnn_lstm_model(
-            config,
-            input_shape=input_shape,
-            long_term_input_dim=long_term_input_dim,
-        )
 
     if long_term_features is not None:
         try:
@@ -1053,12 +1068,36 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
 
     callbacks = create_callbacks(config)
 
-    train_gen, train_steps = build_training_generator(
+    num_classes = int(output_cfg["num_classes"])
+
+    # Helper to create a fresh generator (needed by tf.data.Dataset.from_generator)
+    def _make_train_gen() -> Iterator[Tuple[Any, ...]]:
+        gen, _ = build_training_generator(
+            dataset=snapshot_dataset,
+            start_index=0,
+            end_index=effective_train_n,
+            batch_size=batch_size,
+            num_classes=num_classes,
+            normalization=train_stats,
+            sample_weight_cfg=training_cfg["sample_weighting"],
+            mask_start=mask_start,
+            mask_count=mask_count,
+            class_weights_up=class_weights_up,
+            class_weights_down=class_weights_down,
+        )
+        if long_term_features is not None:
+            gen = wrap_generator_with_long_term(
+                gen, long_term_features, start_index=0, end_index=effective_train_n,
+            )
+        return gen
+
+    # Compute steps from a throwaway call (same as build_training_generator returns)
+    _, train_steps = build_training_generator(
         dataset=snapshot_dataset,
         start_index=0,
         end_index=effective_train_n,
         batch_size=batch_size,
-        num_classes=int(output_cfg["num_classes"]),
+        num_classes=num_classes,
         normalization=train_stats,
         sample_weight_cfg=training_cfg["sample_weighting"],
         mask_start=mask_start,
@@ -1067,13 +1106,25 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
         class_weights_down=class_weights_down,
     )
 
-    if long_term_features is not None:
-        train_gen = wrap_generator_with_long_term(
-            train_gen,
-            long_term_features,
-            start_index=0,
-            end_index=effective_train_n,
+    if dist_ctx is not None:
+        global_batch_size = dist_ctx.global_batch_size(batch_size)
+        train_data: Any = wrap_generator_as_dataset(
+            generator_factory=_make_train_gen,
+            input_shape=input_shape,
+            num_classes=num_classes,
+            long_term_dim=long_term_input_dim,
+            global_batch_size=global_batch_size,
+            steps_per_epoch=train_steps,
+            distributed_ctx=dist_ctx,
         )
+        logger.info(
+            "Distributed training: per_replica_batch=%d, global_batch=%d, replicas=%d",
+            batch_size,
+            global_batch_size,
+            dist_ctx.num_replicas,
+        )
+    else:
+        train_data = _make_train_gen()
 
     writer = None
     try:
@@ -1094,7 +1145,7 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
             callbacks.append(progress_cb)
 
     fit_kwargs: Dict[str, Any] = {
-        "x": train_gen,
+        "x": train_data,
         "epochs": epochs,
         "steps_per_epoch": train_steps,
         "callbacks": callbacks,
@@ -1102,27 +1153,54 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
     }
 
     if val_count > 0:
-        val_gen, val_steps = build_training_generator(
+        def _make_val_gen() -> Iterator[Tuple[Any, ...]]:
+            gen, _ = build_training_generator(
+                dataset=snapshot_dataset,
+                start_index=val_start,
+                end_index=val_end,
+                batch_size=batch_size,
+                num_classes=num_classes,
+                normalization=val_stats,
+                sample_weight_cfg=None,
+                mask_start=mask_start,
+                mask_count=mask_count,
+                class_weights_up=None,
+                class_weights_down=None,
+            )
+            if long_term_features is not None:
+                gen = wrap_generator_with_long_term(
+                    gen, long_term_features, start_index=val_start, end_index=val_end,
+                )
+            return gen
+
+        _, val_steps = build_training_generator(
             dataset=snapshot_dataset,
             start_index=val_start,
             end_index=val_end,
             batch_size=batch_size,
-            num_classes=int(output_cfg["num_classes"]),
+            num_classes=num_classes,
             normalization=val_stats,
             sample_weight_cfg=None,
             mask_start=mask_start,
             mask_count=mask_count,
-            class_weights_up=None,  # No class weights for validation
+            class_weights_up=None,
             class_weights_down=None,
         )
-        if long_term_features is not None:
-            val_gen = wrap_generator_with_long_term(
-                val_gen,
-                long_term_features,
-                start_index=val_start,
-                end_index=val_end,
+
+        if dist_ctx is not None:
+            val_data: Any = wrap_generator_as_dataset(
+                generator_factory=_make_val_gen,
+                input_shape=input_shape,
+                num_classes=num_classes,
+                long_term_dim=long_term_input_dim,
+                global_batch_size=dist_ctx.global_batch_size(batch_size),
+                steps_per_epoch=val_steps,
+                distributed_ctx=dist_ctx,
             )
-        fit_kwargs["validation_data"] = val_gen
+        else:
+            val_data = _make_val_gen()
+
+        fit_kwargs["validation_data"] = val_data
         fit_kwargs["validation_steps"] = val_steps
 
     history = model.fit(**fit_kwargs)

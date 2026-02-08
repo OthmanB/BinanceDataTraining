@@ -28,6 +28,10 @@ training:
     gpu_init_lock_enabled: false
     gpu_init_stagger_seconds: 0
     mixed_precision: "float16"
+    distributed:
+      enabled: true
+      strategy: "mirrored"
+      resources: ["gpu:0", "gpu:1"]
   sequential_training:
     enabled: true
     window_days: 7

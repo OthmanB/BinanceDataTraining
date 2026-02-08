@@ -303,6 +303,12 @@ sections:
         type: number
       runtime.mixed_precision:
         type: string
+      runtime.distributed.enabled:
+        type: boolean
+      runtime.distributed.strategy:
+        type: string
+      runtime.distributed.resources:
+        type: list
       sequential_training.enabled:
         type: boolean
       sequential_training.window_days:

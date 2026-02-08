@@ -245,6 +245,10 @@ training:  # Controls how the model is fit on the prepared dataset.
     gpu_init_lock_enabled: false  # When true in parallel HPO workers, serialize initial TensorFlow GPU context setup.
     gpu_init_stagger_seconds: 0  # Optional startup delay (seconds) before GPU worker initialization.
     mixed_precision: "float32"  # Precision policy: "float32" (default) or "float16" (mixed precision for ~1.5-2x speedup on Ampere+ GPUs).
+    distributed:
+      enabled: false  # When true, use multi-GPU distributed training via MirroredStrategy for the final training phase.
+      strategy: "mirrored"  # Distribution strategy: "mirrored" (synchronous data-parallel across GPUs).
+      resources: []  # Device list, same format as hpo.parallel.resources, e.g. ["gpu:0", "gpu:1"]. Empty = all visible GPUs.
 
   sequential_training:
     enabled: false  # When true, split data.time_range into rolling day windows and train continuously window-by-window.
