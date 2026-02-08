@@ -178,27 +178,13 @@ sections:
         type: boolean
       input_representation.temporal_features.use_global_features:
         type: boolean
-      cnn.num_layers:
-        type: integer
-      cnn.filters:
-        type: list
-      cnn.kernel_sizes:
-        type: list
-      cnn.pool_sizes:
-        type: list
       cnn.activation:
         type: string
-      cnn.dropout_rates:
+      cnn.layers:
         type: list
-      lstm.units:
-        type: integer
-      lstm.dropout:
-        type: number
-      lstm.recurrent_dropout:
-        type: number
+      lstm.layers:
+        type: list
       dense.layers:
-        type: list
-      dense.dropout_rates:
         type: list
       output.type:
         type: string
@@ -228,9 +214,11 @@ sections:
         type: number
       long_term.input_dim:
         type: any
-      long_term.dense.layers:
+      long_term.architecture.conv1d.activation:
+        type: string
+      long_term.architecture.conv1d.layers:
         type: list
-      long_term.dense.dropout_rates:
+      long_term.architecture.dense.layers:
         type: list
 
   training:

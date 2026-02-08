@@ -241,11 +241,16 @@ def _read_regime_memory(path: str) -> Dict[str, Any]:
 
 
 def _build_model_signature(params: Dict[str, Any]) -> str:
-    return (
-        f"cnn1={int(params.get('cnn_filters_1', 0))};"
-        f"cnn2={int(params.get('cnn_filters_2', 0))};"
-        f"lstm={int(params.get('lstm_units', 0))}"
-    )
+    parts: List[str] = []
+    # CNN layer params
+    cnn_params = {k: v for k, v in params.items() if k.startswith("cnn_layer_")}
+    for k in sorted(cnn_params):
+        parts.append(f"{k}={int(cnn_params[k])}")
+    # LSTM layer params
+    lstm_params = {k: v for k, v in params.items() if k.startswith("lstm_layer_")}
+    for k in sorted(lstm_params):
+        parts.append(f"{k}={int(lstm_params[k])}")
+    return ";".join(parts) if parts else "no_arch_params"
 
 
 def _update_regime_memory(
@@ -1077,29 +1082,16 @@ def _run_optuna_worker(
 def _sample_hyperparameters(trial: Any, hpo_cfg: Dict[str, Any]) -> Dict[str, Any]:
     search_space = hpo_cfg["search_space"]
 
-    def _ensure_list(name: str) -> Any:
-        if name not in search_space:
-            raise ValueError(f"Missing hyperparameter_optimization.search_space entry for {name!r}")
-        value = search_space[name]
-        if not isinstance(value, list):
-            raise ValueError(
-                "Each hyperparameter_optimization.search_space entry must be a list; "
-                f"got type={type(value).__name__} for {name!r}",
-            )
-        if not value:
-            raise ValueError(f"hyperparameter_optimization.search_space.{name} must be a non-empty list")
-        return value
-
     def _suggest_int(name: str, bounds: Any) -> int:
-        if len(bounds) < 2:
-            raise ValueError(f"Integer search space for {name!r} must have at least two elements [low, high]")
+        if not isinstance(bounds, list) or len(bounds) < 2:
+            raise ValueError(f"Integer search space for {name!r} must be a list with at least [low, high]")
         low = int(bounds[0])
         high = int(bounds[1])
         return int(trial.suggest_int(name, low, high))
 
     def _suggest_float(name: str, bounds: Any) -> float:
-        if len(bounds) < 2:
-            raise ValueError(f"Float search space for {name!r} must have at least two elements [low, high]")
+        if not isinstance(bounds, list) or len(bounds) < 2:
+            raise ValueError(f"Float search space for {name!r} must be a list with at least [low, high]")
         low = float(bounds[0])
         high = float(bounds[1])
         log_scale = False
@@ -1109,24 +1101,45 @@ def _sample_hyperparameters(trial: Any, hpo_cfg: Dict[str, Any]) -> Dict[str, An
 
     params: Dict[str, Any] = {}
 
-    cnn_filters_1_space = _ensure_list("cnn_filters_1")
-    cnn_filters_2_space = _ensure_list("cnn_filters_2")
-    lstm_units_space = _ensure_list("lstm_units")
-    learning_rate_space = _ensure_list("learning_rate")
-    batch_size_space = _ensure_list("batch_size")
+    # CNN per-layer search ranges
+    cnn_space = search_space.get("cnn", [])
+    if not isinstance(cnn_space, list):
+        raise ValueError("hyperparameter_optimization.search_space.cnn must be a list")
+    for i, layer_space in enumerate(cnn_space):
+        if not isinstance(layer_space, dict):
+            raise ValueError(f"search_space.cnn[{i}] must be a dict")
+        if "filters" in layer_space:
+            params[f"cnn_layer_{i}_filters"] = _suggest_int(
+                f"cnn_layer_{i}_filters", layer_space["filters"],
+            )
 
-    params["cnn_filters_1"] = _suggest_int("cnn_filters_1", cnn_filters_1_space)
-    params["cnn_filters_2"] = _suggest_int("cnn_filters_2", cnn_filters_2_space)
-    params["lstm_units"] = _suggest_int("lstm_units", lstm_units_space)
-    params["learning_rate"] = _suggest_float("learning_rate", learning_rate_space)
+    # LSTM per-layer search ranges
+    lstm_space = search_space.get("lstm", [])
+    if not isinstance(lstm_space, list):
+        raise ValueError("hyperparameter_optimization.search_space.lstm must be a list")
+    for i, layer_space in enumerate(lstm_space):
+        if not isinstance(layer_space, dict):
+            raise ValueError(f"search_space.lstm[{i}] must be a dict")
+        if "units" in layer_space:
+            params[f"lstm_layer_{i}_units"] = _suggest_int(
+                f"lstm_layer_{i}_units", layer_space["units"],
+            )
 
+    # Scalar search parameters
+    if "learning_rate" not in search_space:
+        raise ValueError("Missing hyperparameter_optimization.search_space.learning_rate")
+    params["learning_rate"] = _suggest_float("learning_rate", search_space["learning_rate"])
+
+    if "batch_size" not in search_space:
+        raise ValueError("Missing hyperparameter_optimization.search_space.batch_size")
+    batch_size_space = search_space["batch_size"]
+    if not isinstance(batch_size_space, list) or len(batch_size_space) < 2:
+        raise ValueError("hyperparameter_optimization.search_space.batch_size must have at least two values")
     if len(batch_size_space) >= 3:
         choices = sorted({int(v) for v in batch_size_space})
         params["batch_size"] = int(trial.suggest_categorical("batch_size", choices))
-    elif len(batch_size_space) == 2:
-        params["batch_size"] = _suggest_int("batch_size", batch_size_space)
     else:
-        raise ValueError("hyperparameter_optimization.search_space.batch_size must have at least two values")
+        params["batch_size"] = _suggest_int("batch_size", batch_size_space)
 
     return params
 
@@ -1135,24 +1148,37 @@ def _apply_hyperparameters(base_config: Dict[str, Any], params: Dict[str, Any]) 
     cfg = copy.deepcopy(base_config)
 
     model_cfg = cfg["model"]
-    cnn_cfg = model_cfg["cnn"]
-    lstm_cfg = model_cfg["lstm"]
+    cnn_layers = model_cfg["cnn"]["layers"]
+    lstm_layers = model_cfg["lstm"]["layers"]
     compilation_cfg = model_cfg["compilation"]
     training_cfg = cfg["training"]
 
-    filters = list(cnn_cfg["filters"])
-    if len(filters) < 2:
-        raise ValueError("model.cnn.filters must have length at least 2 to apply cnn_filters_1 and cnn_filters_2")
-    filters[0] = int(params["cnn_filters_1"])
-    filters[1] = int(params["cnn_filters_2"])
-    cnn_cfg["filters"] = filters
+    # Apply CNN per-layer params
+    for key, value in params.items():
+        if key.startswith("cnn_layer_") and key.endswith("_filters"):
+            idx = int(key.split("_")[2])
+            if idx < len(cnn_layers):
+                cnn_layers[idx]["filters"] = int(value)
+            else:
+                raise ValueError(
+                    f"search_space references cnn layer {idx} but model.cnn.layers has only {len(cnn_layers)} entries"
+                )
 
-    lstm_cfg["units"] = int(params["lstm_units"])
+    # Apply LSTM per-layer params
+    for key, value in params.items():
+        if key.startswith("lstm_layer_") and key.endswith("_units"):
+            idx = int(key.split("_")[2])
+            if idx < len(lstm_layers):
+                lstm_layers[idx]["units"] = int(value)
+            else:
+                raise ValueError(
+                    f"search_space references lstm layer {idx} but model.lstm.layers has only {len(lstm_layers)} entries"
+                )
+
+    # Scalar params
     compilation_cfg["learning_rate"] = float(params["learning_rate"])
     training_cfg["batch_size"] = int(params["batch_size"])
 
-    model_cfg["cnn"] = cnn_cfg
-    model_cfg["lstm"] = lstm_cfg
     model_cfg["compilation"] = compilation_cfg
     cfg["model"] = model_cfg
     cfg["training"] = training_cfg

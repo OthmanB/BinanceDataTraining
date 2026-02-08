@@ -185,22 +185,30 @@ model:  # Defines the neural network architecture and its compilation settings.
       use_global_features: true            # When true, include global temporal features (days_since_start, market_session).
 
   cnn:
-    num_layers: 2                # Number of convolutional layers in the CNN block.
-    filters: [64, 128]           # Number of filters per convolutional layer.
-    kernel_sizes: [[3, 3], [3, 3]]  # Spatial kernel sizes for each convolutional layer (height, width).
-    pooling: "max"              # Type of pooling operation; currently max pooling.
-    pool_sizes: [[2, 2], [2, 2]]  # Pooling window sizes per layer.
-    activation: "relu"          # Activation function for convolutional layers.
-    dropout_rates: [0.2, 0.3]    # Dropout rates applied after each convolutional layer.
+    activation: "relu"            # Activation function shared across CNN layers.
+    layers:                       # Per-layer configuration; number of layers = length of this list.
+      - filters: 64               # Number of filters for this convolutional layer.
+        kernel_size: [3, 3]       # Spatial kernel size (height, width).
+        pool_size: [2, 2]         # Pooling window size; null to skip pooling on this layer.
+        normalization: null       # Normalization after Conv2D: null | "batch" | "group" | "layer".
+        dropout: 0.2              # Dropout rate after this layer; 0.0 to skip.
+      - filters: 128
+        kernel_size: [3, 3]
+        pool_size: [2, 2]
+        normalization: null
+        dropout: 0.3
 
   lstm:
-    units: 96             # Number of hidden units in the LSTM layer.
-    dropout: 0.3          # Dropout on the inputs to the LSTM.
-    recurrent_dropout: 0.0 # Dropout on recurrent connections; keep 0.0 when using cuDNN for performance.
+    layers:                       # Per-layer configuration; supports stacked LSTMs.
+      - units: 96                 # Number of hidden units in this LSTM layer.
+        dropout: 0.3              # Keras LSTM input dropout.
+        recurrent_dropout: 0.0    # Recurrent dropout; keep 0.0 for cuDNN acceleration.
+        post_dropout: 0.0         # Standalone Dropout layer after this LSTM; 0.0 to skip.
 
   dense:
-    layers: [64]          # Sizes of fully connected layers after the recurrent block.
-    dropout_rates: [0.2]  # Dropout rates for each dense layer.
+    layers:                       # Fully connected layers after the recurrent block.
+      - units: 64                 # Number of units.
+        dropout: 0.2              # Dropout rate after this dense layer.
 
   long_term:
     enabled: false                    # When true, add long-term context branch (TD-019 dual-channel).
@@ -214,9 +222,14 @@ model:  # Defines the neural network architecture and its compilation settings.
     summary_method: "mean"            # How to summarize stats: "mean", "ewma", "last".
     ewma_halflife_days: 7.0           # Half-life for EWMA weighting (when summary_method="ewma").
     input_dim: null                   # Auto-computed: len(windows_days) * len(features). Set to override.
-    dense:
-      layers: [32]                    # Dense layer sizes for long-term branch.
-      dropout_rates: [0.2]            # Dropout rates for long-term dense layers.
+    architecture:
+      conv1d:                         # Optional Conv1D layers on reshaped (num_windows, features_per_window) input.
+        activation: "relu"            # Activation function for Conv1D layers.
+        layers: []                    # Empty list = no Conv1D (dense-only branch). Same dict format as cnn.layers but 1D.
+      dense:
+        layers:                       # Dense layers for long-term branch.
+          - units: 32
+            dropout: 0.2
 
   output:
     type: "two_head_intensity"  # Output head configuration: separate up/down intensity classifications.
@@ -340,11 +353,13 @@ hyperparameter_optimization:  # Controls Optuna-based search over selected hyper
       persistence_enabled: true  # Persist learned envelope memory to disk for reuse in future runs.
 
   search_space:
-    cnn_filters_1: [16, 128]      # Integer range [low, high] for the first CNN filter size.
-    cnn_filters_2: [64, 256]      # Integer range for the second CNN filter size.
-    lstm_units: [32, 256]         # Integer range for the number of LSTM units.
-    learning_rate: [0.0001, 0.01] # Continuous range [low, high] for learning rate; third entry can be "log" for log scale.
-    batch_size: [16, 32, 64]      # Batch-size candidates; list can encode either a range or categorical set.
+    cnn:                            # Per-layer CNN search ranges; list index matches model.cnn.layers index.
+      - filters: [16, 128]         # Integer range [low, high] for CNN layer 0 filters.
+      - filters: [64, 256]         # Integer range for CNN layer 1 filters.
+    lstm:                           # Per-layer LSTM search ranges; list index matches model.lstm.layers index.
+      - units: [32, 256]           # Integer range for LSTM layer 0 units.
+    learning_rate: [0.0001, 0.01]   # Continuous range [low, high] for learning rate; third entry can be "log" for log scale.
+    batch_size: [16, 32, 64]        # Batch-size candidates; list can encode either a range or categorical set.
 
 # MLFlow Configuration
 mlflow:  # Experiment tracking and model registry configuration.
