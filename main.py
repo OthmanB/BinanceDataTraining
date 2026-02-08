@@ -127,6 +127,50 @@ def _apply_runtime_device(config: Dict[str, Any], logger: logging.Logger) -> Non
         time.sleep(stagger_seconds)
 
 
+_VALID_MIXED_PRECISION_POLICIES = {"float32", "float16"}
+
+
+def _apply_mixed_precision_policy(config: Dict[str, Any], logger: logging.Logger) -> None:
+    training_cfg = config.get("training")
+    if not isinstance(training_cfg, dict):
+        raise ConfigError("training section must be a mapping")
+    runtime_cfg = training_cfg.get("runtime")
+    if not isinstance(runtime_cfg, dict):
+        raise ConfigError("training.runtime must be a mapping")
+
+    policy_raw = runtime_cfg.get("mixed_precision")
+    if policy_raw is None:
+        return
+
+    policy = str(policy_raw).strip().lower()
+    if policy not in _VALID_MIXED_PRECISION_POLICIES:
+        raise ConfigError(
+            f"training.runtime.mixed_precision must be one of {sorted(_VALID_MIXED_PRECISION_POLICIES)}; "
+            f"got {policy!r}"
+        )
+
+    if policy == "float32":
+        logger.info("Mixed precision policy: float32 (default, no mixed precision).")
+        return
+
+    try:
+        import tensorflow as tf  # type: ignore[import]
+    except Exception as exc:  # noqa: BLE001
+        raise ConfigError(
+            f"training.runtime.mixed_precision='{policy}' requires TensorFlow"
+        ) from exc
+
+    tf_policy = f"mixed_{policy}"
+    tf.keras.mixed_precision.set_global_policy(tf_policy)
+    logger.info(
+        "Mixed precision policy set to '%s' (TF policy='%s'). "
+        "Compute in %s, variables in float32.",
+        policy,
+        tf_policy,
+        policy,
+    )
+
+
 def _validate_runtime_device_availability(config: Dict[str, Any], logger: logging.Logger) -> None:
     training_cfg = config.get("training")
     if not isinstance(training_cfg, dict):
@@ -276,6 +320,7 @@ def main() -> int:
 
     try:
         _apply_runtime_device(config, logger)
+        _apply_mixed_precision_policy(config, logger)
         _validate_runtime_device_availability(config, logger)
     except ConfigError as exc:
         logger.error("Runtime device configuration invalid: %s", exc)

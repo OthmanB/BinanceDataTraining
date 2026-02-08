@@ -244,6 +244,7 @@ training:  # Controls how the model is fit on the prepared dataset.
     gpu_allocator: "default"  # GPU allocator policy: "default" or "cuda_malloc_async".
     gpu_init_lock_enabled: false  # When true in parallel HPO workers, serialize initial TensorFlow GPU context setup.
     gpu_init_stagger_seconds: 0  # Optional startup delay (seconds) before GPU worker initialization.
+    mixed_precision: "float32"  # Precision policy: "float32" (default) or "float16" (mixed precision for ~1.5-2x speedup on Ampere+ GPUs).
 
   sequential_training:
     enabled: false  # When true, split data.time_range into rolling day windows and train continuously window-by-window.

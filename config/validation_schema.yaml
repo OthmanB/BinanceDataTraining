@@ -301,6 +301,8 @@ sections:
         type: boolean
       runtime.gpu_init_stagger_seconds:
         type: number
+      runtime.mixed_precision:
+        type: string
       sequential_training.enabled:
         type: boolean
       sequential_training.window_days:

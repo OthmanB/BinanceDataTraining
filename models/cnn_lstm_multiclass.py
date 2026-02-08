@@ -192,8 +192,8 @@ def build_cnn_lstm_model(
     num_classes = int(output_cfg["num_classes"])
     output_activation = output_cfg["activation"]
 
-    up_head = layers.Dense(num_classes, activation=output_activation, name="up_intensity")(x)
-    down_head = layers.Dense(num_classes, activation=output_activation, name="down_intensity")(x)
+    up_head = layers.Dense(num_classes, activation=output_activation, name="up_intensity", dtype="float32")(x)
+    down_head = layers.Dense(num_classes, activation=output_activation, name="down_intensity", dtype="float32")(x)
 
     # Build model with appropriate inputs
     if long_term_enabled and long_term_input is not None:

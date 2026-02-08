@@ -752,10 +752,39 @@ def _apply_worker_runtime_environment(base_config: Dict[str, Any], resource: str
                 )
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        _apply_worker_mixed_precision(runtime_cfg, resource)
         return
 
     _configure_worker_tensorflow_runtime(
         enable_memory_growth=bool(runtime_options["gpu_memory_growth"]),
+    )
+
+    _apply_worker_mixed_precision(runtime_cfg, resource)
+
+
+def _apply_worker_mixed_precision(runtime_cfg: Dict[str, Any], resource: str) -> None:
+    policy_raw = runtime_cfg.get("mixed_precision")
+    if policy_raw is None:
+        return
+    policy = str(policy_raw).strip().lower()
+    if policy in {"", "float32"}:
+        return
+    if policy != "float16":
+        logger.warning(
+            "Worker resource %s: unsupported mixed_precision=%r, skipping.",
+            resource,
+            policy,
+        )
+        return
+
+    import tensorflow as tf  # type: ignore[import]
+
+    tf_policy = f"mixed_{policy}"
+    tf.keras.mixed_precision.set_global_policy(tf_policy)
+    logger.info(
+        "Worker resource %s: mixed precision policy set to '%s'.",
+        resource,
+        tf_policy,
     )
 
 
