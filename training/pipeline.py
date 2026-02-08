@@ -311,6 +311,7 @@ def _fit_snapshot_model_once(
     model: Optional[Any],
     *,
     epoch_step_offset: int,
+    dist_ctx: Optional[DistributedContext] = None,
 ) -> Tuple[Optional[Any], int, Optional[float], float]:
     training_cfg = config["training"]
     debug_max_samples = int(training_cfg["debug_max_samples"])
@@ -443,65 +444,91 @@ def _fit_snapshot_model_once(
         class_weights_up = compute_class_weights_from_counts(train_label_dist.up_counts, num_classes)
         class_weights_down = compute_class_weights_from_counts(train_label_dist.down_counts, num_classes)
 
-    if model is None:
-        fine_tuning_cfg = training_cfg["fine_tuning"]
-        fine_tuning_enabled = bool(fine_tuning_cfg["enabled"])
-        if fine_tuning_enabled:
-            from .fine_tuning import (
-                FineTuningError,
-                load_model_from_registry,
-                load_model_from_run,
-                prepare_fine_tuning,
-            )
+    # When distributed, model must be built/compiled inside strategy.scope().
+    strategy_scope = dist_ctx.scope() if dist_ctx is not None else contextlib.nullcontext()
 
-            use_registry = bool(fine_tuning_cfg["use_model_registry"])
-            if use_registry:
-                registry_name = fine_tuning_cfg["registry_name"]
-                if not registry_name:
-                    raise ConfigError(
-                        "training.fine_tuning.registry_name is required when use_model_registry is true"
-                    )
-                stage = str(fine_tuning_cfg["base_model_stage"])
+    with strategy_scope:
+        if model is None:
+            fine_tuning_cfg = training_cfg["fine_tuning"]
+            fine_tuning_enabled = bool(fine_tuning_cfg["enabled"])
+            if fine_tuning_enabled:
+                from .fine_tuning import (
+                    FineTuningError,
+                    load_model_from_registry,
+                    load_model_from_run,
+                    prepare_fine_tuning,
+                )
+
+                use_registry = bool(fine_tuning_cfg["use_model_registry"])
+                if use_registry:
+                    registry_name = fine_tuning_cfg["registry_name"]
+                    if not registry_name:
+                        raise ConfigError(
+                            "training.fine_tuning.registry_name is required when use_model_registry is true"
+                        )
+                    stage = str(fine_tuning_cfg["base_model_stage"])
+                    try:
+                        model = load_model_from_registry(registry_name, stage=stage)
+                    except FineTuningError as exc:
+                        raise ConfigError(f"Failed to load base model for fine-tuning: {exc}") from exc
+                else:
+                    run_id = fine_tuning_cfg["base_model_run_id"]
+                    if not run_id:
+                        raise ConfigError(
+                            "training.fine_tuning.base_model_run_id is required when fine_tuning.enabled is true "
+                            "and use_model_registry is false"
+                        )
+                    try:
+                        model = load_model_from_run(run_id)
+                    except FineTuningError as exc:
+                        raise ConfigError(f"Failed to load base model for fine-tuning: {exc}") from exc
+
                 try:
-                    model = load_model_from_registry(registry_name, stage=stage)
+                    model = prepare_fine_tuning(
+                        config,
+                        model,
+                        input_shape=input_shape,
+                        long_term_input_dim=long_term_input_dim,
+                    )
                 except FineTuningError as exc:
-                    raise ConfigError(f"Failed to load base model for fine-tuning: {exc}") from exc
+                    raise ConfigError(f"Failed to prepare model for fine-tuning: {exc}") from exc
             else:
-                run_id = fine_tuning_cfg["base_model_run_id"]
-                if not run_id:
-                    raise ConfigError(
-                        "training.fine_tuning.base_model_run_id is required when fine_tuning.enabled is true "
-                        "and use_model_registry is false"
-                    )
-                try:
-                    model = load_model_from_run(run_id)
-                except FineTuningError as exc:
-                    raise ConfigError(f"Failed to load base model for fine-tuning: {exc}") from exc
+                from models.cnn_lstm_multiclass import build_cnn_lstm_model
 
-            try:
-                model = prepare_fine_tuning(
+                model = build_cnn_lstm_model(
                     config,
-                    model,
                     input_shape=input_shape,
                     long_term_input_dim=long_term_input_dim,
                 )
-            except FineTuningError as exc:
-                raise ConfigError(f"Failed to prepare model for fine-tuning: {exc}") from exc
-        else:
-            from models.cnn_lstm_multiclass import build_cnn_lstm_model
 
-            model = build_cnn_lstm_model(
-                config,
-                input_shape=input_shape,
-                long_term_input_dim=long_term_input_dim,
+    num_classes = int(output_cfg["num_classes"])
+
+    def _make_train_gen() -> Iterator[Tuple[Any, ...]]:
+        gen, _ = build_training_generator(
+            dataset=snapshot_dataset,
+            start_index=0,
+            end_index=effective_train_n,
+            batch_size=batch_size,
+            num_classes=num_classes,
+            normalization=train_stats,
+            sample_weight_cfg=training_cfg["sample_weighting"],
+            mask_start=mask_start,
+            mask_count=mask_count,
+            class_weights_up=class_weights_up,
+            class_weights_down=class_weights_down,
+        )
+        if long_term_features is not None:
+            gen = wrap_generator_with_long_term(
+                gen, long_term_features, start_index=0, end_index=effective_train_n,
             )
+        return gen
 
-    train_gen, train_steps = build_training_generator(
+    _, train_steps = build_training_generator(
         dataset=snapshot_dataset,
         start_index=0,
         end_index=effective_train_n,
         batch_size=batch_size,
-        num_classes=int(output_cfg["num_classes"]),
+        num_classes=num_classes,
         normalization=train_stats,
         sample_weight_cfg=training_cfg["sample_weighting"],
         mask_start=mask_start,
@@ -510,17 +537,23 @@ def _fit_snapshot_model_once(
         class_weights_down=class_weights_down,
     )
 
-    if long_term_features is not None:
-        train_gen = wrap_generator_with_long_term(
-            train_gen,
-            long_term_features,
-            start_index=0,
-            end_index=effective_train_n,
+    if dist_ctx is not None:
+        global_batch_size = dist_ctx.global_batch_size(batch_size)
+        train_data: Any = wrap_generator_as_dataset(
+            generator_factory=_make_train_gen,
+            input_shape=input_shape,
+            num_classes=num_classes,
+            long_term_dim=long_term_input_dim,
+            global_batch_size=global_batch_size,
+            steps_per_epoch=train_steps,
+            distributed_ctx=dist_ctx,
         )
+    else:
+        train_data = _make_train_gen()
 
     callbacks = create_callbacks(config)
     fit_kwargs: Dict[str, Any] = {
-        "x": train_gen,
+        "x": train_data,
         "epochs": epochs,
         "steps_per_epoch": train_steps,
         "callbacks": callbacks,
@@ -528,12 +561,32 @@ def _fit_snapshot_model_once(
     }
 
     if val_count > 0:
-        val_gen, val_steps = build_training_generator(
+        def _make_val_gen() -> Iterator[Tuple[Any, ...]]:
+            gen, _ = build_training_generator(
+                dataset=snapshot_dataset,
+                start_index=val_start,
+                end_index=val_end,
+                batch_size=batch_size,
+                num_classes=num_classes,
+                normalization=val_stats,
+                sample_weight_cfg=None,
+                mask_start=mask_start,
+                mask_count=mask_count,
+                class_weights_up=None,
+                class_weights_down=None,
+            )
+            if long_term_features is not None:
+                gen = wrap_generator_with_long_term(
+                    gen, long_term_features, start_index=val_start, end_index=val_end,
+                )
+            return gen
+
+        _, val_steps = build_training_generator(
             dataset=snapshot_dataset,
             start_index=val_start,
             end_index=val_end,
             batch_size=batch_size,
-            num_classes=int(output_cfg["num_classes"]),
+            num_classes=num_classes,
             normalization=val_stats,
             sample_weight_cfg=None,
             mask_start=mask_start,
@@ -541,20 +594,26 @@ def _fit_snapshot_model_once(
             class_weights_up=None,
             class_weights_down=None,
         )
-        if long_term_features is not None:
-            val_gen = wrap_generator_with_long_term(
-                val_gen,
-                long_term_features,
-                start_index=val_start,
-                end_index=val_end,
+
+        if dist_ctx is not None:
+            val_data: Any = wrap_generator_as_dataset(
+                generator_factory=_make_val_gen,
+                input_shape=input_shape,
+                num_classes=num_classes,
+                long_term_dim=long_term_input_dim,
+                global_batch_size=dist_ctx.global_batch_size(batch_size),
+                steps_per_epoch=val_steps,
+                distributed_ctx=dist_ctx,
             )
-        fit_kwargs["validation_data"] = val_gen
+        else:
+            val_data = _make_val_gen()
+
+        fit_kwargs["validation_data"] = val_data
         fit_kwargs["validation_steps"] = val_steps
 
     if model is None:
         raise ConfigError("Model is not initialized for snapshot training window")
-    model_for_fit = model
-    history = model_for_fit.fit(**fit_kwargs)
+    history = model.fit(**fit_kwargs)
 
     hpo_metric_value = _extract_hpo_metric_from_history(config, history)
     hpo_metric_weight = 0.0
@@ -583,6 +642,8 @@ def _fit_snapshot_model_once(
 def _run_snapshot_training_pipeline_sequential(
     config: Dict[str, Any],
     windows: List[Tuple[str, str]],
+    *,
+    dist_ctx: Optional[DistributedContext] = None,
 ) -> Optional[Any]:
     sequential_cfg = config["training"].get("sequential_training") or {}
     cleanup_completed = bool(sequential_cfg.get("cleanup_completed_windows", False))
@@ -680,6 +741,7 @@ def _run_snapshot_training_pipeline_sequential(
             snapshot_dataset,
             model,
             epoch_step_offset=epoch_offset,
+            dist_ctx=dist_ctx,
         )
         if hpo_metric_value is not None:
             hpo_window_metrics.append((hpo_metric_value, hpo_metric_weight))
@@ -787,7 +849,7 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
 
     windows = _resolve_sequential_windows(config)
     if windows is not None and len(windows) > 1:
-        return _run_snapshot_training_pipeline_sequential(config, windows)
+        return _run_snapshot_training_pipeline_sequential(config, windows, dist_ctx=dist_ctx)
 
     class_weights_cfg = training_cfg["class_weights"]
     use_class_weights = bool(class_weights_cfg["compute_from_train"])
