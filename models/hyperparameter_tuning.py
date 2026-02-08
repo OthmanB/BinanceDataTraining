@@ -6,7 +6,7 @@ configuration.
 """
 
 from typing import Any, Dict, Optional
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 import copy
 import fcntl
 import json
@@ -21,6 +21,23 @@ import time
 
 
 logger = logging.getLogger(__name__)
+
+
+def _summarize_trial_states(study: Any) -> Dict[str, int]:
+    counts = {
+        "completed": 0,
+        "pruned": 0,
+        "failed": 0,
+    }
+    for trial in study.trials:
+        state_name = str(getattr(trial.state, "name", "")).upper()
+        if state_name == "COMPLETE":
+            counts["completed"] += 1
+        elif state_name == "PRUNED":
+            counts["pruned"] += 1
+        elif state_name in {"FAIL", "FAILED"}:
+            counts["failed"] += 1
+    return counts
 
 
 def _default_regime_memory() -> Dict[str, Any]:
@@ -405,6 +422,56 @@ def _try_read_gpu_memory_stats(resource: Optional[str]) -> Dict[str, Optional[fl
         return stats
 
 
+def _cleanup_trial_runtime() -> None:
+    """Best-effort cleanup between HPO trials to limit process RSS growth."""
+    try:
+        import tensorflow as tf  # type: ignore[import]
+
+        tf.keras.backend.clear_session()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to clear TensorFlow session after trial: %s", exc)
+
+    try:
+        import gc
+
+        gc.collect()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to run GC collection after trial: %s", exc)
+
+
+def _read_process_rss_bytes(pid: int) -> Optional[int]:
+    status_path = f"/proc/{pid}/status"
+    try:
+        with open(status_path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("VmRSS:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1]) * 1024
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _collect_wave_worker_rss_bytes(executor: ProcessPoolExecutor) -> Dict[int, int]:
+    rss_by_pid: Dict[int, int] = {}
+    processes = getattr(executor, "_processes", {})
+    if not isinstance(processes, dict):
+        return rss_by_pid
+
+    for pid, proc in processes.items():
+        try:
+            if proc is None or not proc.is_alive():
+                continue
+        except Exception:  # noqa: BLE001
+            continue
+        rss = _read_process_rss_bytes(int(pid))
+        if rss is not None and rss > 0:
+            rss_by_pid[int(pid)] = int(rss)
+
+    return rss_by_pid
+
+
 def _allocate_trials_to_workers(n_trials: int, n_workers: int) -> list[int]:
     if n_trials <= 0:
         return []
@@ -447,7 +514,7 @@ def _apply_worker_resource(config: Dict[str, Any], resource: str) -> Dict[str, A
 def _resolve_parallel_settings(hpo_cfg: Dict[str, Any]) -> Dict[str, Any]:
     parallel_cfg = hpo_cfg.get("parallel")
     if not isinstance(parallel_cfg, dict):
-        return {"enabled": False, "resources": [], "storage_uri": None, "study_name": None}
+        raise ValueError("hyperparameter_optimization.parallel must be a mapping")
 
     enabled = bool(parallel_cfg.get("enabled", False))
     resources_raw = parallel_cfg.get("resources", [])
@@ -469,11 +536,57 @@ def _resolve_parallel_settings(hpo_cfg: Dict[str, Any]) -> Dict[str, Any]:
         if candidate:
             study_name = candidate
 
+    max_trials_per_worker_process_raw = parallel_cfg.get("max_trials_per_worker_process")
+    if max_trials_per_worker_process_raw is None:
+        raise ValueError(
+            "hyperparameter_optimization.parallel.max_trials_per_worker_process is required and must be >= 1"
+        )
+    try:
+        max_trials_per_worker_process = int(max_trials_per_worker_process_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "hyperparameter_optimization.parallel.max_trials_per_worker_process must be an integer >= 1"
+        ) from exc
+    if max_trials_per_worker_process < 1:
+        raise ValueError(
+            "hyperparameter_optimization.parallel.max_trials_per_worker_process must be >= 1"
+        )
+
+    rss_watchdog_enabled = bool(parallel_cfg.get("rss_watchdog_enabled", True))
+
+    rss_watchdog_max_worker_rss_gb_raw = parallel_cfg.get("rss_watchdog_max_worker_rss_gb", 28.0)
+    try:
+        rss_watchdog_max_worker_rss_gb = float(rss_watchdog_max_worker_rss_gb_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "hyperparameter_optimization.parallel.rss_watchdog_max_worker_rss_gb must be a number > 0"
+        ) from exc
+    if rss_watchdog_max_worker_rss_gb <= 0:
+        raise ValueError(
+            "hyperparameter_optimization.parallel.rss_watchdog_max_worker_rss_gb must be > 0"
+        )
+
+    rss_watchdog_check_interval_seconds_raw = parallel_cfg.get("rss_watchdog_check_interval_seconds", 5.0)
+    try:
+        rss_watchdog_check_interval_seconds = float(rss_watchdog_check_interval_seconds_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "hyperparameter_optimization.parallel.rss_watchdog_check_interval_seconds must be a number > 0"
+        ) from exc
+    if rss_watchdog_check_interval_seconds <= 0:
+        raise ValueError(
+            "hyperparameter_optimization.parallel.rss_watchdog_check_interval_seconds must be > 0"
+        )
+
     return {
         "enabled": enabled,
         "resources": resources,
         "storage_uri": storage_uri,
         "study_name": study_name,
+        "max_trials_per_worker_process": max_trials_per_worker_process,
+        "rss_watchdog_enabled": rss_watchdog_enabled,
+        "rss_watchdog_max_worker_rss_gb": rss_watchdog_max_worker_rss_gb,
+        "rss_watchdog_check_interval_seconds": rss_watchdog_check_interval_seconds,
     }
 
 
@@ -799,6 +912,10 @@ def _evaluate_trial_objective(
                     f"Resource-constrained trial pruned after {attempt} retries: {exc}"
                 ) from exc
             raise
+        finally:
+            # Ensure model/runtime state is reclaimed between attempts/trials.
+            trial_config = None
+            _cleanup_trial_runtime()
 
     if last_exception is not None:
         raise last_exception
@@ -975,6 +1092,21 @@ def run_hyperparameter_search(
     parallel_settings = _resolve_parallel_settings(hpo_cfg)
     _resolve_regime_settings(hpo_cfg)
 
+    writer = None
+    try:
+        from observability.run_state import get_run_state_writer
+
+        writer = get_run_state_writer()
+    except Exception:  # noqa: BLE001
+        writer = None
+    if writer is not None:
+        try:
+            writer.set_stage("trial")
+            writer.update_hpo_progress(completed=0, total=n_trials, pruned=0, failed=0)
+            writer.update_hpo_wave_memory({})
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to initialize HPO run-state progress: %s", exc)
+
     trial_logging_cfg = hpo_cfg["trial_model_logging"]
     trial_log_models = bool(trial_logging_cfg["enabled"])
 
@@ -1000,7 +1132,10 @@ def run_hyperparameter_search(
     if use_parallel:
         resources = list(parallel_settings["resources"])[:n_trials]
         n_workers = len(resources)
-        allocations = _allocate_trials_to_workers(n_trials, n_workers)
+        max_trials_per_worker_process = int(parallel_settings["max_trials_per_worker_process"])
+        rss_watchdog_enabled = bool(parallel_settings["rss_watchdog_enabled"])
+        rss_watchdog_max_worker_rss_bytes = int(float(parallel_settings["rss_watchdog_max_worker_rss_gb"]) * (1024**3))
+        rss_watchdog_check_interval_seconds = float(parallel_settings["rss_watchdog_check_interval_seconds"])
         storage_uri = _build_trial_storage_uri(config, parallel_settings["storage_uri"])
         study_name = str(parallel_settings["study_name"] or "binance_hpo")
 
@@ -1020,29 +1155,161 @@ def run_hyperparameter_search(
             study_name,
         )
 
+        no_progress_cycles = 0
+        max_no_progress_cycles = 8
+        last_finished = -1
         spawn_ctx = multiprocessing.get_context("spawn")
-        with ProcessPoolExecutor(max_workers=n_workers, mp_context=spawn_ctx) as executor:
-            futures = []
-            for resource, worker_trials in zip(resources, allocations):
-                if worker_trials <= 0:
-                    continue
-                futures.append(
-                    executor.submit(
-                        _run_optuna_worker,
-                        base_config=config,
-                        data_object=data_object,
-                        hpo_cfg=hpo_cfg,
-                        metric_name=metric_name,
-                        direction=direction,
-                        trial_log_models=trial_log_models,
-                        storage_uri=storage_uri,
-                        study_name=study_name,
-                        resource=resource,
-                        n_trials=worker_trials,
+
+        while True:
+            refreshed = optuna.load_study(study_name=study_name, storage=storage_uri)
+            counts = _summarize_trial_states(refreshed)
+            finished_trials = int(counts["completed"]) + int(counts["pruned"]) + int(counts["failed"])
+            remaining_trials = max(0, n_trials - finished_trials)
+
+            if writer is not None:
+                try:
+                    writer.update_hpo_progress(
+                        completed=int(counts["completed"]),
+                        total=n_trials,
+                        pruned=int(counts["pruned"]),
+                        failed=int(counts["failed"]),
                     )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Failed to update HPO run-state progress: %s", exc)
+
+            if remaining_trials <= 0:
+                break
+
+            if finished_trials <= last_finished:
+                no_progress_cycles += 1
+            else:
+                no_progress_cycles = 0
+            last_finished = finished_trials
+
+            if no_progress_cycles > max_no_progress_cycles:
+                raise RuntimeError(
+                    "Parallel HPO made no progress across multiple recovery cycles; "
+                    "worker processes may be repeatedly terminating."
                 )
-            for fut in futures:
-                fut.result()
+
+            wave_resources = resources[: min(len(resources), remaining_trials)]
+            wave_trial_budget = min(
+                remaining_trials,
+                max_trials_per_worker_process * len(wave_resources),
+            )
+            allocations = _allocate_trials_to_workers(wave_trial_budget, len(wave_resources))
+
+            logger.info(
+                "Launching parallel HPO wave: remaining_trials=%s wave_budget=%s max_trials_per_worker_process=%s allocations=%s resources=%s",
+                remaining_trials,
+                wave_trial_budget,
+                max_trials_per_worker_process,
+                allocations,
+                wave_resources,
+            )
+
+            worker_errors: list[str] = []
+            watchdog_triggered = False
+            with ProcessPoolExecutor(max_workers=len(wave_resources), mp_context=spawn_ctx) as executor:
+                futures = []
+                for resource, worker_trials in zip(wave_resources, allocations):
+                    if worker_trials <= 0:
+                        continue
+                    futures.append(
+                        executor.submit(
+                            _run_optuna_worker,
+                            base_config=config,
+                            data_object=data_object,
+                            hpo_cfg=hpo_cfg,
+                            metric_name=metric_name,
+                            direction=direction,
+                            trial_log_models=trial_log_models,
+                            storage_uri=storage_uri,
+                            study_name=study_name,
+                            resource=resource,
+                            n_trials=worker_trials,
+                        )
+                    )
+
+                pending = set(futures)
+                while pending:
+                    done, pending = wait(
+                        pending,
+                        timeout=rss_watchdog_check_interval_seconds,
+                        return_when=FIRST_COMPLETED,
+                    )
+
+                    if writer is not None:
+                        try:
+                            refreshed = optuna.load_study(study_name=study_name, storage=storage_uri)
+                            counts = _summarize_trial_states(refreshed)
+                            writer.update_hpo_progress(
+                                completed=int(counts["completed"]),
+                                total=n_trials,
+                                pruned=int(counts["pruned"]),
+                                failed=int(counts["failed"]),
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("Failed to update HPO run-state progress: %s", exc)
+
+                    for fut in done:
+                        try:
+                            fut.result()
+                        except Exception as exc:  # noqa: BLE001
+                            error_text = str(exc)
+                            worker_errors.append(error_text)
+                            logger.error(
+                                "Parallel HPO worker failed; continuing with recovery wave. Error: %s",
+                                exc,
+                            )
+
+                    rss_by_pid = _collect_wave_worker_rss_bytes(executor)
+                    if writer is not None:
+                        try:
+                            writer.update_hpo_wave_memory(rss_by_pid)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("Failed to publish HPO wave RSS to run-state: %s", exc)
+
+                    if rss_watchdog_enabled and rss_by_pid:
+                        hottest_pid, hottest_rss = max(rss_by_pid.items(), key=lambda item: item[1])
+                        if hottest_rss >= rss_watchdog_max_worker_rss_bytes:
+                            rss_gb = hottest_rss / float(1024**3)
+                            limit_gb = rss_watchdog_max_worker_rss_bytes / float(1024**3)
+                            logger.warning(
+                                "Parallel HPO RSS watchdog triggered: pid=%s rss=%.2fGiB >= limit=%.2fGiB. "
+                                "Terminating current wave and relaunching remaining trials.",
+                                hottest_pid,
+                                rss_gb,
+                                limit_gb,
+                            )
+                            if writer is not None:
+                                try:
+                                    writer.mark_hpo_rss_watchdog_trigger(
+                                        pid=int(hottest_pid),
+                                        rss_bytes=int(hottest_rss),
+                                        limit_bytes=int(rss_watchdog_max_worker_rss_bytes),
+                                    )
+                                except Exception as exc:  # noqa: BLE001
+                                    logger.warning("Failed to publish HPO RSS watchdog event: %s", exc)
+                            for process in getattr(executor, "_processes", {}).values():
+                                try:
+                                    if process is not None and process.is_alive():
+                                        process.terminate()
+                                except Exception:  # noqa: BLE001
+                                    continue
+                            for fut in pending:
+                                fut.cancel()
+                            pending.clear()
+                            watchdog_triggered = True
+                            break
+
+            if worker_errors:
+                logger.warning(
+                    "Parallel HPO wave completed with %s worker failure(s). The supervisor will continue remaining trials.",
+                    len(worker_errors),
+                )
+            if watchdog_triggered:
+                logger.info("Parallel HPO wave restarted after RSS watchdog trigger.")
 
         study = optuna.load_study(study_name=study_name, storage=storage_uri)
     else:
@@ -1060,7 +1327,34 @@ def run_hyperparameter_search(
             )
 
         study = optuna.create_study(direction=direction)
-        study.optimize(objective, n_trials=n_trials)
+
+        def _callback(study_obj: Any, _trial: Any) -> None:
+            if writer is None:
+                return
+            try:
+                counts = _summarize_trial_states(study_obj)
+                writer.update_hpo_progress(
+                    completed=int(counts["completed"]),
+                    total=n_trials,
+                    pruned=int(counts["pruned"]),
+                    failed=int(counts["failed"]),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to update sequential HPO run-state progress: %s", exc)
+
+        study.optimize(objective, n_trials=n_trials, callbacks=[_callback])
+
+    if writer is not None:
+        try:
+            counts = _summarize_trial_states(study)
+            writer.update_hpo_progress(
+                completed=int(counts["completed"]),
+                total=n_trials,
+                pruned=int(counts["pruned"]),
+                failed=int(counts["failed"]),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to finalize HPO run-state progress: %s", exc)
 
     best_trial = study.best_trial
     best_params = dict(best_trial.params)

@@ -312,6 +312,10 @@ hyperparameter_optimization:  # Controls Optuna-based search over selected hyper
 
   parallel:
     enabled: false  # When true, distribute HPO trials across multiple worker processes/resources.
+    max_trials_per_worker_process: 2  # Hard cap of trials per worker process before respawn; must be >= 1.
+    rss_watchdog_enabled: true  # When true, monitor worker RSS and restart the current wave if memory exceeds threshold.
+    rss_watchdog_max_worker_rss_gb: 28.0  # Per-worker RSS soft limit in GiB; exceeding it triggers wave restart.
+    rss_watchdog_check_interval_seconds: 5.0  # Watchdog polling cadence in seconds while workers are running.
     resources: []  # Resource list like ["gpu:0", "gpu:1", "cpu"]; each worker is pinned to one entry.
     storage_uri: null  # Optional Optuna storage URI (e.g. sqlite:///tmp/optuna/hpo.db); null auto-creates local SQLite.
     study_name: null  # Optional Optuna study name used by parallel workers; null defaults to "binance_hpo".

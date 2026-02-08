@@ -349,6 +349,14 @@ sections:
         type: dict
       trial_model_logging.enabled:
         type: boolean
+      parallel.max_trials_per_worker_process:
+        type: integer
+      parallel.rss_watchdog_enabled:
+        type: boolean
+      parallel.rss_watchdog_max_worker_rss_gb:
+        type: number
+      parallel.rss_watchdog_check_interval_seconds:
+        type: number
     optional_keys:
       parallel.enabled:
         type: boolean

@@ -13,6 +13,7 @@ from models.hyperparameter_tuning import (
     _apply_worker_runtime_environment,
     _compute_next_batch_size,
     _compute_safe_batch_cap_from_memory,
+    _evaluate_trial_objective,
     _is_resource_exhaustion_error,
     _resolve_failure_objective_value,
     _resolve_parallel_settings,
@@ -41,15 +42,15 @@ class TestHPOParallelHelpers(unittest.TestCase):
         self.assertEqual(updated["training"]["runtime"]["device"], "gpu")
         self.assertEqual(updated["training"]["runtime"]["gpu_visible_devices"], "1")
 
-    def test_resolve_parallel_settings_defaults_when_missing(self) -> None:
-        settings = _resolve_parallel_settings({})
-        self.assertFalse(bool(settings["enabled"]))
-        self.assertEqual(settings["resources"], [])
+    def test_resolve_parallel_settings_requires_mapping(self) -> None:
+        with self.assertRaises(ValueError):
+            _resolve_parallel_settings({})
 
     def test_resolve_parallel_settings_parses_values(self) -> None:
         hpo_cfg = {
             "parallel": {
                 "enabled": True,
+                "max_trials_per_worker_process": 2,
                 "resources": ["GPU:0", "cpu", "  gpu:1  "],
                 "storage_uri": "sqlite:///tmp/hpo.db",
                 "study_name": "my_study",
@@ -60,6 +61,34 @@ class TestHPOParallelHelpers(unittest.TestCase):
         self.assertEqual(settings["resources"], ["gpu:0", "cpu", "gpu:1"])
         self.assertEqual(settings["storage_uri"], "sqlite:///tmp/hpo.db")
         self.assertEqual(settings["study_name"], "my_study")
+        self.assertEqual(int(settings["max_trials_per_worker_process"]), 2)
+        self.assertTrue(bool(settings["rss_watchdog_enabled"]))
+        self.assertEqual(float(settings["rss_watchdog_max_worker_rss_gb"]), 28.0)
+
+    def test_resolve_parallel_settings_requires_positive_worker_cap(self) -> None:
+        with self.assertRaises(ValueError):
+            _resolve_parallel_settings(
+                {
+                    "parallel": {
+                        "enabled": True,
+                        "max_trials_per_worker_process": 0,
+                        "resources": ["gpu:0"],
+                    }
+                }
+            )
+
+    def test_resolve_parallel_settings_rejects_invalid_rss_threshold(self) -> None:
+        with self.assertRaises(ValueError):
+            _resolve_parallel_settings(
+                {
+                    "parallel": {
+                        "enabled": True,
+                        "max_trials_per_worker_process": 2,
+                        "rss_watchdog_max_worker_rss_gb": 0,
+                        "resources": ["gpu:0"],
+                    }
+                }
+            )
 
     def test_resolve_worker_runtime_options_parses_explicit_values(self) -> None:
         runtime_cfg = {
@@ -202,6 +231,88 @@ class TestHPOParallelHelpers(unittest.TestCase):
                 self.assertEqual(os.environ.get("CUDA_VISIBLE_DEVICES"), "0")
                 self.assertEqual(os.environ.get("TF_GPU_ALLOCATOR"), "cuda_malloc_async")
         self.assertEqual(fake_tf_config.calls, [(fake_tf_config.device, True)])
+
+    def test_evaluate_trial_objective_calls_cleanup_on_success(self) -> None:
+        trial = types.SimpleNamespace(number=1, user_attrs={})
+
+        def _set_user_attr(key: str, value: object) -> None:
+            trial.user_attrs[key] = value
+
+        trial.set_user_attr = _set_user_attr
+
+        base_config = {
+            "mlflow": {
+                "local_tmp_dir": "/tmp",
+                "artifact_logging": {"trained_model": True},
+                "model_registry": {"register_model": True},
+            },
+            "training": {"runtime": {"device": "gpu", "gpu_visible_devices": "0"}},
+            "model": {"cnn_lstm": {"filters": [64, 128], "lstm_units": 64}},
+        }
+
+        def _run_training_pipeline(cfg: dict, _data_obj: object) -> None:
+            cfg["_hpo_last_metric"] = 0.123
+
+        fake_pipeline = types.SimpleNamespace(run_training_pipeline=_run_training_pipeline)
+
+        with mock.patch.dict("sys.modules", {"training.pipeline": fake_pipeline}):
+            with mock.patch("models.hyperparameter_tuning._sample_hyperparameters", return_value={"batch_size": 16}):
+                with mock.patch("models.hyperparameter_tuning._apply_hyperparameters", side_effect=lambda cfg, _p: cfg):
+                    with mock.patch("models.hyperparameter_tuning._cleanup_trial_runtime") as cleanup_mock:
+                        value = _evaluate_trial_objective(
+                            base_config,
+                            None,
+                            {"search_space": {}},
+                            "loss",
+                            "minimize",
+                            False,
+                            trial,
+                            resource=None,
+                            study_name="test",
+                        )
+        self.assertEqual(value, 0.123)
+        self.assertEqual(cleanup_mock.call_count, 1)
+
+    def test_evaluate_trial_objective_calls_cleanup_on_error(self) -> None:
+        trial = types.SimpleNamespace(number=2, user_attrs={})
+
+        def _set_user_attr(key: str, value: object) -> None:
+            trial.user_attrs[key] = value
+
+        trial.set_user_attr = _set_user_attr
+
+        base_config = {
+            "mlflow": {
+                "local_tmp_dir": "/tmp",
+                "artifact_logging": {"trained_model": True},
+                "model_registry": {"register_model": True},
+            },
+            "training": {"runtime": {"device": "gpu", "gpu_visible_devices": "0"}},
+            "model": {"cnn_lstm": {"filters": [64, 128], "lstm_units": 64}},
+        }
+
+        def _run_training_pipeline(_cfg: dict, _data_obj: object) -> None:
+            raise RuntimeError("boom")
+
+        fake_pipeline = types.SimpleNamespace(run_training_pipeline=_run_training_pipeline)
+
+        with mock.patch.dict("sys.modules", {"training.pipeline": fake_pipeline}):
+            with mock.patch("models.hyperparameter_tuning._sample_hyperparameters", return_value={"batch_size": 16}):
+                with mock.patch("models.hyperparameter_tuning._apply_hyperparameters", side_effect=lambda cfg, _p: cfg):
+                    with mock.patch("models.hyperparameter_tuning._cleanup_trial_runtime") as cleanup_mock:
+                        with self.assertRaises(RuntimeError):
+                            _evaluate_trial_objective(
+                                base_config,
+                                None,
+                                {"search_space": {}},
+                                "loss",
+                                "minimize",
+                                False,
+                                trial,
+                                resource=None,
+                                study_name="test",
+                            )
+        self.assertEqual(cleanup_mock.call_count, 1)
 
 
 if __name__ == "__main__":

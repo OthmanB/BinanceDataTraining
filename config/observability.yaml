@@ -15,9 +15,10 @@
 host: "0.0.0.0"
 port: 8008
 
-# Paths for run state JSON and plain-text run logs.
+# Paths for run state and plain-text run logs.
+# run_state_path must be a SQLite URI: sqlite:///absolute/or/relative/path.db
 # Use absolute paths in production; relative paths are resolved from repo root.
-run_state_path: "tmp/observability/run_state.json"
+run_state_path: "sqlite:///tmp/observability/run_state.db"
 run_log_path: "tmp/observability/run.log"
 
 # When true, enables starting/stopping `main.py` runs from the UI.

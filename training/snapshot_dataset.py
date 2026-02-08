@@ -761,45 +761,46 @@ def build_training_generator(
         return weights_up, weights_down
 
     def _generator_with_weights() -> Iterator[Tuple[np.ndarray, Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]]:
-        for x_chunk, y_up_chunk, y_down_chunk, anchor_ts, duty_cycle_chunk in iter_snapshot_batches(
-            dataset, start_index, end_index
-        ):
-            x_chunk = _apply_normalization(x_chunk, normalization, mask_start, mask_count)
+        while True:
+            for x_chunk, y_up_chunk, y_down_chunk, anchor_ts, duty_cycle_chunk in iter_snapshot_batches(
+                dataset, start_index, end_index
+            ):
+                x_chunk = _apply_normalization(x_chunk, normalization, mask_start, mask_count)
 
-            n_chunk = x_chunk.shape[0]
-            for offset in range(0, n_chunk, batch_size):
-                x_batch = x_chunk[offset : offset + batch_size]
-                y_up = y_up_chunk[offset : offset + batch_size]
-                y_down = y_down_chunk[offset : offset + batch_size]
-                duty_cycle = duty_cycle_chunk[offset : offset + batch_size].astype("float32")
+                n_chunk = x_chunk.shape[0]
+                for offset in range(0, n_chunk, batch_size):
+                    x_batch = x_chunk[offset : offset + batch_size]
+                    y_up = y_up_chunk[offset : offset + batch_size]
+                    y_down = y_down_chunk[offset : offset + batch_size]
+                    duty_cycle = duty_cycle_chunk[offset : offset + batch_size].astype("float32")
 
-                y_up_oh = eye[y_up]
-                y_down_oh = eye[y_down]
-                y_batch = (y_up_oh, y_down_oh)
+                    y_up_oh = eye[y_up]
+                    y_down_oh = eye[y_down]
+                    y_batch = (y_up_oh, y_down_oh)
 
-                # Start with duty-cycle weights
-                weights_up = duty_cycle
-                weights_down = duty_cycle.copy()
+                    # Start with duty-cycle weights
+                    weights_up = duty_cycle
+                    weights_down = duty_cycle.copy()
 
-                # Apply exponential decay if enabled
-                if use_decay_weights:
-                    if current_day is None or decay_const is None:
-                        raise ValueError("Sample weighting requires current_day and decay_const")
-                    anchor_slice = anchor_ts[offset : offset + batch_size]
-                    anchor_days = (anchor_slice // 86400).astype("float64")
-                    age_days = float(current_day) - anchor_days
-                    decay_weights = np.exp(-age_days * float(decay_const)).astype("float32")
-                    weights_up = weights_up * decay_weights
-                    weights_down = weights_down * decay_weights
+                    # Apply exponential decay if enabled
+                    if use_decay_weights:
+                        if current_day is None or decay_const is None:
+                            raise ValueError("Sample weighting requires current_day and decay_const")
+                        anchor_slice = anchor_ts[offset : offset + batch_size]
+                        anchor_days = (anchor_slice // 86400).astype("float64")
+                        age_days = float(current_day) - anchor_days
+                        decay_weights = np.exp(-age_days * float(decay_const)).astype("float32")
+                        weights_up = weights_up * decay_weights
+                        weights_down = weights_down * decay_weights
 
-                # Apply class weights if enabled
-                if use_class_weights:
-                    class_w_up, class_w_down = _compute_class_sample_weights(y_up, y_down)
-                    weights_up = weights_up * class_w_up
-                    weights_down = weights_down * class_w_down
+                    # Apply class weights if enabled
+                    if use_class_weights:
+                        class_w_up, class_w_down = _compute_class_sample_weights(y_up, y_down)
+                        weights_up = weights_up * class_w_up
+                        weights_down = weights_down * class_w_down
 
-                sample_weight = (weights_up, weights_down)
-                yield x_batch, y_batch, sample_weight
+                    sample_weight = (weights_up, weights_down)
+                    yield x_batch, y_batch, sample_weight
 
     return _generator_with_weights(), steps
 

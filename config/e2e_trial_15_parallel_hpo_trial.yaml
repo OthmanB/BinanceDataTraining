@@ -41,6 +41,7 @@ hyperparameter_optimization:
     enabled: false
   parallel:
     enabled: true
+    max_trials_per_worker_process: 2
     resources: ["gpu:0", "gpu:1"]
     storage_uri: null
     study_name: "e2e_trial_15_parallel_hpo"

@@ -6,7 +6,7 @@ Configuration:
 
 Environment variable overrides (take precedence over YAML):
 - OBSERVABILITY_HOST, OBSERVABILITY_PORT
-- RUN_STATE_PATH, RUN_LOG_PATH
+- RUN_STATE_PATH (sqlite URI), RUN_LOG_PATH
 - OBSERVABILITY_ALLOW_RUN_CONTROL
 - OBSERVABILITY_ALLOWED_CONFIGS_GLOB
 - OBSERVABILITY_STATIC_DIR
@@ -31,13 +31,14 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from prometheus_client import CollectorRegistry, Gauge, generate_latest, CONTENT_TYPE_LATEST
 
-from .run_state import RunStateWriter, load_run_state
+from .run_state import RunStateWriter, _resolve_sqlite_path, load_run_state
 
 
 logger = logging.getLogger(__name__)
@@ -155,6 +156,10 @@ class ServerConfig:
             raise RuntimeError("RUN_STATE_PATH must be set (env or config file)")
         if not run_log_path:
             raise RuntimeError("RUN_LOG_PATH must be set (env or config file)")
+        try:
+            _resolve_sqlite_path(str(run_state_path))
+        except ValueError as exc:
+            raise RuntimeError(f"RUN_STATE_PATH must be a sqlite URI (sqlite:///...): {exc}") from exc
 
         allow_run_control = cls._parse_bool(
             os.environ.get("OBSERVABILITY_ALLOW_RUN_CONTROL")
@@ -198,6 +203,10 @@ class ServerState:
         self.selection_lock = threading.Lock()
         self.config_mode = "extended"
         self.mode_lock = threading.Lock()
+        self.system_metrics_lock = threading.Lock()
+        self.system_metrics_cached_at = 0.0
+        self.system_metrics_cache: Dict[str, Any] = {}
+        self.system_metrics_ttl_seconds = 3.0
 
     def is_running(self) -> bool:
         with self.process_lock:
@@ -220,6 +229,57 @@ class ServerState:
     def get_config_mode(self) -> str:
         with self.mode_lock:
             return self.config_mode
+
+    def get_system_metrics(self) -> Dict[str, Any]:
+        with self.system_metrics_lock:
+            now = time.time()
+            if self.system_metrics_cache and (now - self.system_metrics_cached_at) < self.system_metrics_ttl_seconds:
+                return dict(self.system_metrics_cache)
+
+            cpu_count = os.cpu_count() or 1
+            load_1m: Optional[float] = None
+            load_5m: Optional[float] = None
+            load_15m: Optional[float] = None
+            load_norm_1m: Optional[float] = None
+            try:
+                load_1m, load_5m, load_15m = os.getloadavg()
+                load_norm_1m = float(load_1m) / float(cpu_count)
+            except Exception:  # noqa: BLE001
+                load_1m = None
+                load_5m = None
+                load_15m = None
+                load_norm_1m = None
+
+            mem_stats = _read_linux_memory_stats()
+
+            run_pid_fallback: Optional[int] = None
+            with self.process_lock:
+                if self.process is not None and self.process.poll() is None:
+                    run_pid_fallback = int(self.process.pid)
+
+            state = load_run_state(self.config.run_state_path) or {}
+            run_pid = _parse_positive_int(state.get("run_process_pid"))
+            if run_pid is None:
+                run_pid = run_pid_fallback
+
+            run_pid_rss_bytes = _read_linux_process_rss_bytes(run_pid or -1)
+
+            payload: Dict[str, Any] = {
+                "cpu_count": int(cpu_count),
+                "load_1m": load_1m,
+                "load_5m": load_5m,
+                "load_15m": load_15m,
+                "load_norm_1m": load_norm_1m,
+                "run_process_pid": run_pid,
+                "run_process_rss_bytes": run_pid_rss_bytes,
+                "collected_time": now,
+                "gpus": _read_gpu_stats(),
+            }
+            payload.update(mem_stats)
+
+            self.system_metrics_cached_at = now
+            self.system_metrics_cache = dict(payload)
+            return payload
 
     def start_run(self, config_path: str) -> Tuple[bool, str]:
         if not self.config.allow_run_control:
@@ -271,6 +331,210 @@ def _tail_log(path: str, *, max_lines: int) -> List[str]:
         return ["Log file not found"]
     lines = path_obj.read_text(encoding="utf-8", errors="replace").splitlines()
     return lines[-max_lines:]
+
+
+def _read_linux_memory_stats() -> Dict[str, Optional[float]]:
+    stats: Dict[str, Optional[float]] = {
+        "mem_total_bytes": None,
+        "mem_available_bytes": None,
+        "mem_used_bytes": None,
+        "mem_used_ratio": None,
+    }
+    meminfo_path = Path("/proc/meminfo")
+    if not meminfo_path.exists():
+        return stats
+
+    values_kb: Dict[str, int] = {}
+    try:
+        for line in meminfo_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if ":" not in line:
+                continue
+            key, raw_value = line.split(":", 1)
+            parts = raw_value.strip().split()
+            if not parts:
+                continue
+            try:
+                values_kb[key] = int(parts[0])
+            except ValueError:
+                continue
+    except Exception:  # noqa: BLE001
+        return stats
+
+    total_kb = values_kb.get("MemTotal")
+    available_kb = values_kb.get("MemAvailable")
+    if total_kb is None or available_kb is None or total_kb <= 0:
+        return stats
+
+    total_bytes = float(total_kb) * 1024.0
+    available_bytes = float(available_kb) * 1024.0
+    used_bytes = max(total_bytes - available_bytes, 0.0)
+    used_ratio = used_bytes / total_bytes if total_bytes > 0 else None
+
+    stats["mem_total_bytes"] = total_bytes
+    stats["mem_available_bytes"] = available_bytes
+    stats["mem_used_bytes"] = used_bytes
+    stats["mem_used_ratio"] = used_ratio
+    return stats
+
+
+def _read_linux_process_rss_bytes(pid: int) -> Optional[float]:
+    if pid <= 0:
+        return None
+    status_path = Path(f"/proc/{pid}/status")
+    if not status_path.exists():
+        return None
+    try:
+        for line in status_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line.startswith("VmRSS:"):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                return None
+            return float(int(parts[1]) * 1024)
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _read_gpu_stats() -> List[Dict[str, Any]]:
+    stats: List[Dict[str, Any]] = []
+    try:
+        completed = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,power.draw,power.limit",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except Exception:  # noqa: BLE001
+        return stats
+
+    for raw_line in completed.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 7:
+            continue
+
+        gpu: Dict[str, Any] = {
+            "index": None,
+            "name": None,
+            "utilization_ratio": None,
+            "memory_used_bytes": None,
+            "memory_total_bytes": None,
+            "memory_used_ratio": None,
+            "power_draw_watts": None,
+            "power_limit_watts": None,
+        }
+
+        try:
+            gpu["index"] = float(parts[0])
+        except ValueError:
+            continue
+        gpu["name"] = parts[1]
+
+        try:
+            gpu["utilization_ratio"] = float(parts[2]) / 100.0
+        except ValueError:
+            gpu["utilization_ratio"] = None
+        try:
+            used_bytes = float(parts[3]) * 1024.0 * 1024.0
+            gpu["memory_used_bytes"] = used_bytes
+        except ValueError:
+            used_bytes = None
+        try:
+            total_bytes = float(parts[4]) * 1024.0 * 1024.0
+            gpu["memory_total_bytes"] = total_bytes
+        except ValueError:
+            total_bytes = None
+        if used_bytes is not None and total_bytes is not None and total_bytes > 0:
+            gpu["memory_used_ratio"] = used_bytes / total_bytes
+
+        try:
+            gpu["power_draw_watts"] = float(parts[5])
+        except ValueError:
+            gpu["power_draw_watts"] = None
+        try:
+            gpu["power_limit_watts"] = float(parts[6])
+        except ValueError:
+            gpu["power_limit_watts"] = None
+
+        stats.append(gpu)
+
+    return stats
+
+
+def _parse_positive_int(value: Any) -> Optional[int]:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed <= 0:
+        return None
+    return parsed
+
+
+def _normalize_sqlite_uri(path: Any) -> Optional[str]:
+    if path is None:
+        return None
+    candidate = str(path).strip()
+    if not candidate:
+        return None
+    try:
+        resolved = _resolve_sqlite_path(candidate)
+    except ValueError:
+        return None
+    return f"sqlite:///{resolved.as_posix()}"
+
+
+def _normalize_file_path(path: Any) -> Optional[str]:
+    if path is None:
+        return None
+    candidate = str(path).strip()
+    if not candidate:
+        return None
+    return str(Path(candidate).expanduser().resolve())
+
+
+def _run_state_path_warnings(state: Dict[str, Any], config: ServerConfig) -> List[str]:
+    warnings: List[str] = []
+    writer_state_path = _normalize_sqlite_uri(state.get("run_state_path"))
+    server_state_path = _normalize_sqlite_uri(config.run_state_path)
+    if writer_state_path and server_state_path and writer_state_path != server_state_path:
+        warnings.append(
+            "Run-state path mismatch (server vs writer). "
+            f"server={server_state_path} writer={writer_state_path}"
+        )
+
+    writer_log_path = _normalize_file_path(state.get("run_log_path"))
+    server_log_path = _normalize_file_path(config.run_log_path)
+    if writer_log_path and server_log_path and writer_log_path != server_log_path:
+        warnings.append(
+            "Run-log path mismatch (server vs writer). "
+            f"server={server_log_path} writer={writer_log_path}"
+        )
+    return warnings
+
+
+def _heartbeat_age_seconds(heartbeat_ts: Any) -> Optional[float]:
+    if heartbeat_ts is None:
+        return None
+    try:
+        return max(float(datetime.now().timestamp()) - float(heartbeat_ts), 0.0)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_run_state_stale(state: Dict[str, Any], *, threshold_seconds: float = 30.0) -> bool:
+    age = _heartbeat_age_seconds(state.get("heartbeat_time"))
+    if age is None:
+        return False
+    return age > threshold_seconds
 
 
 def _allowed_configs(glob_pattern: str) -> List[str]:
@@ -1049,6 +1313,16 @@ def _render_ui_page(_config: ServerConfig) -> str:
       button.primary {{ background: var(--accent); color: #fff; }}
       button.danger {{ background: var(--danger); color: #fff; }}
       button[disabled], select[disabled] {{ opacity: 0.55; cursor: not-allowed; }}
+      .badge {{
+        display: inline-block;
+        padding: 3px 8px;
+        border-radius: 999px;
+        font-size: 0.78rem;
+        font-weight: 700;
+      }}
+      .badge.ok {{ background: #d5e6e0; color: #24544a; }}
+      .badge.warn {{ background: #fff3cd; color: #7a5a00; }}
+      .badge.unknown {{ background: #ede4d5; color: var(--muted); }}
       .hint {{
         display: inline-flex;
         align-items: center;
@@ -1105,6 +1379,7 @@ def _render_ui_page(_config: ServerConfig) -> str:
         <div class=\"panel\" hx-get=\"/ui/progress\" hx-trigger=\"load, every 5s\"></div>
         <div class=\"panel\" hx-get=\"/ui/metrics\" hx-trigger=\"load, every 5s\"></div>
         <div class=\"panel\" hx-get=\"/ui/stats\" hx-trigger=\"load, every 5s\"></div>
+        <div class=\"panel\" hx-get=\"/ui/system\" hx-trigger=\"load, every 5s\"></div>
       </div>
       <div class=\"panel logs\" style=\"margin-top: 16px;\">
         <div class=\"panel-header\">
@@ -1187,12 +1462,33 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
         if path == "/ui/status":
             state = load_run_state(self.server_state.config.run_state_path)
             if not state:
-                self._send_html("<strong>No active run.</strong>")
+                self._send_html(
+                    "<strong>No active run.</strong><br/>"
+                    f"<strong>Run State Source:</strong> {_escape_text(self.server_state.config.run_state_path)}"
+                )
                 return
+            heartbeat_age_seconds = _heartbeat_age_seconds(state.get("heartbeat_time"))
+            heartbeat_age = "n/a"
+            if heartbeat_age_seconds is not None:
+                heartbeat_age = f"{int(heartbeat_age_seconds)}s"
+
+            is_stale = _is_run_state_stale(state)
+            stale_badge = '<span class="badge unknown">unknown</span>'
+            if heartbeat_age_seconds is not None:
+                stale_badge = '<span class="badge warn">stale</span>' if is_stale else '<span class="badge ok">fresh</span>'
+
+            warnings = _run_state_path_warnings(state, self.server_state.config)
             body = (
                 f"<strong>Status:</strong> {state.get('status')}<br/>"
                 f"<strong>Stage:</strong> {state.get('stage')}<br/>"
-                f"<strong>Run ID:</strong> {state.get('run_id', '-')}")
+                f"<strong>Run ID:</strong> {state.get('run_id', '-')}<br/>"
+                f"<strong>Run PID:</strong> {_escape_text(state.get('run_process_pid'))}<br/>"
+                f"<strong>Heartbeat Age:</strong> {heartbeat_age}<br/>"
+                f"<strong>State Stale (&gt;30s):</strong> {stale_badge}<br/>"
+                f"<strong>Run State Source:</strong> {_escape_text(self.server_state.config.run_state_path)}"
+            )
+            if warnings:
+                body += "<br/><strong>Warnings:</strong><br/>" + "<br/>".join(_escape_text(msg) for msg in warnings)
             self._send_html(body)
             return
 
@@ -1252,18 +1548,27 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
 
             start_ts = state.get("start_time")
             updated_ts = state.get("updated_time")
+            heartbeat_ts = state.get("heartbeat_time")
             runtime = None
             if start_ts is not None:
                 try:
                     runtime = float(datetime.now().timestamp()) - float(start_ts)
                 except (TypeError, ValueError):
                     runtime = None
+            heartbeat_age = None
+            if heartbeat_ts is not None:
+                try:
+                    heartbeat_age = max(float(datetime.now().timestamp()) - float(heartbeat_ts), 0.0)
+                except (TypeError, ValueError):
+                    heartbeat_age = None
 
             body = "<h3>Run Stats</h3>"
             body += f"<div>Status: {state.get('status', 'idle')}</div>"
             body += f"<div>Stage: {state.get('stage', 'idle')}</div>"
             body += f"<div>Start: {_fmt_time(start_ts)}</div>"
             body += f"<div>Last update: {_fmt_time(updated_ts)}</div>"
+            body += f"<div>Heartbeat: {_fmt_time(heartbeat_ts)}</div>"
+            body += f"<div>Heartbeat age: {_fmt_duration(heartbeat_age)}</div>"
             body += f"<div>Runtime: {_fmt_duration(runtime)}</div>"
             body += (
                 f"<div>Snapshot chunks: {state.get('snapshot_chunks_processed', 0)} / "
@@ -1281,8 +1586,101 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
                 f"<div>Eval batches: {state.get('eval_batches_done', 0)} / "
                 f"{state.get('eval_batches_total', 0)}</div>"
             )
+            body += (
+                f"<div>HPO trials: {state.get('hpo_trials_completed', 0)} / "
+                f"{state.get('hpo_trials_total', 0)} (pruned={state.get('hpo_trials_pruned', 0)}, "
+                f"failed={state.get('hpo_trials_failed', 0)})</div>"
+            )
             if state.get("last_error"):
                 body += f"<div>Last error: {_escape_text(state.get('last_error'))}</div>"
+            self._send_html(body)
+            return
+
+        if path == "/ui/system":
+            metrics = self.server_state.get_system_metrics()
+            state = load_run_state(self.server_state.config.run_state_path) or {}
+
+            def _fmt_bytes(value: Any) -> str:
+                if value is None:
+                    return "n/a"
+                try:
+                    num = float(value)
+                except (TypeError, ValueError):
+                    return "n/a"
+                units = ["B", "KiB", "MiB", "GiB", "TiB"]
+                idx = 0
+                while num >= 1024.0 and idx < len(units) - 1:
+                    num /= 1024.0
+                    idx += 1
+                return f"{num:.2f} {units[idx]}"
+
+            def _fmt_ratio(value: Any) -> str:
+                if value is None:
+                    return "n/a"
+                try:
+                    return f"{float(value) * 100.0:.1f}%"
+                except (TypeError, ValueError):
+                    return "n/a"
+
+            def _fmt_number(value: Any) -> str:
+                if value is None:
+                    return "n/a"
+                try:
+                    return f"{float(value):.2f}"
+                except (TypeError, ValueError):
+                    return "n/a"
+
+            body = "<h3>System</h3>"
+            body += (
+                f"<div>CPU load (1m/5m/15m): {_fmt_number(metrics.get('load_1m'))} / "
+                f"{_fmt_number(metrics.get('load_5m'))} / {_fmt_number(metrics.get('load_15m'))}</div>"
+            )
+            body += f"<div>CPU load normalized (1m): {_fmt_ratio(metrics.get('load_norm_1m'))}</div>"
+            body += (
+                f"<div>RAM used: {_fmt_bytes(metrics.get('mem_used_bytes'))} / "
+                f"{_fmt_bytes(metrics.get('mem_total_bytes'))} ({_fmt_ratio(metrics.get('mem_used_ratio'))})</div>"
+            )
+            body += f"<div>Run PID: {_escape_text(metrics.get('run_process_pid'))}</div>"
+            body += f"<div>Run PID RSS: {_fmt_bytes(metrics.get('run_process_rss_bytes'))}</div>"
+            body += f"<div>HPO wave workers: {_escape_text(state.get('hpo_wave_worker_count'))}</div>"
+            body += (
+                f"<div>HPO worker RSS current/max: {_fmt_bytes(state.get('hpo_wave_worker_rss_current_bytes'))} / "
+                f"{_fmt_bytes(state.get('hpo_wave_worker_rss_max_bytes'))}</div>"
+            )
+            body += (
+                f"<div>HPO RSS watchdog triggers: {_escape_text(state.get('hpo_rss_watchdog_trigger_count'))}"
+                f" (last pid={_escape_text(state.get('hpo_rss_watchdog_last_trigger_pid'))}, "
+                f"rss={_fmt_bytes(state.get('hpo_rss_watchdog_last_trigger_rss_bytes'))}, "
+                f"limit={_fmt_bytes(state.get('hpo_rss_watchdog_last_trigger_limit_bytes'))})</div>"
+            )
+
+            top_workers = state.get("hpo_wave_worker_rss_top")
+            if isinstance(top_workers, list) and top_workers:
+                body += "<h4>Top Worker RSS</h4>"
+                for worker in top_workers:
+                    if not isinstance(worker, dict):
+                        continue
+                    worker_pid_raw = _parse_positive_int(worker.get("pid"))
+                    worker_pid = _escape_text(worker_pid_raw if worker_pid_raw is not None else worker.get("pid"))
+                    body += f"<div>pid={worker_pid} rss={_fmt_bytes(worker.get('rss_bytes'))}</div>"
+
+            gpus = metrics.get("gpus")
+            if isinstance(gpus, list) and gpus:
+                body += "<h4>GPU</h4>"
+                for gpu in gpus:
+                    if not isinstance(gpu, dict):
+                        continue
+                    body += (
+                        f"<div>GPU {int(gpu.get('index', 0))} ({_escape_text(gpu.get('name', 'unknown'))}): "
+                        f"util={_fmt_ratio(gpu.get('utilization_ratio'))}, "
+                        f"mem={_fmt_bytes(gpu.get('memory_used_bytes'))}/{_fmt_bytes(gpu.get('memory_total_bytes'))} "
+                        f"({_fmt_ratio(gpu.get('memory_used_ratio'))}), "
+                        f"power={_fmt_number(gpu.get('power_draw_watts'))}/{_fmt_number(gpu.get('power_limit_watts'))} W"
+                        "</div>"
+                    )
+            else:
+                body += "<div>GPU: n/a</div>"
+
             self._send_html(body)
             return
 
@@ -1295,9 +1693,19 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
 
         if path == "/metrics":
             state = load_run_state(self.server_state.config.run_state_path) or {}
+            system_metrics = self.server_state.get_system_metrics()
             registry = CollectorRegistry()
             Gauge("run_progress", "Run progress", registry=registry).set(float(state.get("progress", 0.0)))
             Gauge("run_eta_seconds", "Run ETA seconds", registry=registry).set(float(state.get("eta_seconds") or 0.0))
+            heartbeat_ts = state.get("heartbeat_time")
+            heartbeat_age = float(_heartbeat_age_seconds(heartbeat_ts) or 0.0)
+            Gauge("run_heartbeat_age_seconds", "Run heartbeat age seconds", registry=registry).set(heartbeat_age)
+            Gauge("run_heartbeat_unix_seconds", "Run heartbeat unix timestamp", registry=registry).set(
+                float(heartbeat_ts or 0.0)
+            )
+            Gauge("run_state_stale", "Run state stale flag (1 stale, 0 fresh)", registry=registry).set(
+                1.0 if _is_run_state_stale(state) else 0.0
+            )
             Gauge("snapshot_chunks_processed", "Snapshot chunks processed", registry=registry).set(
                 float(state.get("snapshot_chunks_processed", 0))
             )
@@ -1316,6 +1724,109 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
             Gauge("eval_batches_total", "Eval batches total", registry=registry).set(
                 float(state.get("eval_batches_total", 0))
             )
+            Gauge("hpo_trials_total", "HPO trials total", registry=registry).set(
+                float(state.get("hpo_trials_total", 0))
+            )
+            Gauge("hpo_trials_completed", "HPO trials completed", registry=registry).set(
+                float(state.get("hpo_trials_completed", 0))
+            )
+            Gauge("hpo_trials_pruned", "HPO trials pruned", registry=registry).set(
+                float(state.get("hpo_trials_pruned", 0))
+            )
+            Gauge("hpo_trials_failed", "HPO trials failed", registry=registry).set(
+                float(state.get("hpo_trials_failed", 0))
+            )
+
+            Gauge("system_memory_total_bytes", "System memory total bytes", registry=registry).set(
+                float(system_metrics.get("mem_total_bytes") or 0.0)
+            )
+            Gauge("system_memory_used_bytes", "System memory used bytes", registry=registry).set(
+                float(system_metrics.get("mem_used_bytes") or 0.0)
+            )
+            Gauge("system_memory_used_ratio", "System memory used ratio", registry=registry).set(
+                float(system_metrics.get("mem_used_ratio") or 0.0)
+            )
+            Gauge("system_loadavg_1m", "System load average 1 minute", registry=registry).set(
+                float(system_metrics.get("load_1m") or 0.0)
+            )
+            Gauge("system_loadavg_5m", "System load average 5 minutes", registry=registry).set(
+                float(system_metrics.get("load_5m") or 0.0)
+            )
+            Gauge("system_loadavg_15m", "System load average 15 minutes", registry=registry).set(
+                float(system_metrics.get("load_15m") or 0.0)
+            )
+            Gauge("system_loadavg_normalized_1m", "System normalized load average 1 minute", registry=registry).set(
+                float(system_metrics.get("load_norm_1m") or 0.0)
+            )
+            Gauge("run_process_rss_bytes", "Run process RSS bytes", registry=registry).set(
+                float(system_metrics.get("run_process_rss_bytes") or 0.0)
+            )
+            Gauge("hpo_wave_worker_count", "HPO wave active worker count", registry=registry).set(
+                float(state.get("hpo_wave_worker_count") or 0.0)
+            )
+            Gauge("hpo_wave_worker_rss_current_bytes", "HPO wave current hottest worker RSS bytes", registry=registry).set(
+                float(state.get("hpo_wave_worker_rss_current_bytes") or 0.0)
+            )
+            Gauge("hpo_wave_worker_rss_max_bytes", "HPO wave maximum worker RSS bytes", registry=registry).set(
+                float(state.get("hpo_wave_worker_rss_max_bytes") or 0.0)
+            )
+            Gauge("hpo_rss_watchdog_trigger_count", "HPO RSS watchdog trigger count", registry=registry).set(
+                float(state.get("hpo_rss_watchdog_trigger_count") or 0.0)
+            )
+            Gauge("hpo_rss_watchdog_last_trigger_unix_seconds", "HPO RSS watchdog last trigger timestamp", registry=registry).set(
+                float(state.get("hpo_rss_watchdog_last_trigger_time") or 0.0)
+            )
+
+            gpus = system_metrics.get("gpus")
+            if isinstance(gpus, list):
+                gpu_util = Gauge(
+                    "gpu_utilization_ratio",
+                    "GPU utilization ratio",
+                    ["gpu", "name"],
+                    registry=registry,
+                )
+                gpu_mem_used = Gauge(
+                    "gpu_memory_used_bytes",
+                    "GPU memory used bytes",
+                    ["gpu", "name"],
+                    registry=registry,
+                )
+                gpu_mem_total = Gauge(
+                    "gpu_memory_total_bytes",
+                    "GPU memory total bytes",
+                    ["gpu", "name"],
+                    registry=registry,
+                )
+                gpu_mem_ratio = Gauge(
+                    "gpu_memory_used_ratio",
+                    "GPU memory used ratio",
+                    ["gpu", "name"],
+                    registry=registry,
+                )
+                gpu_power_draw = Gauge(
+                    "gpu_power_draw_watts",
+                    "GPU power draw watts",
+                    ["gpu", "name"],
+                    registry=registry,
+                )
+                gpu_power_limit = Gauge(
+                    "gpu_power_limit_watts",
+                    "GPU power limit watts",
+                    ["gpu", "name"],
+                    registry=registry,
+                )
+                for gpu in gpus:
+                    if not isinstance(gpu, dict):
+                        continue
+                    index = str(int(gpu.get("index", 0)))
+                    name = str(gpu.get("name") or "unknown")
+                    gpu_util.labels(gpu=index, name=name).set(float(gpu.get("utilization_ratio") or 0.0))
+                    gpu_mem_used.labels(gpu=index, name=name).set(float(gpu.get("memory_used_bytes") or 0.0))
+                    gpu_mem_total.labels(gpu=index, name=name).set(float(gpu.get("memory_total_bytes") or 0.0))
+                    gpu_mem_ratio.labels(gpu=index, name=name).set(float(gpu.get("memory_used_ratio") or 0.0))
+                    gpu_power_draw.labels(gpu=index, name=name).set(float(gpu.get("power_draw_watts") or 0.0))
+                    gpu_power_limit.labels(gpu=index, name=name).set(float(gpu.get("power_limit_watts") or 0.0))
+
             if state.get("duty_cycle_min") is not None:
                 Gauge("duty_cycle_min", "Duty cycle min", registry=registry).set(
                     float(state["duty_cycle_min"])
