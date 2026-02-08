@@ -56,6 +56,9 @@ class RunState:
     run_log_path: Optional[str] = None
     last_error: Optional[str] = None
     last_traceback: Optional[str] = None
+    training_epoch_metrics: Optional[List[Dict[str, Any]]] = None
+    stage_timestamps: Optional[Dict[str, float]] = None
+    hpo_trial_results: Optional[List[Dict[str, Any]]] = None
 
 
 class RunStateWriter:
@@ -85,6 +88,58 @@ class RunStateWriter:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS run_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT,
+                    config_path TEXT,
+                    status TEXT NOT NULL,
+                    start_time REAL,
+                    end_time REAL,
+                    total_epochs INTEGER,
+                    final_loss REAL,
+                    final_val_loss REAL,
+                    payload TEXT NOT NULL
+                )
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _save_history_locked(self) -> None:
+        """Persist current run state as a history record (must hold _lock)."""
+        state_dict = asdict(self._state)
+        payload = json.dumps(state_dict, default=str)
+        epoch_metrics = self._state.training_epoch_metrics or []
+        final_loss: Optional[float] = None
+        final_val_loss: Optional[float] = None
+        if epoch_metrics:
+            last = epoch_metrics[-1]
+            final_loss = last.get("loss")
+            final_val_loss = last.get("val_loss")
+        conn = sqlite3.connect(str(self._sqlite_path))
+        try:
+            conn.execute(
+                """
+                INSERT INTO run_history
+                    (run_id, config_path, status, start_time, end_time,
+                     total_epochs, final_loss, final_val_loss, payload)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    self._state.run_id,
+                    None,
+                    self._state.status,
+                    self._state.start_time,
+                    time.time(),
+                    self._state.training_epochs_done,
+                    final_loss,
+                    final_val_loss,
+                    payload,
+                ),
+            )
             conn.commit()
         finally:
             conn.close()
@@ -100,6 +155,8 @@ class RunStateWriter:
             self._state.heartbeat_time = now
             self._state.status = "running"
             self._state.stage = "initializing"
+            self._state.stage_timestamps = {"initializing": now}
+            self._state.training_epoch_metrics = None
             self._state.progress = 0.0
             if run_id:
                 self._state.run_id = run_id
@@ -112,8 +169,17 @@ class RunStateWriter:
             self._state.run_id = run_id
             self._touch_locked()
 
+    def _record_stage_if_new_locked(self, stage: str) -> None:
+        """Record a timestamp if transitioning to a new stage (must hold _lock)."""
+        if self._state.stage != stage:
+            if self._state.stage_timestamps is None:
+                self._state.stage_timestamps = {}
+            if stage not in self._state.stage_timestamps:
+                self._state.stage_timestamps[stage] = time.time()
+
     def set_stage(self, stage: str) -> None:
         with self._lock:
+            self._record_stage_if_new_locked(stage)
             self._state.stage = stage
             if self._state.status != "failed":
                 self._state.status = "running"
@@ -122,6 +188,7 @@ class RunStateWriter:
     def heartbeat(self, stage: Optional[str] = None) -> None:
         with self._lock:
             if stage is not None:
+                self._record_stage_if_new_locked(stage)
                 self._state.stage = stage
             if self._state.status != "failed":
                 self._state.status = "running"
@@ -136,6 +203,7 @@ class RunStateWriter:
         failed: int = 0,
     ) -> None:
         with self._lock:
+            self._record_stage_if_new_locked("trial")
             self._state.stage = "trial"
             self._state.hpo_trials_total = max(0, int(total))
             self._state.hpo_trials_completed = max(0, int(completed))
@@ -182,6 +250,7 @@ class RunStateWriter:
 
     def update_snapshot_progress(self, processed: int, total: int) -> None:
         with self._lock:
+            self._record_stage_if_new_locked("snapshot_build")
             self._state.stage = "snapshot_build"
             self._state.snapshot_chunks_processed = processed
             self._state.snapshot_chunks_total = total
@@ -195,6 +264,7 @@ class RunStateWriter:
         batches_total: int,
     ) -> None:
         with self._lock:
+            self._record_stage_if_new_locked("training")
             self._state.stage = "training"
             self._state.training_epochs_done = epochs_done
             self._state.training_epochs_total = epochs_total
@@ -210,6 +280,7 @@ class RunStateWriter:
 
     def update_eval_progress(self, processed: int, total: int) -> None:
         with self._lock:
+            self._record_stage_if_new_locked("evaluation")
             self._state.stage = "evaluation"
             self._state.eval_batches_done = processed
             self._state.eval_batches_total = total
@@ -222,12 +293,40 @@ class RunStateWriter:
             self._state.duty_cycle_p95 = float(p95)
             self._touch_locked()
 
+    def update_epoch_metrics(self, epoch: int, metrics: Dict[str, Any]) -> None:
+        """Append per-epoch training metrics (loss, val_loss, etc.)."""
+        with self._lock:
+            if self._state.training_epoch_metrics is None:
+                self._state.training_epoch_metrics = []
+            entry: Dict[str, Any] = {"epoch": epoch}
+            entry.update(metrics)
+            self._state.training_epoch_metrics.append(entry)
+            self._touch_locked()
+
+    def record_stage_transition(self, stage: str) -> None:
+        """Record a timestamp when a pipeline stage begins."""
+        with self._lock:
+            if self._state.stage_timestamps is None:
+                self._state.stage_timestamps = {}
+            self._state.stage_timestamps[stage] = time.time()
+            self._touch_locked()
+
+    def update_hpo_trial_results(self, trials: List[Dict[str, Any]]) -> None:
+        """Replace the HPO trial results list with the latest snapshot."""
+        with self._lock:
+            self._state.hpo_trial_results = list(trials)
+            self._touch_locked()
+
     def set_error(self, message: str, traceback_text: Optional[str] = None) -> None:
         with self._lock:
             self._state.status = "failed"
             self._state.last_error = message
             self._state.last_traceback = traceback_text
             self._touch_locked()
+            try:
+                self._save_history_locked()
+            except Exception:  # noqa: BLE001
+                logger.warning("Failed to save run history on error")
 
     def complete(self) -> None:
         with self._lock:
@@ -235,6 +334,10 @@ class RunStateWriter:
             self._state.progress = 1.0
             self._state.eta_seconds = 0.0
             self._touch_locked()
+            try:
+                self._save_history_locked()
+            except Exception:  # noqa: BLE001
+                logger.warning("Failed to save run history on completion")
 
     def _update_progress_locked(
         self,
@@ -338,10 +441,50 @@ def load_run_state(path: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def load_run_history(path: str, *, limit: int = 50) -> List[Dict[str, Any]]:
+    """Load recent run history records from sqlite."""
+    try:
+        path_obj = _resolve_sqlite_path(path)
+    except ValueError as exc:
+        logger.warning("Invalid run state path for history: %s", exc)
+        return []
+    if not path_obj.exists():
+        return []
+    try:
+        conn = sqlite3.connect(str(path_obj))
+        try:
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='run_history'"
+            )
+            if cursor.fetchone() is None:
+                return []
+            rows = conn.execute(
+                """
+                SELECT id, run_id, config_path, status, start_time, end_time,
+                       total_epochs, final_loss, final_val_loss
+                FROM run_history
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            columns = [
+                "id", "run_id", "config_path", "status", "start_time", "end_time",
+                "total_epochs", "final_loss", "final_val_loss",
+            ]
+            return [dict(zip(columns, row)) for row in rows]
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to read run history from sqlite: %s", exc)
+        return []
+
+
 __all__ = [
     "RunState",
     "RunStateWriter",
     "get_run_state_writer",
     "load_run_state",
+    "load_run_history",
     "_resolve_sqlite_path",
 ]

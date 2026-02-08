@@ -40,6 +40,35 @@ def _summarize_trial_states(study: Any) -> Dict[str, int]:
     return counts
 
 
+def _extract_trial_details(study: Any, *, max_trials: int = 200) -> List[Dict[str, Any]]:
+    """Extract per-trial details from an Optuna study for observability."""
+    results: List[Dict[str, Any]] = []
+    for trial in study.trials[-max_trials:]:
+        state_name = str(getattr(trial.state, "name", "UNKNOWN")).upper()
+        if state_name == "COMPLETE":
+            status = "completed"
+        elif state_name == "PRUNED":
+            status = "pruned"
+        elif state_name in {"FAIL", "FAILED"}:
+            status = "failed"
+        elif state_name == "RUNNING":
+            status = "running"
+        else:
+            status = state_name.lower()
+        duration: Optional[float] = None
+        if trial.datetime_start is not None and trial.datetime_complete is not None:
+            duration = (trial.datetime_complete - trial.datetime_start).total_seconds()
+        entry: Dict[str, Any] = {
+            "number": trial.number,
+            "status": status,
+            "value": trial.value if trial.value is not None else None,
+            "duration": duration,
+            "params": dict(trial.params) if trial.params else {},
+        }
+        results.append(entry)
+    return results
+
+
 def _default_regime_memory() -> Dict[str, Any]:
     return {
         "version": 1,
@@ -1251,6 +1280,7 @@ def run_hyperparameter_search(
                                 pruned=int(counts["pruned"]),
                                 failed=int(counts["failed"]),
                             )
+                            writer.update_hpo_trial_results(_extract_trial_details(refreshed))
                         except Exception as exc:  # noqa: BLE001
                             logger.warning("Failed to update HPO run-state progress: %s", exc)
 
@@ -1341,6 +1371,7 @@ def run_hyperparameter_search(
                     pruned=int(counts["pruned"]),
                     failed=int(counts["failed"]),
                 )
+                writer.update_hpo_trial_results(_extract_trial_details(study_obj))
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to update sequential HPO run-state progress: %s", exc)
 
@@ -1355,6 +1386,7 @@ def run_hyperparameter_search(
                 pruned=int(counts["pruned"]),
                 failed=int(counts["failed"]),
             )
+            writer.update_hpo_trial_results(_extract_trial_details(study))
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to finalize HPO run-state progress: %s", exc)
 

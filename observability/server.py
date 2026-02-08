@@ -38,7 +38,7 @@ from urllib.parse import parse_qs, urlparse
 
 from prometheus_client import CollectorRegistry, Gauge, generate_latest, CONTENT_TYPE_LATEST
 
-from .run_state import RunStateWriter, _resolve_sqlite_path, load_run_state
+from .run_state import RunStateWriter, _resolve_sqlite_path, load_run_state, load_run_history
 
 
 logger = logging.getLogger(__name__)
@@ -1196,200 +1196,418 @@ def _render_run_control_panel(config: ServerConfig, selected_path: Optional[str]
     """
 
 
+
+
+_PIPELINE_STAGES = [
+    ("initializing", "Init"),
+    ("snapshot_build", "Snapshot"),
+    ("training", "Training"),
+    ("evaluation", "Eval"),
+]
+
+
+def _render_pipeline_stepper(
+    current_stage: str,
+    status: str,
+    stage_timestamps: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Render a horizontal pipeline stepper showing stage progression."""
+    stage_ids = [s[0] for s in _PIPELINE_STAGES]
+    ts = stage_timestamps or {}
+
+    def _stage_duration(stage_id: str) -> str:
+        start = ts.get(stage_id)
+        if start is None:
+            return ""
+        idx = stage_ids.index(stage_id) if stage_id in stage_ids else -1
+        end = None
+        for next_idx in range(idx + 1, len(stage_ids)):
+            end = ts.get(stage_ids[next_idx])
+            if end is not None:
+                break
+        if end is None and status == "completed":
+            end = ts.get("completed")
+        if end is None and stage_id == current_stage:
+            end = time.time()
+        if end is None:
+            return ""
+        try:
+            secs = max(float(end) - float(start), 0)
+        except (TypeError, ValueError):
+            return ""
+        if secs < 60:
+            return f" ({int(secs)}s)"
+        minutes = int(secs) // 60
+        remainder = int(secs) % 60
+        return f" ({minutes}m{remainder:02d}s)"
+
+    found = False
+    parts: list = []
+    for i, (stage_id, label) in enumerate(_PIPELINE_STAGES):
+        if i > 0:
+            parts.append('<span class="step-arrow">\u2192</span>')
+        dur = _stage_duration(stage_id)
+        if status == "completed":
+            parts.append(f'<span class="step done">\u2713 {_escape_text(label)}{dur}</span>')
+        elif status == "failed" and stage_id == current_stage:
+            parts.append(f'<span class="step error">\u2717 {_escape_text(label)}{dur}</span>')
+            found = True
+        elif found or (stage_id != current_stage and current_stage in stage_ids and stage_ids.index(stage_id) > stage_ids.index(current_stage)):
+            parts.append(f'<span class="step pending">\u25CB {_escape_text(label)}</span>')
+        elif stage_id == current_stage:
+            parts.append(f'<span class="step active">\u25CF {_escape_text(label)}{dur}</span>')
+            found = True
+        elif not found:
+            parts.append(f'<span class="step done">\u2713 {_escape_text(label)}{dur}</span>')
+        else:
+            parts.append(f'<span class="step pending">\u25CB {_escape_text(label)}</span>')
+    if status == "completed":
+        parts.append('<span class="step-arrow">\u2192</span>')
+        parts.append('<span class="step done">\u2713 Done</span>')
+    if not found and status not in ("completed", "failed") and current_stage not in stage_ids:
+        parts = []
+        for i, (_, label) in enumerate(_PIPELINE_STAGES):
+            if i > 0:
+                parts.append('<span class="step-arrow">\u2192</span>')
+            parts.append(f'<span class="step pending">\u25CB {_escape_text(label)}</span>')
+    return '<div class="stepper">' + ''.join(parts) + '</div>'
+
+
 def _render_ui_page(_config: ServerConfig) -> str:
     return f"""
 <!doctype html>
-<html>
+<html lang="en">
   <head>
-    <meta charset=\"utf-8\" />
-    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Observability Dashboard</title>
-    <script src=\"/static/htmx.min.js\"></script>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1F4CA;</text></svg>" />
+    <script src="/static/htmx.min.js"></script>
+    <script src="/static/chart.min.js"></script>
     <style>
       :root {{
-        --bg: #f4efe6;
-        --panel: #fffaf1;
-        --ink: #262626;
-        --muted: #6d6a61;
-        --border: #e1d7c7;
-        --accent: #1f6f8b;
-        --accent-2: #e1a95f;
-        --danger: #b23a48;
-        --shadow: 0 12px 28px rgba(0, 0, 0, 0.08);
+        --bg: #f4f6f9; --bg-alt: #e8ecf1; --panel: #ffffff;
+        --ink: #1a1a2e; --ink-2: #5a6072; --ink-3: #8b90a0;
+        --border: #dce0e8;
+        --accent: #3b82f6; --accent-hover: #2563eb; --accent-soft: #dbeafe;
+        --danger: #ef4444; --danger-soft: #fce4e4;
+        --success: #22c55e; --success-soft: #dcfce7;
+        --warning: #f59e0b; --warning-soft: #fef3c7;
+        --shadow: 0 1px 3px rgba(0,0,0,0.06), 0 2px 8px rgba(0,0,0,0.04);
+        --shadow-lg: 0 4px 12px rgba(0,0,0,0.08);
+        --radius: 10px;
+        --font: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+        --mono: "SF Mono", "Cascadia Code", "JetBrains Mono", "Fira Code", ui-monospace, monospace;
       }}
+      [data-theme="dark"] {{
+        --bg: #0c0e14; --bg-alt: #151822; --panel: #1a1e2e;
+        --ink: #e2e4eb; --ink-2: #9499ad; --ink-3: #5d6377;
+        --border: #282d3e;
+        --accent: #60a5fa; --accent-hover: #93c5fd; --accent-soft: #1e3a5f;
+        --danger: #f87171; --danger-soft: #3b1c1c;
+        --success: #4ade80; --success-soft: #14352a;
+        --warning: #fbbf24; --warning-soft: #3b2f10;
+        --shadow: 0 1px 3px rgba(0,0,0,0.25), 0 2px 8px rgba(0,0,0,0.2);
+        --shadow-lg: 0 4px 12px rgba(0,0,0,0.35);
+      }}
+      *, *::before, *::after {{ box-sizing: border-box; }}
       body {{
-        font-family: "Trebuchet MS", "Gill Sans", "Segoe UI", sans-serif;
-        margin: 0;
-        padding: 24px;
-        background: radial-gradient(circle at top left, #fdf7ec 0%, #f4efe6 45%, #efe7d8 100%);
-        color: var(--ink);
+        font-family: var(--font); margin: 0; padding: 0;
+        background: var(--bg); color: var(--ink);
+        font-size: 14px; line-height: 1.5; -webkit-font-smoothing: antialiased;
       }}
-      h2 {{ margin: 0 0 16px 0; letter-spacing: 0.5px; }}
-      h3 {{ margin: 0; }}
-      .layout {{ max-width: 1200px; margin: 0 auto; }}
-      .panel {{
-        background: var(--panel);
-        border: 1px solid var(--border);
-        border-radius: 12px;
-        padding: 16px;
-        box-shadow: var(--shadow);
+      .shell {{ max-width: 1320px; margin: 0 auto; padding: 16px 20px; }}
+      /* Header */
+      .header {{
+        display: flex; justify-content: space-between; align-items: center;
+        padding: 12px 0 16px 0; border-bottom: 1px solid var(--border); margin-bottom: 16px;
       }}
-      .panel + .panel {{ margin-top: 16px; }}
-      .panel-header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }}
-      .mode-toggle {{ display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }}
-      .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }}
-      .stats-grid {{ margin-top: 16px; }}
-      .muted {{ color: var(--muted); font-size: 0.9rem; }}
-      .chip {{
-        padding: 4px 10px;
-        border-radius: 999px;
-        font-size: 0.75rem;
-        background: #e9dfcf;
-        color: var(--muted);
+      .header h1 {{ font-size: 1.25rem; font-weight: 700; margin: 0; letter-spacing: -0.02em; }}
+      .header-controls {{ display: flex; align-items: center; gap: 12px; }}
+      .theme-toggle {{
+        background: var(--bg-alt); border: 1px solid var(--border); border-radius: 8px;
+        padding: 6px 10px; cursor: pointer; font-size: 1rem; line-height: 1; color: var(--ink);
       }}
-      .chip.ok {{ background: #d5e6e0; color: #24544a; }}
-      .chip.muted {{ background: #efe7d8; color: var(--muted); }}
-      .config-panel {{ margin-top: 16px; }}
+      .theme-toggle:hover {{ background: var(--border); }}
+      /* Tabs */
+      .tab-bar {{
+        display: flex; gap: 2px; background: var(--bg-alt); border-radius: 10px;
+        padding: 3px; margin-bottom: 16px; width: fit-content;
+      }}
+      .tab-btn {{
+        padding: 7px 18px; border: none; border-radius: 8px; cursor: pointer;
+        font-size: 0.85rem; font-weight: 600; color: var(--ink-2); background: transparent;
+        transition: all 0.15s ease; font-family: var(--font);
+      }}
+      .tab-btn:hover {{ color: var(--ink); }}
+      .tab-btn.active {{ background: var(--panel); color: var(--ink); box-shadow: var(--shadow); }}
+      .tab-panel {{ display: none; }}
+      .tab-panel.active {{ display: block; }}
+      /* Cards */
+      .card, .panel {{
+        background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+        padding: 16px; box-shadow: var(--shadow);
+      }}
+      .card + .card {{ margin-top: 16px; }}
+      .card-header, .panel-header {{
+        display: flex; justify-content: space-between; align-items: center;
+        margin-bottom: 10px; padding-bottom: 8px; border-bottom: 1px solid var(--border);
+      }}
+      .card-header h3, .panel-header h3 {{ margin: 0; font-size: 0.95rem; font-weight: 700; letter-spacing: -0.01em; }}
+      .card-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-bottom: 16px; }}
+      /* Badges */
+      .badge {{
+        display: inline-flex; align-items: center; gap: 5px;
+        padding: 3px 10px; border-radius: 999px; font-size: 0.75rem; font-weight: 600;
+      }}
+      .badge.idle {{ background: var(--bg-alt); color: var(--ink-3); }}
+      .badge.running {{ background: var(--accent-soft); color: var(--accent); }}
+      .badge.completed {{ background: var(--success-soft); color: var(--success); }}
+      .badge.failed {{ background: var(--danger-soft); color: var(--danger); }}
+      .badge.fresh {{ background: var(--success-soft); color: var(--success); }}
+      .badge.stale {{ background: var(--warning-soft); color: var(--warning); }}
+      .badge.unknown {{ background: var(--bg-alt); color: var(--ink-3); }}
+      .badge.warn {{ background: var(--warning-soft); color: var(--warning); }}
+      .badge.ok {{ background: var(--success-soft); color: var(--success); }}
+      /* KV rows */
+      .kv {{ display: flex; justify-content: space-between; padding: 5px 0; font-size: 0.85rem; }}
+      .kv .k {{ color: var(--ink-2); }}
+      .kv .v {{ font-weight: 600; font-variant-numeric: tabular-nums; }}
+      .kv + .kv {{ border-top: 1px solid var(--border); }}
+      /* Pipeline stepper */
+      .stepper {{ display: flex; align-items: center; gap: 0; margin: 12px 0; flex-wrap: wrap; }}
+      .step {{
+        display: flex; align-items: center; gap: 4px; padding: 5px 12px;
+        font-size: 0.78rem; font-weight: 600; border-radius: 6px; white-space: nowrap;
+      }}
+      .step.done {{ color: var(--success); }}
+      .step.active {{ background: var(--accent-soft); color: var(--accent); }}
+      .step.pending {{ color: var(--ink-3); }}
+      .step.error {{ background: var(--danger-soft); color: var(--danger); }}
+      .step-arrow {{ color: var(--ink-3); font-size: 0.7rem; margin: 0 2px; }}
+      /* Progress bar */
+      .progress-wrap {{ margin: 8px 0; }}
+      .progress-bar-outer {{
+        width: 100%; height: 20px; background: var(--bg-alt); border-radius: 10px;
+        overflow: hidden; position: relative;
+      }}
+      .progress-bar-inner {{
+        height: 100%; border-radius: 10px; transition: width 0.4s ease;
+        background: linear-gradient(90deg, var(--accent), #818cf8);
+        position: relative; min-width: 0;
+      }}
+      .progress-bar-inner.training {{ background: linear-gradient(90deg, #22c55e, #4ade80); }}
+      .progress-bar-inner.snapshot_build {{ background: linear-gradient(90deg, #3b82f6, #60a5fa); }}
+      .progress-bar-inner.evaluation {{ background: linear-gradient(90deg, #a855f7, #c084fc); }}
+      .progress-bar-inner.active {{
+        background-image: linear-gradient(
+          -45deg, rgba(255,255,255,0.15) 25%, transparent 25%,
+          transparent 50%, rgba(255,255,255,0.15) 50%, rgba(255,255,255,0.15) 75%, transparent 75%
+        );
+        background-size: 30px 30px; animation: barberpole 1s linear infinite;
+      }}
+      @keyframes barberpole {{ 0% {{ background-position: 0 0; }} 100% {{ background-position: 30px 0; }} }}
+      .progress-label {{
+        font-size: 0.8rem; font-weight: 600; color: var(--ink-2); margin-top: 4px;
+        display: flex; justify-content: space-between;
+      }}
+      /* Log viewer */
+      .log-viewer {{
+        background: #0d1117; color: #c9d1d9; padding: 12px 14px; border-radius: var(--radius);
+        height: 420px; overflow: auto; font-family: var(--mono); font-size: 0.78rem;
+        line-height: 1.65; white-space: pre-wrap; word-break: break-all; border: 1px solid #21262d;
+      }}
+      [data-theme="dark"] .log-viewer {{ background: #010409; border-color: #21262d; }}
+      .log-line {{ display: block; }}
+      .log-line-error {{ color: #f87171; }}
+      .log-line-warning {{ color: #fbbf24; }}
+      .log-line-debug {{ color: #6b7280; }}
+      .log-controls {{ display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }}
+      .log-controls input {{
+        flex: 1; padding: 6px 10px; border-radius: 6px; border: 1px solid var(--border);
+        background: var(--panel); color: var(--ink); font-family: var(--font); font-size: 0.8rem;
+      }}
+      .log-controls button {{
+        padding: 6px 12px; border-radius: 6px; border: 1px solid var(--border);
+        background: var(--bg-alt); color: var(--ink-2); cursor: pointer; font-size: 0.8rem;
+        font-family: var(--font); font-weight: 500;
+      }}
+      /* Error detail panel */
+      .error-detail {{
+        background: var(--danger-soft); border: 1px solid var(--danger); border-radius: var(--radius);
+        padding: 12px; margin-top: 10px;
+      }}
+      .error-detail summary {{ cursor: pointer; font-weight: 600; color: var(--danger); font-size: 0.85rem; }}
+      .error-detail pre {{
+        margin: 8px 0 0 0; font-family: var(--mono); font-size: 0.75rem;
+        white-space: pre-wrap; color: var(--ink); max-height: 300px; overflow: auto;
+      }}
+      /* Config panel */
+      .config-panel {{ margin-top: 0; }}
       .config-panel .field label,
-      .config-panel input,
+      .config-panel input:not([type="checkbox"]),
       .config-panel select,
       .config-panel textarea,
       .config-panel .file-entry,
-      .config-panel .browser-header {{
-        font-size: 0.7rem;
-        line-height: 1.2;
+      .config-panel .browser-header {{ font-size: 0.8rem; line-height: 1.3; }}
+      .config-browser {{
+        margin-top: 12px; border: 1px dashed var(--border); border-radius: var(--radius);
+        padding: 12px; background: var(--bg-alt);
       }}
-      .config-browser {{ margin-top: 12px; border: 1px dashed var(--border); border-radius: 10px; padding: 12px; background: #fffdf7; }}
-      .browser-header {{ display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; font-size: 0.9rem; }}
-      .file-list {{ max-height: 220px; overflow: auto; display: grid; gap: 6px; padding: 8px; margin-top: 10px; border: 1px solid var(--border); border-radius: 8px; background: #fff; }}
-      .file-entry {{ text-align: left; padding: 6px 8px; border-radius: 6px; border: 1px solid transparent; background: #f7f2e9; cursor: pointer; }}
-      .file-entry.dir {{ font-weight: 600; color: var(--ink); }}
-      .file-entry.file.selected {{ border-color: var(--accent); background: #e7f1f5; }}
+      .browser-header {{ display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; font-size: 0.85rem; }}
+      .file-list {{
+        max-height: 220px; overflow: auto; display: grid; gap: 4px; padding: 8px;
+        margin-top: 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel);
+      }}
+      .file-entry {{
+        text-align: left; padding: 5px 8px; border-radius: 6px;
+        border: 1px solid transparent; background: var(--bg-alt); cursor: pointer;
+        font-family: var(--mono); font-size: 0.78rem; color: var(--ink);
+      }}
+      .file-entry:hover {{ background: var(--border); }}
+      .file-entry.dir {{ font-weight: 600; }}
+      .file-entry.file.selected {{ border-color: var(--accent); background: var(--accent-soft); }}
       .load-form {{ margin-top: 10px; }}
       .config-form {{ margin-top: 16px; display: grid; gap: 12px; }}
-      .config-fields {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }}
-      .section-title {{ grid-column: 1 / -1; font-weight: 700; margin-top: 12px; }}
-      .subsection-title {{ grid-column: 1 / -1; font-weight: 600; margin-top: 8px; color: var(--muted); }}
-      .subsub-title {{ grid-column: 1 / -1; font-weight: 600; margin-top: 6px; color: #8b846f; font-size: 0.75rem; }}
-      .field {{ display: grid; gap: 6px; }}
-      .field.missing input, .field.missing textarea, .field.missing select {{ border-color: #b23a48; }}
-      .status {{ margin: 8px 0; padding: 8px 10px; border-radius: 6px; font-size: 0.85rem; }}
-      .status.info {{ background: #ede4d5; color: var(--muted); }}
-      .status.ok {{ background: #d5e6e0; color: #24544a; }}
-      .status.error {{ background: #f8d7da; color: #7a2832; }}
-      .status.warning {{ background: #fff3cd; color: #7a5a00; }}
+      .config-fields {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; }}
+      .section-title {{
+        grid-column: 1 / -1; font-weight: 700; margin-top: 14px; padding-bottom: 4px;
+        border-bottom: 2px solid var(--border); font-size: 0.9rem; cursor: pointer;
+        display: flex; align-items: center; gap: 6px;
+      }}
+      .section-title::before {{ content: "\\25BC"; font-size: 0.65rem; color: var(--ink-3); transition: transform 0.15s; }}
+      .section-title.collapsed::before {{ transform: rotate(-90deg); }}
+      .subsection-title {{ grid-column: 1 / -1; font-weight: 600; margin-top: 8px; color: var(--ink-2); font-size: 0.82rem; }}
+      .subsub-title {{ grid-column: 1 / -1; font-weight: 600; margin-top: 4px; color: var(--ink-3); font-size: 0.78rem; }}
+      .field {{ display: grid; gap: 4px; }}
+      .field.missing input, .field.missing textarea, .field.missing select {{ border-color: var(--danger); }}
+      .status {{ margin: 8px 0; padding: 8px 12px; border-radius: 8px; font-size: 0.85rem; }}
+      .status.info {{ background: var(--bg-alt); color: var(--ink-2); }}
+      .status.ok {{ background: var(--success-soft); color: var(--success); }}
+      .status.error {{ background: var(--danger-soft); color: var(--danger); }}
+      .status.warning {{ background: var(--warning-soft); color: var(--warning); }}
       .status ul {{ margin: 6px 0 0 18px; }}
-      progress {{ width: 100%; height: 12px; }}
-      form {{ display: grid; gap: 10px; margin-top: 10px; }}
+      form {{ display: grid; gap: 8px; margin-top: 8px; }}
       .run-actions {{ display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap; }}
-      label {{ font-weight: 600; }}
+      .mode-toggle {{ display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }}
+      .muted {{ color: var(--ink-2); font-size: 0.85rem; }}
+      label {{ font-weight: 600; font-size: 0.82rem; }}
       input, select {{
-        padding: 8px 10px;
-        border-radius: 8px;
-        border: 1px solid var(--border);
-        background: #fff;
-        font-size: 0.95rem;
+        padding: 7px 10px; border-radius: 8px; border: 1px solid var(--border);
+        background: var(--panel); color: var(--ink); font-family: var(--font); font-size: 0.85rem;
       }}
-      input[type="checkbox"] {{
-        width: 12px;
-        height: 12px;
-        margin: 0;
-        vertical-align: middle;
+      textarea {{
+        padding: 7px 10px; border-radius: 8px; border: 1px solid var(--border);
+        background: var(--panel); color: var(--ink); font-family: var(--mono); font-size: 0.8rem; resize: vertical;
       }}
+      input:focus, select:focus, textarea:focus {{ outline: 2px solid var(--accent); outline-offset: -1px; border-color: var(--accent); }}
+      input[type="checkbox"] {{ width: 15px; height: 15px; margin: 0; accent-color: var(--accent); }}
       button {{
-        padding: 8px 12px;
-        border-radius: 8px;
-        border: none;
-        cursor: pointer;
-        font-weight: 600;
+        padding: 7px 14px; border-radius: 8px; border: none; cursor: pointer;
+        font-weight: 600; font-family: var(--font); font-size: 0.82rem; transition: all 0.15s;
       }}
-      button.ghost {{
-        background: transparent;
-        border: 1px solid var(--border);
-        color: var(--muted);
-      }}
+      button.ghost {{ background: transparent; border: 1px solid var(--border); color: var(--ink-2); }}
+      button.ghost:hover {{ background: var(--bg-alt); }}
       button.primary {{ background: var(--accent); color: #fff; }}
+      button.primary:hover {{ background: var(--accent-hover); }}
       button.danger {{ background: var(--danger); color: #fff; }}
-      button[disabled], select[disabled] {{ opacity: 0.55; cursor: not-allowed; }}
-      .badge {{
-        display: inline-block;
-        padding: 3px 8px;
-        border-radius: 999px;
-        font-size: 0.78rem;
-        font-weight: 700;
-      }}
-      .badge.ok {{ background: #d5e6e0; color: #24544a; }}
-      .badge.warn {{ background: #fff3cd; color: #7a5a00; }}
-      .badge.unknown {{ background: #ede4d5; color: var(--muted); }}
+      button[disabled] {{ opacity: 0.45; cursor: not-allowed; }}
+      .chip {{ padding: 3px 10px; border-radius: 999px; font-size: 0.75rem; font-weight: 600; }}
+      .chip.ok {{ background: var(--success-soft); color: var(--success); }}
+      .chip.muted {{ background: var(--bg-alt); color: var(--ink-3); }}
       .hint {{
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        width: 16px;
-        height: 16px;
-        margin-left: 6px;
-        border-radius: 50%;
-        background: #e8dfd0;
-        color: var(--muted);
-        font-size: 0.7rem;
-        position: relative;
-        cursor: help;
+        display: inline-flex; align-items: center; justify-content: center;
+        width: 16px; height: 16px; margin-left: 4px; border-radius: 50%;
+        background: var(--bg-alt); color: var(--ink-3); font-size: 0.65rem;
+        cursor: help; position: relative;
       }}
       .hint::after {{
-        content: attr(data-hint);
-        position: absolute;
-        bottom: 150%;
-        left: 50%;
-        transform: translateX(-50%);
-        background: #222;
-        color: #f8f6f0;
-        padding: 6px 8px;
-        border-radius: 6px;
-        font-size: 0.75rem;
-        white-space: nowrap;
-        opacity: 0;
-        pointer-events: none;
-        transition: opacity 0.2s ease;
+        content: attr(data-hint); position: absolute; bottom: 150%; left: 50%;
+        transform: translateX(-50%); background: var(--ink); color: var(--panel);
+        padding: 6px 10px; border-radius: 6px; font-size: 0.72rem; white-space: nowrap;
+        max-width: 300px; opacity: 0; pointer-events: none; transition: opacity 0.15s; z-index: 10;
       }}
-      .hint:hover::after, .hint:focus::after {{ opacity: 1; }}
-      .logs pre {{
-        background: #0d0f12;
-        color: #9be564;
-        padding: 10px;
-        border-radius: 8px;
-        height: 320px;
-        overflow: auto;
-        font-family: "Courier New", monospace;
-      }}
+      .hint:hover::after {{ opacity: 1; }}
       @media (max-width: 720px) {{
-        body {{ padding: 16px; }}
-        .panel {{ padding: 14px; }}
+        .shell {{ padding: 12px; }}
+        .card-grid {{ grid-template-columns: 1fr; }}
+        .tab-bar {{ width: 100%; }}
+        .tab-btn {{ flex: 1; text-align: center; }}
       }}
     </style>
   </head>
   <body>
-    <div class=\"layout\">
-      <h2>Run Dashboard</h2>
-      <div id=\"run-status\" class=\"panel\" hx-get=\"/ui/status\" hx-trigger=\"load, every 5s\"></div>
-      <div id=\"config-panel\" class=\"panel config-panel\" hx-get=\"/ui/config\" hx-trigger=\"load\"></div>
-      <div id=\"run-control\" class=\"panel\" hx-get=\"/ui/run-control\" hx-trigger=\"load, every 5s\" style=\"margin-top: 16px;\"></div>
-      <div class=\"grid stats-grid\">
-        <div class=\"panel\" hx-get=\"/ui/progress\" hx-trigger=\"load, every 5s\"></div>
-        <div class=\"panel\" hx-get=\"/ui/metrics\" hx-trigger=\"load, every 5s\"></div>
-        <div class=\"panel\" hx-get=\"/ui/stats\" hx-trigger=\"load, every 5s\"></div>
-        <div class=\"panel\" hx-get=\"/ui/system\" hx-trigger=\"load, every 5s\"></div>
-      </div>
-      <div class=\"panel logs\" style=\"margin-top: 16px;\">
-        <div class=\"panel-header\">
-          <h3>Logs</h3>
+    <div class="shell">
+      <div class="header">
+        <h1>Observability Dashboard</h1>
+        <div class="header-controls">
+          <select id="refresh-rate" onchange="setRefreshRate(this.value)" style="padding:5px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg-alt);color:var(--ink);font-size:0.78rem;font-family:var(--font)">
+            <option value="2">2s</option>
+            <option value="5" selected>5s</option>
+            <option value="10">10s</option>
+            <option value="30">30s</option>
+          </select>
+          <button class="theme-toggle" onclick="exportRunState()" title="Export run state as JSON" aria-label="Export">&#x2B07;</button>
+          <button class="theme-toggle" onclick="toggleTheme()" title="Toggle dark mode" aria-label="Toggle theme">
+            <span id="theme-icon"></span>
+          </button>
         </div>
-        <div id=\"logs-panel\" hx-get=\"/ui/logs\" hx-trigger=\"load, every 2s\"
-             hx-on::afterSwap=\"const el = this.querySelector('pre'); if (el) {{ el.scrollTop = el.scrollHeight; }}\"></div>
+      </div>
+      <div class="tab-bar">
+        <button class="tab-btn active" onclick="switchTab(this,'dashboard')">Dashboard</button>
+        <button class="tab-btn" onclick="switchTab(this,'config')">Config</button>
+        <button class="tab-btn" onclick="switchTab(this,'logs')">Logs</button>
+        <button class="tab-btn" onclick="switchTab(this,'history')">History</button>
+      </div>
+      <div id="tab-dashboard" class="tab-panel active">
+        <div id="run-status" class="card" hx-get="/ui/status" hx-trigger="load, every 5s"></div>
+        <div class="card-grid" style="margin-top:16px">
+          <div class="card" hx-get="/ui/progress" hx-trigger="load, every 5s"></div>
+          <div class="card" hx-get="/ui/metrics" hx-trigger="load, every 5s"></div>
+        </div>
+        <div class="card-grid">
+          <div class="card" hx-get="/ui/stats" hx-trigger="load, every 5s"></div>
+          <div class="card" hx-get="/ui/system" hx-trigger="load, every 5s"></div>
+        </div>
+        <div class="card" id="training-chart-card" hx-get="/ui/training-chart" hx-trigger="load, every 5s"></div>
+        <div class="card" id="hpo-card" hx-get="/ui/hpo" hx-trigger="load, every 5s"></div>
+      </div>
+      <div id="tab-config" class="tab-panel">
+        <div id="config-panel" hx-get="/ui/config" hx-trigger="load" hx-swap="outerHTML"></div>
+        <div id="run-control" hx-get="/ui/run-control" hx-trigger="load, every 5s" style="margin-top:16px"></div>
+      </div>
+      <div id="tab-logs" class="tab-panel">
+        <div class="card">
+          <div class="card-header"><h3>Logs</h3></div>
+          <div class="log-controls">
+            <input type="text" id="log-filter" placeholder="Filter logs..." oninput="filterLogs()" />
+            <button onclick="toggleAutoScroll()" id="autoscroll-btn">Auto-scroll: ON</button>
+          </div>
+          <div id="logs-panel" hx-get="/ui/logs" hx-trigger="load, every 2s"
+               hx-on::afterSwap="if(window._autoScroll!==false){{const el=this.querySelector('.log-viewer');if(el)el.scrollTop=el.scrollHeight;}}"></div>
+        </div>
+      </div>
+      <div id="tab-history" class="tab-panel">
+        <div class="card" hx-get="/ui/history" hx-trigger="load, every 15s"></div>
       </div>
     </div>
+    <script>
+      function getPreferredTheme(){{var s=localStorage.getItem('obs-theme');if(s)return s;return window.matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light';}}
+      function applyTheme(t){{document.documentElement.setAttribute('data-theme',t);document.getElementById('theme-icon').textContent=t==='dark'?'\u2600\uFE0F':'\uD83C\uDF19';localStorage.setItem('obs-theme',t);}}
+      function toggleTheme(){{var c=document.documentElement.getAttribute('data-theme')||'light';applyTheme(c==='dark'?'light':'dark');}}
+      applyTheme(getPreferredTheme());
+      function switchTab(btn,name){{document.querySelectorAll('.tab-panel').forEach(function(p){{p.classList.remove('active')}});document.querySelectorAll('.tab-btn').forEach(function(t){{t.classList.remove('active')}});document.getElementById('tab-'+name).classList.add('active');btn.classList.add('active');}}
+      function filterLogs(){{var q=document.getElementById('log-filter').value.toLowerCase();document.querySelectorAll('#logs-panel .log-line').forEach(function(l){{l.style.display=(!q||l.textContent.toLowerCase().indexOf(q)!==-1)?'':'none'}});}}
+      window._autoScroll=true;
+      function toggleAutoScroll(){{window._autoScroll=!window._autoScroll;document.getElementById('autoscroll-btn').textContent='Auto-scroll: '+(window._autoScroll?'ON':'OFF');}}
+      document.addEventListener('click',function(e){{if(e.target.classList.contains('section-title')){{e.target.classList.toggle('collapsed');var el=e.target.nextElementSibling;while(el&&!el.classList.contains('section-title')){{el.style.display=e.target.classList.contains('collapsed')?'none':'';el=el.nextElementSibling;}}}}}});
+      function exportRunState(){{fetch('/api/run-state').then(function(r){{return r.json()}}).then(function(d){{var blob=new Blob([JSON.stringify(d,null,2)],{{type:'application/json'}});var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='run_state_'+new Date().toISOString().slice(0,19).replace(/:/g,'-')+'.json';a.click();}}).catch(function(e){{alert('Export failed: '+e);}});}}
+      function setRefreshRate(sec){{var val=parseInt(sec,10)||5;document.querySelectorAll('[hx-trigger*="every"]').forEach(function(el){{var t=el.getAttribute('hx-trigger');if(t){{var newT=t.replace(/every \\d+s/g,'every '+val+'s');el.setAttribute('hx-trigger',newT);if(window.htmx)htmx.process(el);}}}});}}
+    </script>
   </body>
 </html>
 """
+
 
 
 class ObservabilityHandler(BaseHTTPRequestHandler):
@@ -1473,10 +1691,14 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
             state = load_run_state(self.server_state.config.run_state_path)
             if not state:
                 self._send_html(
-                    "<strong>No active run.</strong><br/>"
-                    f"<strong>Run State Source:</strong> {_escape_text(self.server_state.config.run_state_path)}"
+                    '<div class="card-header"><h3>Run Status</h3>'
+                    '<span class="badge idle">No Active Run</span></div>'
+                    f'<div class="kv"><span class="k">State Source</span>'
+                    f'<span class="v">{_escape_text(self.server_state.config.run_state_path)}</span></div>'
                 )
                 return
+            run_status = str(state.get("status", "idle"))
+            run_stage = str(state.get("stage", "idle"))
             heartbeat_age_seconds = _heartbeat_age_seconds(state.get("heartbeat_time"))
             heartbeat_age = "n/a"
             if heartbeat_age_seconds is not None:
@@ -1485,20 +1707,33 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
             is_stale = _is_run_state_stale(state)
             stale_badge = '<span class="badge unknown">unknown</span>'
             if heartbeat_age_seconds is not None:
-                stale_badge = '<span class="badge warn">stale</span>' if is_stale else '<span class="badge ok">fresh</span>'
+                stale_badge = '<span class="badge stale">stale</span>' if is_stale else '<span class="badge fresh">fresh</span>'
 
+            status_class = run_status if run_status in ("running", "completed", "failed", "idle") else "idle"
             warnings = _run_state_path_warnings(state, self.server_state.config)
+            stage_ts = state.get("stage_timestamps")
+            stepper_html = _render_pipeline_stepper(run_stage, run_status, stage_timestamps=stage_ts)
+
             body = (
-                f"<strong>Status:</strong> {state.get('status')}<br/>"
-                f"<strong>Stage:</strong> {state.get('stage')}<br/>"
-                f"<strong>Run ID:</strong> {state.get('run_id', '-')}<br/>"
-                f"<strong>Run PID:</strong> {_escape_text(state.get('run_process_pid'))}<br/>"
-                f"<strong>Heartbeat Age:</strong> {heartbeat_age}<br/>"
-                f"<strong>State Stale (&gt;30s):</strong> {stale_badge}<br/>"
-                f"<strong>Run State Source:</strong> {_escape_text(self.server_state.config.run_state_path)}"
+                f'<div class="card-header"><h3>Run Status</h3>'
+                f'<span class="badge {status_class}">{_escape_text(run_status)}</span></div>'
+                f'{stepper_html}'
+                f'<div class="kv"><span class="k">Stage</span><span class="v">{_escape_text(run_stage)}</span></div>'
+                f'<div class="kv"><span class="k">Run ID</span><span class="v">{_escape_text(state.get("run_id", "-"))}</span></div>'
+                f'<div class="kv"><span class="k">Run PID</span><span class="v">{_escape_text(state.get("run_process_pid"))}</span></div>'
+                f'<div class="kv"><span class="k">Heartbeat Age</span><span class="v">{heartbeat_age} {stale_badge}</span></div>'
             )
             if warnings:
-                body += "<br/><strong>Warnings:</strong><br/>" + "<br/>".join(_escape_text(msg) for msg in warnings)
+                for msg in warnings:
+                    body += f'<div class="status warning">{_escape_text(msg)}</div>'
+            last_error = state.get("last_error")
+            last_tb = state.get("last_traceback")
+            if last_error:
+                body += '<details class="error-detail" open>'
+                body += f'<summary>Error: {_escape_text(last_error)}</summary>'
+                if last_tb:
+                    body += f'<pre>{_escape_text(last_tb)}</pre>'
+                body += '</details>'
             self._send_html(body)
             return
 
@@ -1506,13 +1741,20 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
             state = load_run_state(self.server_state.config.run_state_path) or {}
             progress = float(state.get("progress", 0.0)) * 100.0
             eta = state.get("eta_seconds")
+            run_status = str(state.get("status", "idle"))
+            stage = str(state.get("stage", "idle"))
             eta_display = f"{int(eta)}s" if eta is not None else "n/a"
-            body = f"""
-            <h3>Progress</h3>
-            <div>Progress: {progress:.2f}%</div>
-            <div>ETA: {eta_display}</div>
-            <progress value=\"{progress}\" max=\"100\"></progress>
-            """
+            active_class = " active" if run_status == "running" else ""
+            stage_class = stage if stage in ("training", "snapshot_build", "evaluation") else ""
+            body = (
+                '<div class="card-header"><h3>Progress</h3></div>'
+                '<div class="progress-wrap">'
+                '<div class="progress-bar-outer">'
+                f'<div class="progress-bar-inner {stage_class}{active_class}" style="width:{progress:.1f}%"></div>'
+                '</div>'
+                f'<div class="progress-label"><span>{progress:.1f}%</span><span>ETA: {eta_display}</span></div>'
+                '</div>'
+            )
             self._send_html(body)
             return
 
@@ -1526,10 +1768,10 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
                 except (TypeError, ValueError):
                     return "n/a"
 
-            body = "<h3>Duty Cycle</h3>"
-            body += f"<div>min: {_fmt(state.get('duty_cycle_min'))}</div>"
-            body += f"<div>median: {_fmt(state.get('duty_cycle_median'))}</div>"
-            body += f"<div>p95: {_fmt(state.get('duty_cycle_p95'))}</div>"
+            body = '<div class="card-header"><h3>Duty Cycle</h3></div>'
+            body += f'<div class="kv"><span class="k">Min</span><span class="v">{_fmt(state.get("duty_cycle_min"))}</span></div>'
+            body += f'<div class="kv"><span class="k">Median</span><span class="v">{_fmt(state.get("duty_cycle_median"))}</span></div>'
+            body += f'<div class="kv"><span class="k">P95</span><span class="v">{_fmt(state.get("duty_cycle_p95"))}</span></div>'
             self._send_html(body)
             return
 
@@ -1572,37 +1814,31 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
                 except (TypeError, ValueError):
                     heartbeat_age = None
 
-            body = "<h3>Run Stats</h3>"
-            body += f"<div>Status: {state.get('status', 'idle')}</div>"
-            body += f"<div>Stage: {state.get('stage', 'idle')}</div>"
-            body += f"<div>Start: {_fmt_time(start_ts)}</div>"
-            body += f"<div>Last update: {_fmt_time(updated_ts)}</div>"
-            body += f"<div>Heartbeat: {_fmt_time(heartbeat_ts)}</div>"
-            body += f"<div>Heartbeat age: {_fmt_duration(heartbeat_age)}</div>"
-            body += f"<div>Runtime: {_fmt_duration(runtime)}</div>"
+            body = '<div class="card-header"><h3>Run Stats</h3></div>'
+            body += f'<div class="kv"><span class="k">Start</span><span class="v">{_fmt_time(start_ts)}</span></div>'
+            body += f'<div class="kv"><span class="k">Runtime</span><span class="v">{_fmt_duration(runtime)}</span></div>'
+            body += f'<div class="kv"><span class="k">Last Update</span><span class="v">{_fmt_time(updated_ts)}</span></div>'
             body += (
-                f"<div>Snapshot chunks: {state.get('snapshot_chunks_processed', 0)} / "
-                f"{state.get('snapshot_chunks_total', 0)}</div>"
+                f'<div class="kv"><span class="k">Snapshots</span>'
+                f'<span class="v">{state.get("snapshot_chunks_processed", 0)} / {state.get("snapshot_chunks_total", 0)}</span></div>'
             )
             body += (
-                f"<div>Training epochs: {state.get('training_epochs_done', 0)} / "
-                f"{state.get('training_epochs_total', 0)}</div>"
+                f'<div class="kv"><span class="k">Epochs</span>'
+                f'<span class="v">{state.get("training_epochs_done", 0)} / {state.get("training_epochs_total", 0)}</span></div>'
             )
             body += (
-                f"<div>Training batches: {state.get('training_batches_done', 0)} / "
-                f"{state.get('training_batches_total', 0)}</div>"
+                f'<div class="kv"><span class="k">Batches</span>'
+                f'<span class="v">{state.get("training_batches_done", 0)} / {state.get("training_batches_total", 0)}</span></div>'
             )
             body += (
-                f"<div>Eval batches: {state.get('eval_batches_done', 0)} / "
-                f"{state.get('eval_batches_total', 0)}</div>"
+                f'<div class="kv"><span class="k">Eval</span>'
+                f'<span class="v">{state.get("eval_batches_done", 0)} / {state.get("eval_batches_total", 0)}</span></div>'
             )
             body += (
-                f"<div>HPO trials: {state.get('hpo_trials_completed', 0)} / "
-                f"{state.get('hpo_trials_total', 0)} (pruned={state.get('hpo_trials_pruned', 0)}, "
-                f"failed={state.get('hpo_trials_failed', 0)})</div>"
+                f'<div class="kv"><span class="k">HPO Trials</span>'
+                f'<span class="v">{state.get("hpo_trials_completed", 0)} / {state.get("hpo_trials_total", 0)}'
+                f' (pruned={state.get("hpo_trials_pruned", 0)}, failed={state.get("hpo_trials_failed", 0)})</span></div>'
             )
-            if state.get("last_error"):
-                body += f"<div>Last error: {_escape_text(state.get('last_error'))}</div>"
             self._send_html(body)
             return
 
@@ -1640,64 +1876,253 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
                 except (TypeError, ValueError):
                     return "n/a"
 
-            body = "<h3>System</h3>"
+            body = '<div class="card-header"><h3>System</h3></div>'
             body += (
-                f"<div>CPU load (1m/5m/15m): {_fmt_number(metrics.get('load_1m'))} / "
-                f"{_fmt_number(metrics.get('load_5m'))} / {_fmt_number(metrics.get('load_15m'))}</div>"
+                f'<div class="kv"><span class="k">CPU Load (1/5/15m)</span>'
+                f'<span class="v">{_fmt_number(metrics.get("load_1m"))} / '
+                f'{_fmt_number(metrics.get("load_5m"))} / {_fmt_number(metrics.get("load_15m"))}</span></div>'
             )
-            body += f"<div>CPU load normalized (1m): {_fmt_ratio(metrics.get('load_norm_1m'))}</div>"
+            body += f'<div class="kv"><span class="k">CPU Normalized (1m)</span><span class="v">{_fmt_ratio(metrics.get("load_norm_1m"))}</span></div>'
             body += (
-                f"<div>RAM used: {_fmt_bytes(metrics.get('mem_used_bytes'))} / "
-                f"{_fmt_bytes(metrics.get('mem_total_bytes'))} ({_fmt_ratio(metrics.get('mem_used_ratio'))})</div>"
+                f'<div class="kv"><span class="k">RAM Used</span>'
+                f'<span class="v">{_fmt_bytes(metrics.get("mem_used_bytes"))} / '
+                f'{_fmt_bytes(metrics.get("mem_total_bytes"))} ({_fmt_ratio(metrics.get("mem_used_ratio"))})</span></div>'
             )
-            body += f"<div>Run PID: {_escape_text(metrics.get('run_process_pid'))}</div>"
-            body += f"<div>Run PID RSS: {_fmt_bytes(metrics.get('run_process_rss_bytes'))}</div>"
-            body += f"<div>HPO wave workers: {_escape_text(state.get('hpo_wave_worker_count'))}</div>"
-            body += (
-                f"<div>HPO worker RSS current/max: {_fmt_bytes(state.get('hpo_wave_worker_rss_current_bytes'))} / "
-                f"{_fmt_bytes(state.get('hpo_wave_worker_rss_max_bytes'))}</div>"
-            )
-            body += (
-                f"<div>HPO RSS watchdog triggers: {_escape_text(state.get('hpo_rss_watchdog_trigger_count'))}"
-                f" (last pid={_escape_text(state.get('hpo_rss_watchdog_last_trigger_pid'))}, "
-                f"rss={_fmt_bytes(state.get('hpo_rss_watchdog_last_trigger_rss_bytes'))}, "
-                f"limit={_fmt_bytes(state.get('hpo_rss_watchdog_last_trigger_limit_bytes'))})</div>"
-            )
+            body += f'<div class="kv"><span class="k">Run PID</span><span class="v">{_escape_text(metrics.get("run_process_pid"))}</span></div>'
+            body += f'<div class="kv"><span class="k">Run RSS</span><span class="v">{_fmt_bytes(metrics.get("run_process_rss_bytes"))}</span></div>'
 
-            top_workers = state.get("hpo_wave_worker_rss_top")
-            if isinstance(top_workers, list) and top_workers:
-                body += "<h4>Top Worker RSS</h4>"
-                for worker in top_workers:
-                    if not isinstance(worker, dict):
-                        continue
-                    worker_pid_raw = _parse_positive_int(worker.get("pid"))
-                    worker_pid = _escape_text(worker_pid_raw if worker_pid_raw is not None else worker.get("pid"))
-                    body += f"<div>pid={worker_pid} rss={_fmt_bytes(worker.get('rss_bytes'))}</div>"
+            hpo_worker_count = state.get("hpo_wave_worker_count")
+            if hpo_worker_count:
+                body += f'<div class="kv"><span class="k">HPO Workers</span><span class="v">{_escape_text(hpo_worker_count)}</span></div>'
+                body += (
+                    f'<div class="kv"><span class="k">HPO RSS (cur/max)</span>'
+                    f'<span class="v">{_fmt_bytes(state.get("hpo_wave_worker_rss_current_bytes"))} / '
+                    f'{_fmt_bytes(state.get("hpo_wave_worker_rss_max_bytes"))}</span></div>'
+                )
+                watchdog_count = state.get("hpo_rss_watchdog_trigger_count", 0)
+                if watchdog_count:
+                    body += (
+                        f'<div class="kv"><span class="k">RSS Watchdog</span>'
+                        f'<span class="v">{_escape_text(watchdog_count)} triggers</span></div>'
+                    )
+
+                top_workers = state.get("hpo_wave_worker_rss_top")
+                if isinstance(top_workers, list) and top_workers:
+                    for worker in top_workers:
+                        if not isinstance(worker, dict):
+                            continue
+                        worker_pid_raw = _parse_positive_int(worker.get("pid"))
+                        worker_pid = _escape_text(worker_pid_raw if worker_pid_raw is not None else worker.get("pid"))
+                        body += f'<div class="kv"><span class="k">Worker {worker_pid}</span><span class="v">{_fmt_bytes(worker.get("rss_bytes"))}</span></div>'
 
             gpus = metrics.get("gpus")
             if isinstance(gpus, list) and gpus:
-                body += "<h4>GPU</h4>"
                 for gpu in gpus:
                     if not isinstance(gpu, dict):
                         continue
                     body += (
-                        f"<div>GPU {int(gpu.get('index', 0))} ({_escape_text(gpu.get('name', 'unknown'))}): "
-                        f"util={_fmt_ratio(gpu.get('utilization_ratio'))}, "
-                        f"mem={_fmt_bytes(gpu.get('memory_used_bytes'))}/{_fmt_bytes(gpu.get('memory_total_bytes'))} "
-                        f"({_fmt_ratio(gpu.get('memory_used_ratio'))}), "
-                        f"power={_fmt_number(gpu.get('power_draw_watts'))}/{_fmt_number(gpu.get('power_limit_watts'))} W"
-                        "</div>"
+                        f'<div class="kv"><span class="k">GPU {int(gpu.get("index", 0))} {_escape_text(gpu.get("name", ""))}</span>'
+                        f'<span class="v">{_fmt_ratio(gpu.get("utilization_ratio"))} util, '
+                        f'{_fmt_bytes(gpu.get("memory_used_bytes"))}/{_fmt_bytes(gpu.get("memory_total_bytes"))}, '
+                        f'{_fmt_number(gpu.get("power_draw_watts"))}W</span></div>'
                     )
             else:
-                body += "<div>GPU: n/a</div>"
+                body += '<div class="kv"><span class="k">GPU</span><span class="v">n/a</span></div>'
 
+            self._send_html(body)
+            return
+
+        if path == "/ui/hpo":
+            state = load_run_state(self.server_state.config.run_state_path) or {}
+            trials = state.get("hpo_trial_results")
+            body = '<div class="card-header"><h3>HPO Trials</h3></div>'
+            if not isinstance(trials, list) or not trials:
+                body += '<div class="muted" style="padding:20px 0;text-align:center">No HPO trial data yet.</div>'
+                self._send_html(body)
+                return
+
+            best_value: Optional[float] = None
+            best_number: Optional[int] = None
+            for t in trials:
+                if t.get("status") == "completed" and t.get("value") is not None:
+                    v = float(t["value"])
+                    if best_value is None or v < best_value:
+                        best_value = v
+                        best_number = t.get("number")
+
+            param_keys = sorted({k for t in trials for k in (t.get("params") or {})})
+            body += '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:0.82rem">'
+            body += '<thead><tr style="border-bottom:2px solid var(--border);text-align:left">'
+            body += '<th style="padding:5px 8px">#</th><th style="padding:5px 8px">Status</th><th style="padding:5px 8px">Value</th><th style="padding:5px 8px">Duration</th>'
+            for pk in param_keys:
+                body += f'<th style="padding:5px 8px">{_escape_text(pk)}</th>'
+            body += '</tr></thead><tbody>'
+
+            for t in trials:
+                number = t.get("number", "-")
+                status = str(t.get("status", "-"))
+                badge_class = status if status in ("completed", "pruned", "failed", "running") else "idle"
+                value = t.get("value")
+                value_str = f"{float(value):.5f}" if value is not None else "-"
+                dur = t.get("duration")
+                dur_str = f"{int(dur)}s" if dur is not None else "-"
+                is_best = (number == best_number and status == "completed")
+                row_style = "border-bottom:1px solid var(--border);"
+                if is_best:
+                    row_style += "background:var(--success-soft);"
+                body += f'<tr style="{row_style}">'
+                best_marker = " *" if is_best else ""
+                body += f'<td style="padding:5px 8px;font-weight:600">{_escape_text(number)}{best_marker}</td>'
+                body += f'<td style="padding:5px 8px"><span class="badge {badge_class}">{_escape_text(status)}</span></td>'
+                body += f'<td style="padding:5px 8px;font-variant-numeric:tabular-nums">{value_str}</td>'
+                body += f'<td style="padding:5px 8px">{dur_str}</td>'
+                params = t.get("params") or {}
+                for pk in param_keys:
+                    pv = params.get(pk)
+                    if isinstance(pv, float):
+                        pv_str = f"{pv:.4g}"
+                    elif pv is not None:
+                        pv_str = str(pv)
+                    else:
+                        pv_str = "-"
+                    body += f'<td style="padding:5px 8px;font-family:var(--mono);font-size:0.75rem">{_escape_text(pv_str)}</td>'
+                body += '</tr>'
+            body += '</tbody></table></div>'
+            self._send_html(body)
+            return
+
+        if path == "/ui/history":
+            history = load_run_history(self.server_state.config.run_state_path, limit=50)
+            body = '<div class="card-header"><h3>Run History</h3></div>'
+            if not history:
+                body += '<div class="muted" style="padding:20px 0;text-align:center">No completed runs yet.</div>'
+                self._send_html(body)
+                return
+
+            def _fmt_ts(ts: Any) -> str:
+                if ts is None:
+                    return "-"
+                try:
+                    return datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M")
+                except (TypeError, ValueError):
+                    return "-"
+
+            def _fmt_dur(start: Any, end: Any) -> str:
+                if start is None or end is None:
+                    return "-"
+                try:
+                    secs = max(float(end) - float(start), 0)
+                except (TypeError, ValueError):
+                    return "-"
+                if secs < 60:
+                    return f"{int(secs)}s"
+                minutes = int(secs) // 60
+                remainder = int(secs) % 60
+                return f"{minutes}m{remainder:02d}s"
+
+            def _fmt_metric(v: Any) -> str:
+                if v is None:
+                    return "-"
+                try:
+                    return f"{float(v):.4f}"
+                except (TypeError, ValueError):
+                    return "-"
+
+            body += (
+                '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:0.82rem">'
+                '<thead><tr style="border-bottom:2px solid var(--border);text-align:left">'
+                '<th style="padding:6px 8px">Run ID</th>'
+                '<th style="padding:6px 8px">Status</th>'
+                '<th style="padding:6px 8px">Started</th>'
+                '<th style="padding:6px 8px">Duration</th>'
+                '<th style="padding:6px 8px">Epochs</th>'
+                '<th style="padding:6px 8px">Loss</th>'
+                '<th style="padding:6px 8px">Val Loss</th>'
+                '</tr></thead><tbody>'
+            )
+            for run in history:
+                status = str(run.get("status", "-"))
+                badge_class = status if status in ("completed", "failed", "running") else "idle"
+                body += (
+                    f'<tr style="border-bottom:1px solid var(--border)">'
+                    f'<td style="padding:6px 8px;font-family:var(--mono);font-size:0.75rem">{_escape_text(run.get("run_id") or "-")}</td>'
+                    f'<td style="padding:6px 8px"><span class="badge {badge_class}">{_escape_text(status)}</span></td>'
+                    f'<td style="padding:6px 8px">{_fmt_ts(run.get("start_time"))}</td>'
+                    f'<td style="padding:6px 8px">{_fmt_dur(run.get("start_time"), run.get("end_time"))}</td>'
+                    f'<td style="padding:6px 8px">{_escape_text(run.get("total_epochs") or "-")}</td>'
+                    f'<td style="padding:6px 8px">{_fmt_metric(run.get("final_loss"))}</td>'
+                    f'<td style="padding:6px 8px">{_fmt_metric(run.get("final_val_loss"))}</td>'
+                    f'</tr>'
+                )
+            body += '</tbody></table></div>'
+            self._send_html(body)
+            return
+
+        if path == "/ui/training-chart":
+            state = load_run_state(self.server_state.config.run_state_path) or {}
+            epoch_metrics = state.get("training_epoch_metrics")
+            if not isinstance(epoch_metrics, list) or not epoch_metrics:
+                self._send_html(
+                    '<div class="card-header"><h3>Training Curves</h3></div>'
+                    '<div class="muted" style="padding:20px 0;text-align:center">No epoch data yet.</div>'
+                )
+                return
+            epochs = [str(m.get("epoch", i + 1)) for i, m in enumerate(epoch_metrics)]
+            metric_keys = sorted({k for m in epoch_metrics for k in m if k != "epoch"})
+            palette = ["#3b82f6", "#ef4444", "#22c55e", "#f59e0b", "#a855f7", "#06b6d4", "#ec4899", "#84cc16"]
+            datasets_js_parts: List[str] = []
+            for idx, key in enumerate(metric_keys):
+                color = palette[idx % len(palette)]
+                values = [str(m.get(key, "null")) for m in epoch_metrics]
+                is_val = key.startswith("val_")
+                dash = "borderDash:[5,3]," if is_val else ""
+                datasets_js_parts.append(
+                    f'{{label:"{_escape_text(key)}",data:[{",".join(values)}],'
+                    f'borderColor:"{color}",backgroundColor:"{color}22",{dash}'
+                    f'tension:0.3,pointRadius:2,borderWidth:2,fill:false}}'
+                )
+            datasets_js = ",".join(datasets_js_parts)
+            chart_id = "trainChart"
+            body = (
+                '<div class="card-header"><h3>Training Curves</h3></div>'
+                f'<canvas id="{chart_id}" style="width:100%;max-height:320px"></canvas>'
+                '<script>'
+                f'(function(){{'
+                f'var ctx=document.getElementById("{chart_id}");'
+                f'if(!ctx)return;'
+                f'if(ctx._chartInstance){{ctx._chartInstance.destroy();}}'
+                f'var isDark=document.documentElement.getAttribute("data-theme")==="dark";'
+                f'var gridColor=isDark?"rgba(255,255,255,0.08)":"rgba(0,0,0,0.06)";'
+                f'var tickColor=isDark?"#9499ad":"#5a6072";'
+                f'ctx._chartInstance=new Chart(ctx,{{'
+                f'type:"line",'
+                f'data:{{labels:[{",".join(repr(e) for e in epochs)}],datasets:[{datasets_js}]}},'
+                f'options:{{responsive:true,maintainAspectRatio:false,animation:false,'
+                f'plugins:{{legend:{{position:"top",labels:{{color:tickColor,font:{{size:11}}}}}}}},'
+                f'scales:{{x:{{grid:{{color:gridColor}},ticks:{{color:tickColor,font:{{size:10}}}},title:{{display:true,text:"Epoch",color:tickColor}}}},'
+                f'y:{{grid:{{color:gridColor}},ticks:{{color:tickColor,font:{{size:10}}}}}}}}}}'
+                f'}});'
+                f'}})()'
+                '</script>'
+            )
             self._send_html(body)
             return
 
         if path == "/ui/logs":
             cfg = self.server_state.config
             lines = _tail_log(cfg.run_log_path, max_lines=cfg.tail_max_lines)
-            body = "<pre>" + "\n".join(lines) + "</pre>"
+            colored_lines: List[str] = []
+            for line in lines:
+                css_class = "log-line"
+                lower = line.lower()
+                if "[error]" in lower or "error:" in lower or "traceback" in lower:
+                    css_class += " log-line-error"
+                elif "[warning]" in lower or "warning:" in lower:
+                    css_class += " log-line-warning"
+                elif "[debug]" in lower:
+                    css_class += " log-line-debug"
+                colored_lines.append(f'<span class="{css_class}">{_escape_text(line)}</span>')
+            body = '<div class="log-viewer">' + "\n".join(colored_lines) + "</div>"
             self._send_html(body)
             return
 
@@ -1856,6 +2281,11 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/run":
+            state = load_run_state(self.server_state.config.run_state_path) or {"status": "idle"}
+            self._send_json(state)
+            return
+
+        if path == "/api/run-state":
             state = load_run_state(self.server_state.config.run_state_path) or {"status": "idle"}
             self._send_json(state)
             return

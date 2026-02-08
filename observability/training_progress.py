@@ -55,6 +55,9 @@ def create_training_progress_callback(
                 batches_done=self._steps,
                 batches_total=self._steps,
             )
+            if logs:
+                epoch_metrics = {k: float(v) for k, v in logs.items() if isinstance(v, (int, float))}
+                writer.update_epoch_metrics(epoch + 1, epoch_metrics)
 
     return _ProgressCallback()
 
