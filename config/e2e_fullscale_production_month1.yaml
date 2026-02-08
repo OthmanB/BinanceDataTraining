@@ -18,7 +18,7 @@ model:
 
 training:
   epochs: 20
-  batch_size: 24
+  batch_size: 12
   debug_max_samples: 100000000
   runtime:
     device: "gpu"
@@ -75,11 +75,11 @@ hyperparameter_optimization:
       headroom_fraction: 1.0
       persistence_enabled: true
   search_space:
-    cnn_filters_1: [32, 160]
-    cnn_filters_2: [64, 320]
-    lstm_units: [64, 256]
+    cnn_filters_1: [16, 160]
+    cnn_filters_2: [32, 320]
+    lstm_units: [16, 128]
     learning_rate: [0.0003, 0.0012]
-    batch_size: [24, 24]
+    batch_size: [6, 12]
 
 snapshot:
   enabled: true

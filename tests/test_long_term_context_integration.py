@@ -177,9 +177,7 @@ class TestWrapGeneratorWithLongTerm(unittest.TestCase):
         long_term_features = np.random.randn(batch_size, 3).astype(np.float32)
 
         base_gen = self._make_generator([(x, y)])
-        wrapped_gen = wrap_generator_with_long_term(
-            base_gen, long_term_features, start_index=0, batch_size=batch_size
-        )
+        wrapped_gen = wrap_generator_with_long_term(base_gen, long_term_features, start_index=0)
 
         result = next(wrapped_gen)
         self.assertEqual(len(result), 2)  # ([x, lt], y)
@@ -201,9 +199,7 @@ class TestWrapGeneratorWithLongTerm(unittest.TestCase):
         long_term_features = np.random.randn(batch_size, 3).astype(np.float32)
 
         base_gen = self._make_generator([(x, y, sw)], include_sample_weights=True)
-        wrapped_gen = wrap_generator_with_long_term(
-            base_gen, long_term_features, start_index=0, batch_size=batch_size
-        )
+        wrapped_gen = wrap_generator_with_long_term(base_gen, long_term_features, start_index=0)
 
         result = next(wrapped_gen)
         self.assertEqual(len(result), 3)  # ([x, lt], y, sw)
@@ -230,7 +226,7 @@ class TestWrapGeneratorWithLongTerm(unittest.TestCase):
 
         base_gen = self._make_generator([(x, y)])
         wrapped_gen = wrap_generator_with_long_term(
-            base_gen, long_term_features, start_index=start_index, batch_size=batch_size
+            base_gen, long_term_features, start_index=start_index
         )
 
         result = next(wrapped_gen)
@@ -257,9 +253,7 @@ class TestWrapGeneratorWithLongTerm(unittest.TestCase):
         long_term_features = np.arange(total_samples * 2).reshape(total_samples, 2).astype(np.float32)
 
         base_gen = self._make_generator(batches)
-        wrapped_gen = wrap_generator_with_long_term(
-            base_gen, long_term_features, start_index=0, batch_size=batch_size
-        )
+        wrapped_gen = wrap_generator_with_long_term(base_gen, long_term_features, start_index=0)
 
         for batch_idx, result in enumerate(wrapped_gen):
             x_dual, _ = result
@@ -282,9 +276,7 @@ class TestWrapGeneratorWithLongTerm(unittest.TestCase):
         long_term_features = np.random.randn(2, 3).astype(np.float32)
 
         base_gen = self._make_generator([(x, y)])
-        wrapped_gen = wrap_generator_with_long_term(
-            base_gen, long_term_features, start_index=0, batch_size=batch_size
-        )
+        wrapped_gen = wrap_generator_with_long_term(base_gen, long_term_features, start_index=0)
 
         with self.assertRaises(ValueError) as ctx:
             next(wrapped_gen)
@@ -308,20 +300,31 @@ class TestWrapGeneratorWithLongTerm(unittest.TestCase):
 
         base_gen = self._make_generator(batches)
         wrapped_gen = wrap_generator_with_long_term(
-            base_gen, long_term_features, start_index=start_index, batch_size=batch_size
+            base_gen, long_term_features, start_index=start_index
         )
 
         results = list(wrapped_gen)
         self.assertEqual(len(results), num_batches)
 
-        # First batch should have indices [6, 7]
-        np.testing.assert_array_equal(
-            results[0][0][1], long_term_features[6:8]
-        )
-        # Second batch should have indices [8, 9]
-        np.testing.assert_array_equal(
-            results[1][0][1], long_term_features[8:10]
-        )
+    def test_partial_batch_supported(self) -> None:
+        """Partial final batches should be supported without mismatches."""
+        batches = []
+        batches.append((np.random.randn(24, 3, 2).astype(np.float32), np.zeros((24, 1), dtype=np.float32)))
+        batches.append((np.random.randn(8, 3, 2).astype(np.float32), np.zeros((8, 1), dtype=np.float32)))
+
+        long_term_features = np.random.randn(32, 4).astype(np.float32)
+        base_gen = self._make_generator(batches)
+        wrapped_gen = wrap_generator_with_long_term(base_gen, long_term_features, start_index=0)
+
+        results = list(wrapped_gen)
+        self.assertEqual(len(results), 2)
+        first = results[0][0][1]
+        second = results[1][0][1]
+        self.assertEqual(first.shape[0], 24)
+        self.assertEqual(second.shape[0], 8)
+
+        np.testing.assert_array_equal(results[0][0][1], long_term_features[:24])
+        np.testing.assert_array_equal(results[1][0][1], long_term_features[24:32])
 
 
 if __name__ == "__main__":

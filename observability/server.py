@@ -1622,7 +1622,7 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
-        self.wfile.write(body.encode("utf-8"))
+        self.wfile.write(body.encode("utf-8", errors="replace"))
 
     def _send_json(self, payload: Dict[str, Any], status: int = 200) -> None:
         self.send_response(status)

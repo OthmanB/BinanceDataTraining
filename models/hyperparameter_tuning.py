@@ -5,7 +5,7 @@ driven entirely by the ``hyperparameter_optimization`` section of the
 configuration.
 """
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 import copy
 import fcntl
@@ -19,6 +19,7 @@ import subprocess
 import tempfile
 import time
 
+from utils.config_loader import ConfigError
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,30 @@ def _summarize_trial_states(study: Any) -> Dict[str, int]:
         elif state_name in {"FAIL", "FAILED"}:
             counts["failed"] += 1
     return counts
+
+
+def _format_search_space_guidance(search_space: Dict[str, Any]) -> str:
+    guidance_lines: List[str] = []
+    for name, values in search_space.items():
+        if not isinstance(values, list):
+            continue
+        if len(values) == 2 and all(isinstance(v, (int, float)) for v in values):
+            low, high = float(values[0]), float(values[1])
+            if low == high:
+                guidance_lines.append(
+                    f"- {name}: currently fixed at {low}. Consider widening the range (e.g. [{low * 0.5}, {low * 1.5}])."
+                )
+            else:
+                guidance_lines.append(
+                    f"- {name}: range [{low}, {high}]. Consider widening or shifting based on observed failures."
+                )
+        elif len(values) > 2:
+            guidance_lines.append(
+                f"- {name}: categorical candidates {values}. Consider adding smaller/larger values."
+            )
+    if not guidance_lines:
+        return "- search_space: no numeric ranges detected; add or widen numeric ranges for key parameters."
+    return "\n".join(guidance_lines)
 
 
 def _extract_trial_details(study: Any, *, max_trials: int = 200) -> List[Dict[str, Any]]:
@@ -1389,6 +1414,19 @@ def run_hyperparameter_search(
             writer.update_hpo_trial_results(_extract_trial_details(study))
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to finalize HPO run-state progress: %s", exc)
+
+    counts = _summarize_trial_states(study)
+    if int(counts["completed"]) <= 0:
+        search_space = hpo_cfg.get("search_space") if isinstance(hpo_cfg, dict) else None
+        if not isinstance(search_space, dict):
+            search_space = {}
+        guidance = _format_search_space_guidance(search_space)
+        raise ConfigError(
+            "Hyperparameter optimization completed with no successful trials. "
+            f"completed={counts['completed']} pruned={counts['pruned']} failed={counts['failed']}. "
+            "Review the search space and relax constraints. Suggested adjustments:\n"
+            f"{guidance}"
+        )
 
     best_trial = study.best_trial
     best_params = dict(best_trial.params)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 import logging
 from pathlib import Path
 import tempfile
@@ -37,6 +37,55 @@ def _sample_indices(base_indices: np.ndarray, method: str, num_samples: int, see
         rng = np.random.default_rng(seed)
         return np.sort(rng.choice(base_indices, size=num_samples, replace=False).astype("int64"))
     raise ValueError(f"Unsupported diagnostics.sampling.method: {method!r}")
+
+
+def _coerce_scalar(value: Any) -> Optional[float]:
+    try:
+        arr = np.asarray(value)
+    except Exception:  # noqa: BLE001
+        return None
+    if arr.shape == ():
+        return float(arr)
+    if arr.size == 0:
+        return None
+    return float(arr.reshape(-1)[0])
+
+
+def _extract_top_of_book(sample: np.ndarray) -> Optional[Tuple[float, float, float, float]]:
+    if sample.ndim == 4:
+        last_step = sample[-1]
+        if last_step.shape[2] == 4:
+            bid_price = _coerce_scalar(last_step[0, 0, 0])
+            bid_qty = _coerce_scalar(last_step[0, 1, 0])
+            ask_price = _coerce_scalar(last_step[0, 2, 0])
+            ask_qty = _coerce_scalar(last_step[0, 3, 0])
+        else:
+            bid_price = _coerce_scalar(last_step[0, 0, 0])
+            bid_qty = _coerce_scalar(last_step[0, 1, 0])
+            ask_price = _coerce_scalar(last_step[1, 0, 0])
+            ask_qty = _coerce_scalar(last_step[1, 1, 0])
+    elif sample.ndim == 3:
+        if sample.shape[1] == 4:
+            bid_price = _coerce_scalar(sample[0, 0, 0])
+            bid_qty = _coerce_scalar(sample[0, 1, 0])
+            ask_price = _coerce_scalar(sample[0, 2, 0])
+            ask_qty = _coerce_scalar(sample[0, 3, 0])
+        else:
+            bid_price = _coerce_scalar(sample[0, 0, 0])
+            bid_qty = _coerce_scalar(sample[0, 1, 0])
+            ask_price = _coerce_scalar(sample[1, 0, 0])
+            ask_qty = _coerce_scalar(sample[1, 1, 0])
+    elif sample.ndim == 2:
+        bid_price = _coerce_scalar(sample[0, 0])
+        bid_qty = _coerce_scalar(sample[0, 1])
+        ask_price = _coerce_scalar(sample[0, 2])
+        ask_qty = _coerce_scalar(sample[0, 3])
+    else:
+        return None
+
+    if None in {bid_price, bid_qty, ask_price, ask_qty}:
+        return None
+    return float(bid_price), float(bid_qty), float(ask_price), float(ask_qty)
 
 
 def run_snapshot_diagnostics(config: Dict[str, Any]) -> None:
@@ -87,6 +136,7 @@ def run_snapshot_diagnostics(config: Dict[str, Any]) -> None:
     ask_qty_sampled: List[float] = []
 
     sampled_set = set(int(i) for i in sampled_indices.tolist())
+    warned_bad_feature = False
     cursor = 0
     for x_chunk, y_up_chunk, y_down_chunk, _, duty_cycle_chunk in iter_snapshot_batches(snapshot_dataset, 0, train_end):
         chunk_len = int(y_up_chunk.shape[0])
@@ -98,12 +148,17 @@ def run_snapshot_diagnostics(config: Dict[str, Any]) -> None:
             global_idx = cursor + i
             if global_idx in sampled_set:
                 duty_cycle_sampled.append(float(duty_cycle_chunk[i]))
-                features = np.asarray(x_chunk[i])
-                if features.ndim >= 2 and features.shape[1] >= 2:
-                    bid_price = float(features[0, 0])
-                    bid_qty = float(features[0, 1]) if features.shape[1] > 1 else 0.0
-                    ask_price = float(features[1, 0]) if features.shape[0] > 1 else 0.0
-                    ask_qty = float(features[1, 1]) if features.shape[0] > 1 and features.shape[1] > 1 else 0.0
+                try:
+                    features = np.asarray(x_chunk[i])
+                    extracted = _extract_top_of_book(features)
+                except Exception as exc:  # noqa: BLE001
+                    extracted = None
+                    if not warned_bad_feature:
+                        logger.warning("Snapshot diagnostics failed to parse sample features: %s", exc)
+                        warned_bad_feature = True
+
+                if extracted is not None:
+                    bid_price, bid_qty, ask_price, ask_qty = extracted
                     bid_price_sampled.append(bid_price)
                     ask_price_sampled.append(ask_price)
                     bid_qty_sampled.append(bid_qty)

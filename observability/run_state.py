@@ -407,7 +407,7 @@ def _resolve_sqlite_path(path: str) -> Path:
 def get_run_state_writer() -> Optional[RunStateWriter]:
     """Return the shared run state writer if configured via RUN_STATE_PATH."""
     global _WRITER
-    path = os.environ.get("RUN_STATE_PATH")
+    path = os.environ.get("RUN_STATE_PATH") or os.environ.get("OBSERVABILITY_RUN_STATE_PATH")
     if not path:
         return None
     if _WRITER is None:

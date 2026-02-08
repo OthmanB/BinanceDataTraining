@@ -394,7 +394,16 @@ def main() -> int:
             writer.complete()
         return 0
     except Exception as exc:  # noqa: BLE001
-        logger.error("Run failed: %s", exc)
+        message = str(exc)
+        if "Missing aligned data for asset" in message:
+            logger.error(
+                "Run failed: %s. If this is an alignment error for correlated assets, set "
+                "data.asset_pairs.alignment.missing_policy to 'forward_fill' (recommended for preflight) "
+                "or 'skip' to bypass missing aligned rows.",
+                exc,
+            )
+        else:
+            logger.error("Run failed: %s", exc)
         if writer is not None:
             writer.set_error(str(exc), traceback_text=traceback.format_exc())
         return 1

@@ -181,19 +181,29 @@ def load_config(
     Returns a deep-copied, immutable-friendly dictionary.
     """
 
-    raw_config = _load_yaml_file(config_path)
-    if "base_config" in raw_config:
-        base_config_path = raw_config["base_config"]
-        if not isinstance(base_config_path, str) or not base_config_path:
-            raise ConfigError("base_config must be a non-empty string path")
-        if not os.path.isabs(base_config_path):
-            base_config_path = os.path.join(
-                os.path.dirname(os.path.abspath(config_path)),
-                base_config_path,
-            )
-        base_config = _load_yaml_file(base_config_path)
-        override_config = {k: v for k, v in raw_config.items() if k != "base_config"}
-        raw_config = _deep_merge(base_config, override_config)
+    def _load_with_base(path: str) -> Dict[str, Any]:
+        seen_paths = set()
+        current_path = path
+        config = _load_yaml_file(current_path)
+        while "base_config" in config:
+            base_config_path = config["base_config"]
+            if not isinstance(base_config_path, str) or not base_config_path:
+                raise ConfigError("base_config must be a non-empty string path")
+            if not os.path.isabs(base_config_path):
+                base_config_path = os.path.join(
+                    os.path.dirname(os.path.abspath(current_path)),
+                    base_config_path,
+                )
+            if base_config_path in seen_paths:
+                raise ConfigError("Detected recursive base_config references")
+            seen_paths.add(base_config_path)
+            base_config = _load_yaml_file(base_config_path)
+            override_config = {k: v for k, v in config.items() if k != "base_config"}
+            config = _deep_merge(base_config, override_config)
+            current_path = base_config_path
+        return config
+
+    raw_config = _load_with_base(config_path)
     schema = _load_yaml_file(schema_path)
 
     # Resolve environment placeholders before type checking

@@ -257,7 +257,6 @@ def wrap_generator_with_long_term(
     base_generator: Iterator[Tuple[Any, ...]],
     long_term_features: np.ndarray,
     start_index: int,
-    batch_size: int,
 ) -> Iterator[Tuple[Any, ...]]:
     """Wrap a training generator to include long-term features.
 
@@ -269,9 +268,6 @@ def wrap_generator_with_long_term(
         Precomputed long-term features array of shape (n_samples, lt_dim).
     start_index:
         Starting sample index for this generator.
-    batch_size:
-        Batch size for indexing into long_term_features.
-
     Yields
     ------
     Tuple:
@@ -281,7 +277,8 @@ def wrap_generator_with_long_term(
     Notes
     -----
     This wrapper assumes that the base generator yields batches in order
-    starting from start_index. The long-term features are sliced accordingly.
+    starting from start_index. The long-term features are sliced according
+    to the actual batch size, so final partial batches are supported.
     """
     current_idx = start_index
 

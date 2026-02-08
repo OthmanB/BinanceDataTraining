@@ -6,7 +6,7 @@
 #
 # These settings can also be overridden via environment variables:
 #   - OBSERVABILITY_HOST, OBSERVABILITY_PORT
-#   - RUN_STATE_PATH, RUN_LOG_PATH
+#   - RUN_STATE_PATH (or OBSERVABILITY_RUN_STATE_PATH), RUN_LOG_PATH
 #   - OBSERVABILITY_ALLOW_RUN_CONTROL
 #   - OBSERVABILITY_ALLOWED_CONFIGS_GLOB
 #   - OBSERVABILITY_STATIC_DIR
@@ -17,6 +17,8 @@ port: 8008
 
 # Paths for run state and plain-text run logs.
 # run_state_path must be a SQLite URI: sqlite:///absolute/or/relative/path.db
+# For training processes not started by the observability server, export
+# RUN_STATE_PATH or OBSERVABILITY_RUN_STATE_PATH to point at the same SQLite file.
 # Use absolute paths in production; relative paths are resolved from repo root.
 run_state_path: "sqlite:///tmp/observability/run_state.db"
 run_log_path: "tmp/observability/run.log"
@@ -25,7 +27,7 @@ run_log_path: "tmp/observability/run.log"
 allow_run_control: false
 
 # Allow-listed training configs for run control.
-allowed_configs_glob: "config/e2e_trial_*.yaml"
+allowed_configs_glob: "config/e2e_*.yaml"
 
 # Static directory served under /static/ (must contain htmx.min.js).
 static_dir: "static"
