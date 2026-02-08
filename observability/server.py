@@ -1420,11 +1420,23 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
         return False
 
     def do_GET(self) -> None:  # noqa: N802
-        if not self._require_auth():
-            return
-
         parsed = urlparse(self.path)
         path = parsed.path
+
+        # Health check endpoint — no auth required (for load balancers / probes)
+        if path == "/healthz":
+            state = load_run_state(self.server_state.config.run_state_path) or {}
+            run_status = str(state.get("status", "idle"))
+            is_stale = _is_run_state_stale(state)
+            self._send_json({
+                "status": "ok",
+                "run_status": run_status,
+                "run_state_stale": is_stale,
+            })
+            return
+
+        if not self._require_auth():
+            return
 
         if path == "/" or path == "/ui":
             cfg = self.server_state.config

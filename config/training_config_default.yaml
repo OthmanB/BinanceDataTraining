@@ -463,6 +463,7 @@ diagnostics:  # Controls pre-training data quality checks and their logging.
 
 # Logging Configuration
 logging:  # Application logging verbosity and colour settings.
+  format: "colored"      # Log output format: "colored" for human-readable ANSI output, "json" for structured JSON lines (production).
   level: "INFO"          # Global log level: DEBUG, INFO, WARNING, ERROR.
   colored_output: true    # When true, use ANSI colours in log messages.
   log_function_names: true  # When true, include function names in log messages for easier tracing.

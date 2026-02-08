@@ -40,6 +40,13 @@ The pipeline validates configuration strictly against `config/validation_schema.
   CI=true .venv/bin/python3 -m unittest discover -s tests -v
   ```
 
+## Documentation
+
+- [Architecture Overview](documentation/2026-02-08/architecture.md) — pipeline flow, data flow, module dependencies, model architecture
+- [Configuration Key Interactions](documentation/2026-02-08/config_interactions.md) — which config keys depend on each other
+- [Troubleshooting Guide](documentation/2026-02-08/troubleshooting.md) — common errors and fixes
+- [Codebase Audit](documentation/2026-02-08/codebase_full_audit.md) — full audit report
+
 ## Notes
 - Python 3.9 to <3.12 is required (see `setup_venv.sh`).
 - Snapshot datasets are the only supported training mode.

@@ -476,6 +476,8 @@ sections:
   logging:
     type: dict
     required_keys:
+      format:
+        type: string
       level:
         type: string
       colored_output:
