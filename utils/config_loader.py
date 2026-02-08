@@ -97,7 +97,13 @@ def _has_nested(config: Dict[str, Any], dotted_key: str) -> bool:
     return True
 
 
-def _validate_section(config: Dict[str, Any], section_name: str, section_schema: Dict[str, Any]) -> None:
+def _validate_section(
+    config: Dict[str, Any],
+    section_name: str,
+    section_schema: Dict[str, Any],
+    *,
+    strict_unknown: bool = False,
+) -> None:
     if section_name not in config:
         raise ConfigError(f"Missing required section in configuration: '{section_name}'")
     section_value = config[section_name]
@@ -134,9 +140,27 @@ def _validate_section(config: Dict[str, Any], section_name: str, section_schema:
                 f"but got {type(value).__name__}"
             )
 
+    if strict_unknown and isinstance(section_value, dict):
+        for key in section_value.keys():
+            key_str = str(key)
+            allowed = False
+            for dotted_key in list(required_keys.keys()) + list(optional_keys.keys()):
+                if not dotted_key:
+                    continue
+                head = dotted_key.split(".", 1)[0]
+                if head == key_str:
+                    allowed = True
+                    break
+            if not allowed:
+                raise ConfigError(
+                    f"Unknown configuration key '{section_name}.{key_str}'. "
+                    "Check config/validation_schema.yaml for supported keys."
+                )
+
 
 def _validate_config_schema(config: Dict[str, Any], schema: Dict[str, Any]) -> None:
     required_sections = schema.get("required_sections", [])
+    strict_unknown = bool(schema.get("strict_unknown_keys", False))
     for section in required_sections:
         if section not in config:
             raise ConfigError(f"Missing required top-level section: '{section}'")
@@ -145,7 +169,7 @@ def _validate_config_schema(config: Dict[str, Any], schema: Dict[str, Any]) -> N
     for section_name, section_schema in sections_schema.items():
         # Only validate sections that are present or required
         if section_name in config or section_name in required_sections:
-            _validate_section(config, section_name, section_schema)
+            _validate_section(config, section_name, section_schema, strict_unknown=strict_unknown)
 
 
 def load_config(

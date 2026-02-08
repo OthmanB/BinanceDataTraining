@@ -23,15 +23,11 @@ import traceback
 from utils.config_loader import ConfigError, load_config
 from utils.env_validator import validate_environment
 from utils.colored_logging import setup_colored_logging
-from data.data_loader import load_order_book_data
-from preprocessing.temporal_features import attach_temporal_features
-from preprocessing.transformer import run_preprocessing_pipeline
-from preprocessing.train_test_split import chronological_split_indices
-from diagnostics import run_data_diagnostics
+from diagnostics import run_snapshot_diagnostics
 from training import run_training_pipeline
 from training.pipeline import _resolve_sequential_windows
 from training.snapshot_store import resolve_snapshot_context
-from evaluation import evaluate_model, evaluate_snapshot_model
+from evaluation import evaluate_snapshot_model
 from mlflow_integration import start_run, end_run
 from models.hyperparameter_tuning import run_hyperparameter_search
 
@@ -345,9 +341,8 @@ def main() -> int:
             return 1
 
         data_object = None
-        logger.info(
-            "Snapshot mode enabled; skipping in-memory data pipeline and diagnostics.",
-        )
+        logger.info("Snapshot mode enabled; using snapshot-native diagnostics and training pipeline.")
+        run_snapshot_diagnostics(config)
 
         config_for_training = config
 

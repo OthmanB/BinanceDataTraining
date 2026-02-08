@@ -1,3 +1,6 @@
-"""Diagnostics module for data quality checks prior to training."""
+"""Diagnostics module for snapshot-based data checks."""
 
-from .data_diagnostics import run_data_diagnostics
+from .snapshot_diagnostics import run_snapshot_diagnostics
+
+
+__all__ = ["run_snapshot_diagnostics"]

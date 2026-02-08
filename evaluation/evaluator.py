@@ -885,8 +885,8 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
     if writer is not None:
         try:
             writer.update_eval_progress(processed=0, total=total_eval_batches)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to publish initial eval progress: %s", exc)
 
     eval_cfg = config["evaluation"]
     calib_cfg = eval_cfg["calibration_analysis"]
@@ -1360,8 +1360,8 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
             if writer is not None:
                 try:
                     writer.update_eval_progress(processed=eval_batches_done, total=total_eval_batches)
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Failed to publish eval progress update: %s", exc)
 
     if total_eval <= 0:
         logger.info("Snapshot evaluation found no samples after batching; skipping.")

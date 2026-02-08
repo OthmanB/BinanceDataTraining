@@ -1,5 +1,7 @@
 # Validation schema for training_config.yaml (Phase 1)
 
+strict_unknown_keys: true
+
 required_sections:
   - data
   - targets
@@ -238,6 +240,8 @@ sections:
         type: integer
       batch_size:
         type: integer
+      validation_split:
+        type: number
       debug_max_samples:
         type: integer
       missing_snapshot_strategy:
@@ -288,14 +292,6 @@ sections:
         type: string
       fine_tuning.learning_rate_factor:
         type: number
-      dataset_cache.enabled:
-        type: boolean
-      dataset_cache.directory:
-        type: string
-      dataset_cache.filename_pattern:
-        type: string
-      dataset_cache.version:
-        type: string
     optional_keys:
       runtime.gpu_memory_growth:
         type: boolean

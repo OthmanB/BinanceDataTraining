@@ -84,7 +84,6 @@ class TestEvaluator(unittest.TestCase):
                 "validation_split": 0.15,
                 "debug_max_samples": 100,
                 "missing_snapshot_strategy": "synthetic",
-                "dataset_cache": {"enabled": False, "directory": "", "filename_pattern": "", "version": "v1"},
                 "callbacks": {"early_stopping": {"enabled": False, "monitor": "val_loss", "patience": 1, "restore_best_weights": False}, "reduce_lr": {"enabled": False, "monitor": "val_loss", "factor": 0.5, "patience": 1, "min_lr": 1e-5}},
                 "class_weights": {"compute_from_train": False},
                 "sample_weighting": {"enabled": False, "method": "exponential_decay", "half_life_days": 90, "apply_to": "loss_function"},

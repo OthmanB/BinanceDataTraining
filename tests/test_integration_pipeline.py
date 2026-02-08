@@ -169,7 +169,6 @@ def get_minimal_config() -> Dict[str, Any]:
                 "freeze_layers": "none",
                 "learning_rate_factor": 0.1,
             },
-            "dataset_cache": {"enabled": False, "directory": "cache", "filename_pattern": "dataset_{hash}.npz", "version": "v1"},
         },
         "snapshot": {
             "enabled": True,

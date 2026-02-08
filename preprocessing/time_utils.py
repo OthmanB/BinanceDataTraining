@@ -1,5 +1,9 @@
 from typing import Any, Sequence
 
+"""Helpers for timestamp normalization and conversion."""
+
+from typing import Any, Sequence
+
 import numpy as np
 
 

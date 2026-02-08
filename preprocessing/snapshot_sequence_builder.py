@@ -1,4 +1,4 @@
-from __future__ import annotations
+"""Build snapshot sequences for training from order book rows."""
 
 from typing import Any, Dict, Iterable, List
 
@@ -54,11 +54,7 @@ def build_top_of_book_sequence_tensor(
         )
 
     if height <= 0 or width <= 0 or channels <= 0:
-        raise ValueError("height, width, and channels must be positive integers")
-
-    num_snapshots = len(snapshot_features)
-    if num_snapshots == 0:
-        raise ValueError("snapshot_features must be non-empty to build sequence tensors")
+        raise ValueError("Model input height/width/channels must be positive")
 
     anchor_arr = np.asarray(anchor_indices, dtype="int64")
     if anchor_arr.ndim != 1:
@@ -71,13 +67,12 @@ def build_top_of_book_sequence_tensor(
     if sample_idx_arr.size == 0:
         return np.zeros((0, window_steps, height, width, channels), dtype="float32")
 
-    if anchor_arr.min() < 0 or anchor_arr.max() >= num_snapshots:
+    if anchor_arr.min() < 0 or anchor_arr.max() >= len(snapshot_features):
         raise ValueError(
             "anchor_indices must be valid snapshot indices; "
-            f"got min={anchor_arr.min()}, max={anchor_arr.max()}, num_snapshots={num_snapshots}",
+            f"got min={anchor_arr.min()}, max={anchor_arr.max()}, num_snapshots={len(snapshot_features)}",
         )
 
-    # Ensure that sampled indices are valid sample indices relative to anchor_indices.
     if sample_idx_arr.min() < 0 or sample_idx_arr.max() >= anchor_arr.shape[0]:
         raise ValueError(
             "sample_indices must be valid indices into anchor_indices; "
@@ -87,83 +82,47 @@ def build_top_of_book_sequence_tensor(
     n_samples = int(sample_idx_arr.shape[0])
     x_seq = np.zeros((n_samples, window_steps, height, width, channels), dtype="float32")
 
-    for s_idx, sample_i in enumerate(sample_idx_arr):
-        anchor_snapshot_idx = int(anchor_arr[int(sample_i)])
+    for out_idx, sample_idx in enumerate(sample_idx_arr):
+        anchor_idx = int(anchor_arr[sample_idx])
+        start_idx = anchor_idx - window_steps + 1
+        end_idx = anchor_idx + 1
+        if start_idx < 0:
+            raise ValueError("Not enough snapshots to build full window for sample index")
 
-        # Temporal positions are ordered from oldest to newest within the window.
-        for tau in range(window_steps):
-            # Offset from the start of the window to the current time step.
-            # Oldest snapshot index is anchor_snapshot_idx - (window_steps - 1).
-            snapshot_idx = anchor_snapshot_idx - (window_steps - 1 - tau)
+        window = snapshot_features[start_idx:end_idx]
+        if len(window) != window_steps:
+            raise ValueError("Snapshot window length mismatch")
 
-            if snapshot_idx < 0 or snapshot_idx >= num_snapshots:
-                continue
-
-            features = snapshot_features[snapshot_idx]
-            if not isinstance(features, (list, tuple)) or len(features) < 4:
-                continue
-
+        for t_idx, features in enumerate(window):
+            if len(features) < 4:
+                raise ValueError("snapshot_features entries must include bid/ask price and quantity")
             bid_price, bid_qty, ask_price, ask_qty = features[:4]
-
-            try:
-                bid_price_f = float(bid_price)
-                bid_qty_f = float(bid_qty)
-                ask_price_f = float(ask_price)
-                ask_qty_f = float(ask_qty)
-            except (TypeError, ValueError):
-                # Leave this time step as zeros if parsing fails.
-                continue
-
-            # Map into top-left 2x2 patch of the spatial grid for this time step.
-            # Remaining cells stay zero for this baseline implementation.
-            x_seq[s_idx, tau, 0, 0, 0] = bid_price_f
+            x_seq[out_idx, t_idx, 0, 0, 0] = float(bid_price)
             if width > 1:
-                x_seq[s_idx, tau, 0, 1, 0] = bid_qty_f
+                x_seq[out_idx, t_idx, 0, 1, 0] = float(bid_qty)
             if height > 1:
-                x_seq[s_idx, tau, 1, 0, 0] = ask_price_f
+                x_seq[out_idx, t_idx, 1, 0, 0] = float(ask_price)
             if height > 1 and width > 1:
-                x_seq[s_idx, tau, 1, 1, 0] = ask_qty_f
+                x_seq[out_idx, t_idx, 1, 1, 0] = float(ask_qty)
 
     return x_seq
 
 
 def build_hybrid_depth_sequence_tensor(
     config: Dict[str, Any],
-    snapshot_depth_data: List[Dict[str, np.ndarray]],
+    snapshot_depth_data: List[Dict[str, Any]],
     anchor_indices: List[int],
     sample_indices: Iterable[int],
 ) -> np.ndarray:
-    """Build a temporal sequence tensor using hybrid depth representation.
+    """Build hybrid depth sequence tensor for CNN input.
 
-    The returned array has shape (N, T, L, 4, 1), where:
-    - N is the number of samples (len(sample_indices)),
-    - T is derived from targets.visible_window_seconds and data.time_range.cadence_seconds,
-    - L is the effective number of levels (raw_levels + aggregated_bins),
-    - 4 = order book features [bid_price, bid_quantity, ask_price, ask_quantity],
-    - 1 = single channel (for CNN compatibility).
-
-    Each snapshot in snapshot_depth_data is a dict with keys:
-    - 'bid_prices': np.ndarray of shape (depth_levels,)
-    - 'bid_quantities': np.ndarray of shape (depth_levels,)
-    - 'ask_prices': np.ndarray of shape (depth_levels,)
-    - 'ask_quantities': np.ndarray of shape (depth_levels,)
-
-    Parameters
-    ----------
-    config:
-        Full configuration dictionary with data.order_book.hybrid settings.
-    snapshot_depth_data:
-        List of snapshot dictionaries, each containing full depth arrays.
-    anchor_indices:
-        List mapping sample index to snapshot anchor index.
-    sample_indices:
-        Iterable of sample indices to include in the output tensor.
-
-    Returns
-    -------
-    x_seq:
-        Array of shape (N, T, L, 4, 1) with hybrid depth representation.
+    Output shape is (N, T, L, 4, 1), where:
+    - N is sample count,
+    - T is window length in steps,
+    - L is depth levels + aggregated bins,
+    - 4 is [bid_price, bid_quantity, ask_price, ask_quantity].
     """
+
     data_cfg = config["data"]
     time_range_cfg = data_cfg["time_range"]
     cadence_seconds = int(time_range_cfg["cadence_seconds"])
@@ -219,44 +178,24 @@ def build_hybrid_depth_sequence_tensor(
     n_samples = int(sample_idx_arr.shape[0])
     x_seq = np.zeros((n_samples, window_steps, effective_levels, 4, 1), dtype="float32")
 
-    for s_idx, sample_i in enumerate(sample_idx_arr):
-        anchor_snapshot_idx = int(anchor_arr[int(sample_i)])
+    for out_idx, sample_idx in enumerate(sample_idx_arr):
+        anchor_idx = int(anchor_arr[sample_idx])
+        start_idx = anchor_idx - window_steps + 1
+        end_idx = anchor_idx + 1
+        if start_idx < 0:
+            raise ValueError("Not enough snapshots to build full window for sample index")
 
-        for tau in range(window_steps):
-            snapshot_idx = anchor_snapshot_idx - (window_steps - 1 - tau)
+        window = snapshot_depth_data[start_idx:end_idx]
+        if len(window) != window_steps:
+            raise ValueError("Snapshot window length mismatch")
 
-            if snapshot_idx < 0 or snapshot_idx >= num_snapshots:
-                continue
-
-            snapshot = snapshot_depth_data[snapshot_idx]
-            if not isinstance(snapshot, dict):
-                continue
-
-            bid_prices = snapshot.get("bid_prices")
-            bid_quantities = snapshot.get("bid_quantities")
-            ask_prices = snapshot.get("ask_prices")
-            ask_quantities = snapshot.get("ask_quantities")
-
-            if bid_prices is None or bid_quantities is None:
-                continue
-            if ask_prices is None or ask_quantities is None:
-                continue
-
-            # Aggregate to hybrid representation
-            hybrid_snapshot = aggregate_snapshot_to_hybrid(
-                bid_prices=np.asarray(bid_prices, dtype="float64"),
-                bid_quantities=np.asarray(bid_quantities, dtype="float64"),
-                ask_prices=np.asarray(ask_prices, dtype="float64"),
-                ask_quantities=np.asarray(ask_quantities, dtype="float64"),
-                config=config,
-            )
-
-            x_seq[s_idx, tau, :, :, 0] = hybrid_snapshot
+        for t_idx, snapshot in enumerate(window):
+            aggregated = aggregate_snapshot_to_hybrid(config, snapshot)
+            if aggregated.shape[0] != effective_levels:
+                raise ValueError("Hybrid snapshot depth levels mismatch")
+            x_seq[out_idx, t_idx, :, :, 0] = aggregated
 
     return x_seq
 
 
-__all__ = [
-    "build_top_of_book_sequence_tensor",
-    "build_hybrid_depth_sequence_tensor",
-]
+__all__ = ["build_top_of_book_sequence_tensor", "build_hybrid_depth_sequence_tensor"]

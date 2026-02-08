@@ -23,7 +23,6 @@ from preprocessing.snapshot_sequence_builder import (
 from preprocessing.normalizer import create_normalizer_from_config
 from preprocessing.feature_engineering import FeatureEngineer
 from mlflow_integration.model_registry import register_model
-from .dataset_cache import compute_dataset_hash, cache_dataset_to_npz
 from .snapshot_dataset import (
     NormalizationStats,
     build_training_generator,
@@ -560,8 +559,8 @@ def _fit_snapshot_model_once(
 
     try:
         import mlflow  # type: ignore[import]
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to import MLFlow for training history logging: %s", exc)
     else:
         if hasattr(history, "history") and isinstance(history.history, dict):
             for metric_name, values in history.history.items():
@@ -1287,7 +1286,6 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Optional[Dict[str
     raise ConfigError(
         "Legacy in-memory training pipeline is disabled. Set snapshot.enabled=true to use the snapshot pipeline."
     )
-    kernel_sizes = cnn_cfg["kernel_sizes"]
     pool_sizes = cnn_cfg["pool_sizes"]
 
     if not isinstance(kernel_sizes, list) or not kernel_sizes:
@@ -1828,36 +1826,6 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Optional[Dict[str
                     mlflow.log_metric("sample_weight_std", float(sample_weight_train.std()))
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Failed to log sample weight diagnostics to MLFlow: %s", exc)
-
-    dataset_hash = compute_dataset_hash(x_train, y_train, x_val, y_val)
-    dataset_cache_path = cache_dataset_to_npz(
-        config=config,
-        dataset_hash=dataset_hash,
-        x_train=x_train,
-        y_train=y_train,
-        x_val=x_val,
-        y_val=y_val,
-    )
-
-    try:
-        import mlflow  # type: ignore[import]
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to import MLFlow for dataset hash logging: %s", exc)
-    else:
-        try:
-            training_cfg = config["training"]
-            cache_cfg = training_cfg["dataset_cache"]
-            dataset_version = str(cache_cfg["version"])
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to read training.dataset_cache.version for dataset logging: %s", exc)
-        else:
-            try:
-                mlflow.log_param("dataset_version", dataset_version)
-                mlflow.log_param("dataset_hash", dataset_hash)
-                if dataset_cache_path is not None:
-                    mlflow.log_param("dataset_cache_path", dataset_cache_path)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to log dataset hash/version parameters to MLFlow: %s", exc)
 
     from models.cnn_lstm_multiclass import build_cnn_lstm_model
 

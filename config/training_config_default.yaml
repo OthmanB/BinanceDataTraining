@@ -11,7 +11,7 @@
 #   - targets: configures the prediction horizon and label discretisation.
 #   - preprocessing: controls normalization, train/validation/test splitting, etc.
 #   - model: specifies the CNN+LSTM architecture and compilation options.
-#   - training: sets batch size, epochs, weighting, dataset caching, and callbacks.
+#   - training: sets batch size, epochs, weighting, and callbacks.
 #   - snapshot: controls derived dataset snapshots for streaming training.
 #   - hyperparameter_optimization: Optuna search behaviour and search space.
 #   - mlflow: experiment tracking options and model registry settings.
@@ -252,12 +252,6 @@ training:  # Controls how the model is fit on the prepared dataset.
     cleanup_keep_last_windows: 0  # Number of most-recent completed windows to retain when cleanup_completed_windows is true.
     resume_enabled: false  # When true, persist sequential progress/model checkpoints and resume interrupted runs.
 
-  dataset_cache:
-    enabled: false                                  # When true, cache constructed datasets to NPZ files for reuse.
-    directory: "cache/datasets"                    # Directory where cached datasets are stored.
-    filename_pattern: "{asset}_{model}_{dataset_version}_{dataset_hash}.npz"  # Template for naming cached datasets.
-    version: "v1"                                  # Logical dataset version tag; increment when feature definitions change.
-
   callbacks:
     early_stopping:
       enabled: true           # When true, stop training when monitored metric stops improving.
@@ -273,7 +267,7 @@ training:  # Controls how the model is fit on the prepared dataset.
       min_lr: 0.00001         # Lower bound on the learning rate.
 
   class_weights:
-    compute_from_train: false  # When true, compute class weights from the training data (not yet fully integrated into loss).
+    compute_from_train: false  # When true, compute class weights from the training labels and apply them in snapshot training.
 
   sample_weighting:
     enabled: false                 # When true, apply time-based exponential decay weights to samples.

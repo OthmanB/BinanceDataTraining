@@ -448,7 +448,8 @@ def _read_process_rss_bytes(pid: int) -> Optional[int]:
                     parts = line.split()
                     if len(parts) >= 2:
                         return int(parts[1]) * 1024
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Failed to read VmRSS for pid %s: %s", pid, exc)
         return None
     return None
 
@@ -463,7 +464,8 @@ def _collect_wave_worker_rss_bytes(executor: ProcessPoolExecutor) -> Dict[int, i
         try:
             if proc is None or not proc.is_alive():
                 continue
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Failed to inspect worker process %s: %s", pid, exc)
             continue
         rss = _read_process_rss_bytes(int(pid))
         if rss is not None and rss > 0:

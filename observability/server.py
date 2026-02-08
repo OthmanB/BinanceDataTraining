@@ -752,8 +752,6 @@ def _is_hidden_in_simple(full_key: str) -> bool:
         return True
     if full_key.startswith("model.input_representation."):
         return True
-    if full_key.startswith("training.dataset_cache."):
-        return True
     return False
 
 

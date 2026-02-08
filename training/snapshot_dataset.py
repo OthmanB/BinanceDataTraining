@@ -716,6 +716,12 @@ def build_training_generator(
     decay_const = None
     use_decay_weights = False
     if sample_weight_cfg and sample_weight_cfg.get("enabled"):
+        apply_to = str(sample_weight_cfg.get("apply_to", "loss_function"))
+        if apply_to != "loss_function":
+            raise ValueError(
+                "training.sample_weighting.apply_to must be 'loss_function' when enabled; "
+                f"got {apply_to!r}"
+            )
         method = str(sample_weight_cfg["method"])
         if method != "exponential_decay":
             raise ValueError("training.sample_weighting.method must be 'exponential_decay'")
@@ -1676,7 +1682,8 @@ def _build_snapshot_chunks(
         from observability.run_state import get_run_state_writer
 
         writer = get_run_state_writer()
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to initialize run-state writer for snapshot build: %s", exc)
         writer = None
     data_cfg = config["data"]
     time_range_cfg = data_cfg["time_range"]
@@ -1703,8 +1710,8 @@ def _build_snapshot_chunks(
     if writer is not None:
         try:
             writer.update_snapshot_progress(processed=0, total=chunks_total)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to publish initial snapshot progress: %s", exc)
 
     duty_cycle_stats = _DutyCycleAccumulator()
 
@@ -1717,7 +1724,7 @@ def _build_snapshot_chunks(
         try:
             writer.update_duty_cycle_stats(*summary)
         except Exception:  # noqa: BLE001
-            pass
+            logger.warning("Failed to publish duty-cycle summary to run-state", exc_info=True)
 
     manifest["complete"] = False
     save_manifest(context, manifest)
