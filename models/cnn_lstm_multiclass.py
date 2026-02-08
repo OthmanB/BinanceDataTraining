@@ -71,7 +71,7 @@ def _add_normalization_layer(x: Any, norm_type: Optional[str], filters: int, lay
         )
 
     if time_distributed:
-        return layers.TimeDistributed(norm_layer)(x)
+        return layers.TimeDistributed(norm_layer, name=name)(x)
     return norm_layer(x)
 
 
