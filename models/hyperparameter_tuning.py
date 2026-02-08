@@ -622,6 +622,8 @@ def _resolve_parallel_settings(hpo_cfg: Dict[str, Any]) -> Dict[str, Any]:
             "hyperparameter_optimization.parallel.rss_watchdog_max_worker_rss_gb must be > 0"
         )
 
+    resume_study = bool(parallel_cfg.get("resume_study", False))
+
     rss_watchdog_check_interval_seconds_raw = parallel_cfg.get("rss_watchdog_check_interval_seconds", 5.0)
     try:
         rss_watchdog_check_interval_seconds = float(rss_watchdog_check_interval_seconds_raw)
@@ -640,6 +642,7 @@ def _resolve_parallel_settings(hpo_cfg: Dict[str, Any]) -> Dict[str, Any]:
         "storage_uri": storage_uri,
         "study_name": study_name,
         "max_trials_per_worker_process": max_trials_per_worker_process,
+        "resume_study": resume_study,
         "rss_watchdog_enabled": rss_watchdog_enabled,
         "rss_watchdog_max_worker_rss_gb": rss_watchdog_max_worker_rss_gb,
         "rss_watchdog_check_interval_seconds": rss_watchdog_check_interval_seconds,
@@ -925,7 +928,6 @@ def _evaluate_trial_objective(
                 and bool(regime_settings["retry_on_oom"])
                 and is_oom
                 and attempt < max_retry_attempts
-                and int(active_batch_size) > int(regime_settings["min_batch_size"])
             )
             if can_retry:
                 next_batch_size = _compute_next_batch_size(
@@ -934,6 +936,13 @@ def _evaluate_trial_objective(
                     int(regime_settings["min_batch_size"]),
                 )
                 if next_batch_size >= int(active_batch_size):
+                    logger.warning(
+                        "Trial %s resource=%s attempt=%s OOM but batch already at floor (%s); no further backoff possible.",
+                        trial.number,
+                        resource,
+                        attempt + 1,
+                        active_batch_size,
+                    )
                     can_retry = False
                 else:
                     logger.warning(
@@ -1195,12 +1204,52 @@ def run_hyperparameter_search(
         storage_uri = _build_trial_storage_uri(config, parallel_settings["storage_uri"])
         study_name = str(parallel_settings["study_name"] or "binance_hpo")
 
+        resume_study = bool(parallel_settings["resume_study"])
+
         study = optuna.create_study(
             direction=direction,
             study_name=study_name,
             storage=storage_uri,
             load_if_exists=True,
         )
+
+        pre_existing_counts = _summarize_trial_states(study)
+        pre_existing_finished = (
+            int(pre_existing_counts["completed"])
+            + int(pre_existing_counts["pruned"])
+            + int(pre_existing_counts["failed"])
+        )
+
+        if pre_existing_finished > 0:
+            if resume_study:
+                logger.info(
+                    "Resuming existing study '%s' with %d pre-existing trials "
+                    "(completed=%d pruned=%d failed=%d). Only %d new trial(s) will be launched.",
+                    study_name,
+                    pre_existing_finished,
+                    pre_existing_counts["completed"],
+                    pre_existing_counts["pruned"],
+                    pre_existing_counts["failed"],
+                    max(0, n_trials - pre_existing_finished),
+                )
+            else:
+                logger.warning(
+                    "Existing study '%s' has %d stale trials from a previous run "
+                    "(completed=%d pruned=%d failed=%d). Deleting and recreating study "
+                    "(set parallel.resume_study=true to keep them).",
+                    study_name,
+                    pre_existing_finished,
+                    pre_existing_counts["completed"],
+                    pre_existing_counts["pruned"],
+                    pre_existing_counts["failed"],
+                )
+                optuna.delete_study(study_name=study_name, storage=storage_uri)
+                study = optuna.create_study(
+                    direction=direction,
+                    study_name=study_name,
+                    storage=storage_uri,
+                )
+                pre_existing_finished = 0
 
         logger.info(
             "Starting parallel HPO with %s workers over %s trials. resources=%s storage=%s study=%s",
@@ -1318,6 +1367,7 @@ def run_hyperparameter_search(
                             logger.error(
                                 "Parallel HPO worker failed; continuing with recovery wave. Error: %s",
                                 exc,
+                                exc_info=True,
                             )
 
                     rss_by_pid = _collect_wave_worker_rss_bytes(executor)
@@ -1416,16 +1466,30 @@ def run_hyperparameter_search(
             logger.warning("Failed to finalize HPO run-state progress: %s", exc)
 
     counts = _summarize_trial_states(study)
+    total_finished = int(counts["completed"]) + int(counts["pruned"]) + int(counts["failed"])
     if int(counts["completed"]) <= 0:
         search_space = hpo_cfg.get("search_space") if isinstance(hpo_cfg, dict) else None
         if not isinstance(search_space, dict):
             search_space = {}
         guidance = _format_search_space_guidance(search_space)
+        if total_finished == 0:
+            detail = (
+                "No trials were executed at all. This usually means the study DB "
+                "contained stale trials from a previous run that exhausted the trial budget. "
+                "Delete the study DB or set parallel.resume_study=false (default)."
+            )
+        else:
+            detail = (
+                f"All {total_finished} trial(s) ended without a successful completion "
+                f"(pruned={counts['pruned']} failed={counts['failed']}). "
+                "This typically indicates OOM errors exhausting all batch-backoff retries. "
+                "Review the search space and relax constraints. Suggested adjustments:\n"
+                f"{guidance}"
+            )
         raise ConfigError(
             "Hyperparameter optimization completed with no successful trials. "
             f"completed={counts['completed']} pruned={counts['pruned']} failed={counts['failed']}. "
-            "Review the search space and relax constraints. Suggested adjustments:\n"
-            f"{guidance}"
+            f"{detail}"
         )
 
     best_trial = study.best_trial
