@@ -52,7 +52,7 @@ def _make_config(
                 "resolution_days": 1,
                 "ewma_halflife_days": 7.0,
                 "input_dim": None,
-                "dense": {"layers": [32], "dropout_rates": [0.2]},
+                "architecture": {"conv1d": {"activation": "relu", "layers": []}, "dense": {"layers": [{"units": 32, "dropout": 0.2}]}},
             }
         }
     }

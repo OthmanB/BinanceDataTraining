@@ -2070,14 +2070,16 @@ def _upsert_series_entry(manifest: Dict[str, Any], entry: Dict[str, Any]) -> Non
 def _create_sample_builder(config: Dict[str, Any]) -> StreamingSampleBuilder:
     model_cfg = config["model"]
     cnn_cfg = model_cfg["cnn"]
-    kernel_sizes = cnn_cfg["kernel_sizes"]
-    pool_sizes = cnn_cfg["pool_sizes"]
+    cnn_layers = cnn_cfg["layers"]
+
+    kernel_sizes = [l["kernel_size"] for l in cnn_layers]
+    pool_sizes = [l["pool_size"] for l in cnn_layers if l.get("pool_size") is not None]
 
     heights = [int(k[0]) for k in kernel_sizes]
     widths = [int(k[1]) for k in kernel_sizes]
 
-    pool_heights = [int(p[0]) for p in pool_sizes]
-    pool_widths = [int(p[1]) for p in pool_sizes]
+    pool_heights = [int(p[0]) for p in pool_sizes] if pool_sizes else [1]
+    pool_widths = [int(p[1]) for p in pool_sizes] if pool_sizes else [1]
 
     min_height = 1
     for ph in pool_heights:

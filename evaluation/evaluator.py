@@ -95,19 +95,18 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
         raise ValueError("Only model.output.type='two_head_intensity' is supported in the evaluation pipeline")
 
     cnn_cfg = model_cfg["cnn"]
-    kernel_sizes = cnn_cfg["kernel_sizes"]
-    pool_sizes = cnn_cfg["pool_sizes"]
+    cnn_layers = cnn_cfg["layers"]
+    if not isinstance(cnn_layers, list) or not cnn_layers:
+        raise ValueError("model.cnn.layers must be a non-empty list in configuration")
 
-    if not isinstance(kernel_sizes, list) or not kernel_sizes:
-        raise ValueError("model.cnn.kernel_sizes must be a non-empty list in configuration")
-    if not isinstance(pool_sizes, list) or not pool_sizes:
-        raise ValueError("model.cnn.pool_sizes must be a non-empty list in configuration")
+    kernel_sizes = [l["kernel_size"] for l in cnn_layers]
+    pool_sizes = [l["pool_size"] for l in cnn_layers if l.get("pool_size") is not None]
 
     heights = [int(k[0]) for k in kernel_sizes]
     widths = [int(k[1]) for k in kernel_sizes]
 
-    pool_heights = [int(p[0]) for p in pool_sizes]
-    pool_widths = [int(p[1]) for p in pool_sizes]
+    pool_heights = [int(p[0]) for p in pool_sizes] if pool_sizes else [1]
+    pool_widths = [int(p[1]) for p in pool_sizes] if pool_sizes else [1]
 
     min_height = 1
     for ph in pool_heights:

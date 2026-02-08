@@ -126,15 +126,14 @@ def get_minimal_config() -> Dict[str, Any]:
                 },
             },
             "cnn": {
-                "num_layers": 2,
-                "filters": [32, 64],
-                "kernel_sizes": [(3, 3), (3, 3)],
-                "pool_sizes": [(2, 2), (2, 2)],
                 "activation": "relu",
-                "dropout_rates": [0.1, 0.1],
+                "layers": [
+                    {"filters": 32, "kernel_size": [3, 3], "pool_size": [2, 2], "normalization": None, "dropout": 0.1},
+                    {"filters": 64, "kernel_size": [3, 3], "pool_size": [2, 2], "normalization": None, "dropout": 0.1},
+                ],
             },
-            "lstm": {"units": 32, "dropout": 0.1, "recurrent_dropout": 0.0},
-            "dense": {"layers": [16], "dropout_rates": [0.1]},
+            "lstm": {"layers": [{"units": 32, "dropout": 0.1, "recurrent_dropout": 0.0, "post_dropout": 0.0}]},
+            "dense": {"layers": [{"units": 16, "dropout": 0.1}]},
             "output": {"type": "two_head_intensity", "num_classes": 4, "activation": "softmax"},
             "compilation": {"optimizer": "adam", "learning_rate": 0.001, "loss": "categorical_crossentropy", "metrics": ["accuracy"]},
             "long_term": {
@@ -145,7 +144,7 @@ def get_minimal_config() -> Dict[str, Any]:
                 "summary_method": "mean",
                 "ewma_halflife_days": 7.0,
                 "input_dim": None,
-                "dense": {"layers": [32], "dropout_rates": [0.2]},
+                "architecture": {"conv1d": {"activation": "relu", "layers": []}, "dense": {"layers": [{"units": 32, "dropout": 0.2}]}},
             },
         },
         "training": {

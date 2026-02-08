@@ -38,7 +38,7 @@ def _make_config(long_term_cfg: Dict[str, Any] | None = None) -> Dict[str, Any]:
         "summary_method": "mean",
         "ewma_halflife_days": 7.0,
         "input_dim": None,
-        "dense": {"layers": [32], "dropout_rates": [0.2]},
+        "architecture": {"conv1d": {"activation": "relu", "layers": []}, "dense": {"layers": [{"units": 32, "dropout": 0.2}]}},
     }
     lt_cfg = dict(lt_defaults)
     if long_term_cfg is not None:
