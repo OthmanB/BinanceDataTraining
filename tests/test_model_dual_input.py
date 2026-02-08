@@ -350,7 +350,8 @@ class TestModelBuilderNormalization(unittest.TestCase):
 
         model = build_cnn_lstm_model(config, input_shape)
 
-        bn_layers = [l for l in model.layers if "batch_normalization" in l.__class__.__name__.lower()]
+        # Normalization is wrapped in TimeDistributed; check by layer name
+        bn_layers = [l for l in model.layers if "_norm" in l.name]
         self.assertGreaterEqual(len(bn_layers), 1)
 
     def test_layer_normalization(self) -> None:
@@ -367,7 +368,8 @@ class TestModelBuilderNormalization(unittest.TestCase):
 
         model = build_cnn_lstm_model(config, input_shape)
 
-        ln_layers = [l for l in model.layers if "layer_normalization" in l.__class__.__name__.lower()]
+        # Normalization is wrapped in TimeDistributed; check by layer name
+        ln_layers = [l for l in model.layers if "_norm" in l.name]
         self.assertGreaterEqual(len(ln_layers), 1)
 
     def test_no_normalization(self) -> None:
@@ -384,10 +386,8 @@ class TestModelBuilderNormalization(unittest.TestCase):
 
         model = build_cnn_lstm_model(config, input_shape)
 
-        norm_layers = [
-            l for l in model.layers
-            if any(n in l.__class__.__name__.lower() for n in ("normalization",))
-        ]
+        # No normalization layers should exist (check by name)
+        norm_layers = [l for l in model.layers if "_norm" in l.name]
         self.assertEqual(len(norm_layers), 0)
 
 
@@ -408,7 +408,8 @@ class TestModelBuilderOptionalPooling(unittest.TestCase):
 
         model = build_cnn_lstm_model(config, input_shape)
 
-        pool_layers = [l for l in model.layers if "pooling" in l.__class__.__name__.lower()]
+        # Pooling is wrapped in TimeDistributed; check by layer name
+        pool_layers = [l for l in model.layers if "_pool" in l.name]
         self.assertEqual(len(pool_layers), 0)
 
     def test_mixed_pooling(self) -> None:
@@ -428,7 +429,7 @@ class TestModelBuilderOptionalPooling(unittest.TestCase):
         model = build_cnn_lstm_model(config, input_shape)
 
         # Should have exactly 2 pooling layers (layers 0 and 2)
-        pool_layers = [l for l in model.layers if "pooling" in l.__class__.__name__.lower()]
+        pool_layers = [l for l in model.layers if "_pool" in l.name]
         self.assertEqual(len(pool_layers), 2)
 
 
