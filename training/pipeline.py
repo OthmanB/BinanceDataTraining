@@ -509,6 +509,7 @@ def _fit_snapshot_model_once(
             train_gen,
             long_term_features,
             start_index=0,
+            end_index=effective_train_n,
         )
 
     callbacks = create_callbacks(config)
@@ -539,6 +540,7 @@ def _fit_snapshot_model_once(
                 val_gen,
                 long_term_features,
                 start_index=val_start,
+                end_index=val_end,
             )
         fit_kwargs["validation_data"] = val_gen
         fit_kwargs["validation_steps"] = val_steps
@@ -1070,6 +1072,7 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
             train_gen,
             long_term_features,
             start_index=0,
+            end_index=effective_train_n,
         )
 
     writer = None
@@ -1117,6 +1120,7 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
                 val_gen,
                 long_term_features,
                 start_index=val_start,
+                end_index=val_end,
             )
         fit_kwargs["validation_data"] = val_gen
         fit_kwargs["validation_steps"] = val_steps
@@ -1211,6 +1215,7 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
                             sample_gen,
                             long_term_features,
                             start_index=0,
+                            end_index=sample_n,
                         )
                     batch = next(iter(sample_gen))
                     x_sample = batch[0]

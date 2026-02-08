@@ -257,6 +257,7 @@ def wrap_generator_with_long_term(
     base_generator: Iterator[Tuple[Any, ...]],
     long_term_features: np.ndarray,
     start_index: int,
+    end_index: Optional[int] = None,
 ) -> Iterator[Tuple[Any, ...]]:
     """Wrap a training generator to include long-term features.
 
@@ -264,10 +265,17 @@ def wrap_generator_with_long_term(
     ----------
     base_generator:
         Original generator yielding (x, y) or (x, y, sample_weight).
+        Must loop infinitely (``while True``).
     long_term_features:
         Precomputed long-term features array of shape (n_samples, lt_dim).
     start_index:
         Starting sample index for this generator.
+    end_index:
+        End sample index (exclusive) for this generator.  When the internal
+        cursor reaches *end_index* it resets to *start_index*, keeping the
+        wrapper in sync with the base generator's epoch-boundary reset.
+        Defaults to ``long_term_features.shape[0]`` when not provided.
+
     Yields
     ------
     Tuple:
@@ -280,17 +288,28 @@ def wrap_generator_with_long_term(
     starting from start_index. The long-term features are sliced according
     to the actual batch size, so final partial batches are supported.
     """
+    if end_index is None:
+        end_index = int(long_term_features.shape[0])
+
     current_idx = start_index
 
     for batch_data in base_generator:
         batch_len = batch_data[0].shape[0]
+
+        # Detect epoch boundary: the base generator looped back to the
+        # beginning of its range while current_idx is still at the end.
+        if current_idx >= end_index:
+            current_idx = start_index
+
         end_idx = current_idx + batch_len
 
         lt_batch = long_term_features[current_idx:end_idx]
         if lt_batch.shape[0] != batch_len:
             raise ValueError(
                 "Long-term feature batch size mismatch: "
-                f"features={lt_batch.shape[0]}, expected={batch_len}"
+                f"features={lt_batch.shape[0]}, expected={batch_len}. "
+                f"current_idx={current_idx}, end_index={end_index}, "
+                f"lt_features_len={long_term_features.shape[0]}"
             )
         current_idx = end_idx
 
