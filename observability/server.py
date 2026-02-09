@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import base64
 import argparse
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
 import html
@@ -689,16 +690,41 @@ def _join_rel(*parts: str) -> str:
 
 
 def _load_training_config(config_path: Path) -> Dict[str, Any]:
-    raw_config = _load_yaml_file(config_path)
-    base_config_path = raw_config.get("base_config")
-    if base_config_path:
-        base_path = Path(base_config_path)
+    """Load a training config, following the full base_config chain."""
+    chain = _resolve_config_chain(config_path)
+    if len(chain) == 1:
+        return {k: v for k, v in chain[0]["data"].items() if k != "base_config"}
+    merged: Dict[str, Any] = {}
+    for entry in reversed(chain):
+        override = {k: v for k, v in entry["data"].items() if k != "base_config"}
+        merged = _deep_merge(merged, override)
+    return merged
+
+
+def _resolve_config_chain(config_path: Path) -> List[Dict[str, Any]]:
+    """Return the inheritance chain as a list of dicts with 'path' and 'data'.
+
+    Index 0 is the leaf (selected file), last element is the root base config.
+    """
+    chain: List[Dict[str, Any]] = []
+    seen: set = set()
+    current = config_path.resolve()
+    while True:
+        if str(current) in seen:
+            raise RuntimeError(f"Detected recursive base_config chain at {current}")
+        seen.add(str(current))
+        raw = _load_yaml_file(current)
+        chain.append({"path": str(current), "data": raw})
+        base_ref = raw.get("base_config")
+        if not base_ref or not isinstance(base_ref, str):
+            break
+        base_path = Path(base_ref)
         if not base_path.is_absolute():
-            base_path = (config_path.parent / base_path).resolve()
-        base_config = _load_yaml_file(base_path)
-        override_config = {k: v for k, v in raw_config.items() if k != "base_config"}
-        return _deep_merge(base_config, override_config)
-    return raw_config
+            base_path = (current.parent / base_path).resolve()
+        if not base_path.exists():
+            raise RuntimeError(f"base_config file not found: {base_path} (referenced by {current})")
+        current = base_path
+    return chain
 
 
 def _load_validation_schema() -> Dict[str, Any]:
@@ -977,91 +1003,145 @@ def _render_status(message: Optional[str], level: str, missing: List[str], error
     return "".join(sections)
 
 
+def _render_config_chain_graph(chain: List[Dict[str, Any]]) -> str:
+    """Render the config inheritance chain as a visual dependency graph."""
+    if not chain:
+        return ""
+    parts: List[str] = []
+    parts.append('<div class="chain-graph">')
+    parts.append('<div class="chain-label">Inheritance chain:</div>')
+    parts.append('<div class="chain-nodes">')
+    for i, entry in enumerate(chain):
+        path_str = entry.get("path", "")
+        name = Path(path_str).name if path_str else "?"
+        css = "chain-node chain-leaf" if i == 0 else "chain-node chain-base"
+        tag = "leaf" if i == 0 else "base"
+        parts.append(f'<span class="{css}" title="{_escape_text(path_str)}">{_escape_text(name)}'
+                     f'<span class="chain-tag">{tag}</span></span>')
+        if i < len(chain) - 1:
+            parts.append('<span class="chain-arrow">\u2192</span>')
+    parts.append('</div></div>')
+    return "".join(parts)
+
+
+def _render_yaml_block(data: Dict[str, Any], *, title: str, css_id: str) -> str:
+    """Render a dict as a read-only syntax-highlighted YAML block."""
+    try:
+        import yaml  # type: ignore[import]
+    except Exception:  # noqa: BLE001
+        text = str(data)
+    else:
+        filtered = {k: v for k, v in data.items() if k != "base_config"}
+        text = yaml.safe_dump(filtered, sort_keys=False, default_flow_style=False)
+    lines: List[str] = []
+    for line in text.splitlines():
+        escaped = _escape_text(line)
+        if ":" in line:
+            colon_idx = escaped.index(":")
+            key_part = escaped[:colon_idx]
+            rest = escaped[colon_idx:]
+            lines.append(f'<span class="yaml-key">{key_part}</span>{rest}')
+        elif escaped.strip().startswith("- "):
+            lines.append(f'<span class="yaml-list">{escaped}</span>')
+        else:
+            lines.append(escaped)
+    return (
+        f'<details class="yaml-block" id="{_escape_text(css_id)}">'
+        f'<summary>{_escape_text(title)}</summary>'
+        f'<pre class="yaml-pre">' + "\n".join(lines) + '</pre>'
+        f'</details>'
+    )
+
+
 def _render_config_fields(
     values: Dict[str, Any],
     missing: List[str],
     schema_fields: List[SchemaField],
 ) -> str:
     hint_map = _get_hint_map()
-    fields_html: List[str] = []
-    current_section = None
-    current_subsection = None
-    current_subsub = None
+    # Group fields by section, then subsection
+    sections: "OrderedDict[str, OrderedDict[str, List[SchemaField]]]" = OrderedDict()
     for field in schema_fields:
-        if field.section != current_section:
-            current_section = field.section
-            current_subsection = None
-            current_subsub = None
-            fields_html.append(
-                f"<div class=\"section-title\">{_escape_text(current_section)}</div>"
-            )
-        parts = field.dotted_key.split(".") if field.dotted_key else []
-        subsection = parts[0] if len(parts) >= 1 else None
-        subsub = parts[1] if len(parts) >= 2 else None
-        if subsection and subsection != current_subsection:
-            current_subsection = subsection
-            current_subsub = None
-            fields_html.append(
-                f"<div class=\"subsection-title\">{_escape_text(subsection)}</div>"
-            )
-        if subsub and subsub != current_subsub:
-            current_subsub = subsub
-            fields_html.append(
-                f"<div class=\"subsub-title\">{_escape_text(subsub)}</div>"
-            )
-        label = parts[-1] if parts else field.section
-        hint = hint_map.get(field.full_key) or f"Required. Type: {field.field_type}."
-        is_missing = field.full_key in missing
-        field_class = "field missing" if is_missing else "field"
-        value = values.get(field.full_key, "")
+        if field.section not in sections:
+            sections[field.section] = OrderedDict()
+        parts = field.dotted_key.split(".") if field.dotted_key else [""]
+        subsection = parts[0] if parts else ""
+        if subsection not in sections[field.section]:
+            sections[field.section][subsection] = []
+        sections[field.section][subsection].append(field)
 
-        if field.field_type == "boolean":
-            checked = "checked" if value else ""
-            input_html = (
-                f"<input type=\"checkbox\" name=\"{_escape_text(field.full_key)}\" value=\"true\" {checked} />"
-            )
-        elif field.field_type in {"list", "dict", "any"}:
-            input_html = (
-                f"<textarea name=\"{_escape_text(field.full_key)}\" rows=\"3\">"
-                f"{_escape_text(value)}</textarea>"
-            )
-        elif field.field_type == "string" and field.full_key in _SELECT_OPTIONS:
-            options = list(_SELECT_OPTIONS[field.full_key])
-            if value and str(value) not in options:
-                options = [str(value)] + options
-            option_html = ""
-            if not value:
-                option_html += "<option value=\"\">Select...</option>"
-            for option in options:
-                selected = "selected" if str(value) == option else ""
-                option_html += (
-                    f"<option value=\"{_escape_text(option)}\" {selected}>{_escape_text(option)}</option>"
-                )
-            input_html = (
-                f"<select name=\"{_escape_text(field.full_key)}\">{option_html}</select>"
-            )
-        else:
-            step = "1" if field.field_type == "integer" else "any"
-            input_type = "number" if field.field_type in {"integer", "number"} else "text"
-            input_html = (
-                f"<input type=\"{input_type}\" name=\"{_escape_text(field.full_key)}\" "
-                f"step=\"{step}\" value=\"{_escape_text(value)}\" />"
-            )
-
-        fields_html.append(
-            """
-            <div class="{field_class}">
-              <label>{label} <span class="hint" data-hint="{hint}">i</span></label>
-              {input_html}
-            </div>
-            """.format(
-                field_class=field_class,
-                label=_escape_text(label),
-                hint=_escape_text(hint),
-                input_html=input_html,
-            )
+    out: List[str] = []
+    for section_name, subsections in sections.items():
+        out.append(
+            f'<details class="cfg-section" open>'
+            f'<summary class="cfg-section-title">{_escape_text(section_name)}</summary>'
+            f'<div class="cfg-section-body">'
         )
-    return "".join(fields_html)
+        for sub_name, fields in subsections.items():
+            if sub_name:
+                out.append(
+                    f'<div class="cfg-subsection">'
+                    f'<div class="cfg-subsection-title">{_escape_text(sub_name)}</div>'
+                )
+            else:
+                out.append('<div class="cfg-subsection">')
+
+            for field in fields:
+                parts = field.dotted_key.split(".") if field.dotted_key else []
+                label = parts[-1] if parts else field.section
+                depth = max(len(parts) - 1, 0)
+                hint = hint_map.get(field.full_key) or f"Required. Type: {field.field_type}."
+                is_missing = field.full_key in missing
+                field_class = "cfg-field missing" if is_missing else "cfg-field"
+                indent_style = f"margin-left:{depth * 16}px" if depth > 1 else ""
+                value = values.get(field.full_key, "")
+
+                if field.field_type == "boolean":
+                    checked = "checked" if value else ""
+                    input_html = (
+                        f'<input type="checkbox" name="{_escape_text(field.full_key)}" '
+                        f'value="true" {checked} />'
+                    )
+                elif field.field_type in {"list", "dict", "any"}:
+                    input_html = (
+                        f'<textarea name="{_escape_text(field.full_key)}" rows="2">'
+                        f'{_escape_text(value)}</textarea>'
+                    )
+                elif field.field_type == "string" and field.full_key in _SELECT_OPTIONS:
+                    options = list(_SELECT_OPTIONS[field.full_key])
+                    if value and str(value) not in options:
+                        options = [str(value)] + options
+                    option_html = ""
+                    if not value:
+                        option_html += '<option value="">Select...</option>'
+                    for option in options:
+                        sel = "selected" if str(value) == option else ""
+                        option_html += (
+                            f'<option value="{_escape_text(option)}" {sel}>'
+                            f'{_escape_text(option)}</option>'
+                        )
+                    input_html = f'<select name="{_escape_text(field.full_key)}">{option_html}</select>'
+                else:
+                    step = "1" if field.field_type == "integer" else "any"
+                    input_type = "number" if field.field_type in {"integer", "number"} else "text"
+                    input_html = (
+                        f'<input type="{input_type}" name="{_escape_text(field.full_key)}" '
+                        f'step="{step}" value="{_escape_text(value)}" />'
+                    )
+
+                out.append(
+                    f'<div class="{field_class}" style="{indent_style}">'
+                    f'<label>{_escape_text(label)} '
+                    f'<span class="hint" data-hint="{_escape_text(hint)}">i</span></label>'
+                    f'{input_html}'
+                    f'</div>'
+                )
+
+            out.append('</div>')  # close cfg-subsection
+
+        out.append('</div></details>')  # close cfg-section-body + cfg-section
+
+    return "".join(out)
 
 
 def _render_training_config_panel(
@@ -1075,6 +1155,8 @@ def _render_training_config_panel(
     schema_fields: List[SchemaField],
     message: Optional[str] = None,
     message_level: str = "info",
+    chain: Optional[List[Dict[str, Any]]] = None,
+    merged_config: Optional[Dict[str, Any]] = None,
 ) -> str:
     rel_path, parent_rel, dirs, files = _list_config_entries(browse_path)
     selected_display = selected_path or "None"
@@ -1106,6 +1188,48 @@ def _render_training_config_panel(
     mode_label = "Simple" if config_mode == "simple" else "Extended"
     other_mode = "extended" if config_mode == "simple" else "simple"
     other_label = "Extended" if config_mode == "simple" else "Simple"
+
+    # Inheritance chain graph
+    chain_html = ""
+    if chain and len(chain) > 0:
+        chain_html = _render_config_chain_graph(chain)
+
+    # YAML viewer blocks (per-layer overrides + merged effective)
+    yaml_viewer_html = ""
+    if chain and len(chain) > 0:
+        yaml_parts: List[str] = []
+        yaml_parts.append('<div class="yaml-viewer-section">')
+        yaml_parts.append('<div class="cfg-subsection-title" style="margin-bottom:8px">'
+                         'YAML Viewer (read-only)</div>')
+        for idx, entry in enumerate(chain):
+            entry_data = entry.get("data", {})
+            entry_path = entry.get("path", "")
+            entry_name = Path(entry_path).name if entry_path else "?"
+            tag = " (leaf)" if idx == 0 else " (base)" if idx == len(chain) - 1 else ""
+            is_open = "open" if idx == 0 else ""
+            yaml_parts.append(
+                _render_yaml_block(
+                    entry_data,
+                    title=f"{entry_name}{tag}",
+                    css_id=f"yaml-layer-{idx}",
+                ).replace('<details ', f'<details {is_open} ')
+                if is_open else
+                _render_yaml_block(
+                    entry_data,
+                    title=f"{entry_name}{tag}",
+                    css_id=f"yaml-layer-{idx}",
+                )
+            )
+        if merged_config:
+            yaml_parts.append(
+                _render_yaml_block(
+                    merged_config,
+                    title="Effective (merged)",
+                    css_id="yaml-merged",
+                )
+            )
+        yaml_parts.append('</div>')
+        yaml_viewer_html = "".join(yaml_parts)
 
     return f"""
     <div id=\"config-panel\" class=\"panel config-panel\">
@@ -1139,6 +1263,8 @@ def _render_training_config_panel(
           <button type=\"submit\" class=\"primary\">Load</button>
         </form>
       </div>
+      {chain_html}
+      {yaml_viewer_html}
       <form hx-post=\"/ui/config/save\" hx-target=\"#config-panel\" hx-swap=\"outerHTML\" class=\"config-form\">
         <input type=\"hidden\" name=\"browse_path\" value=\"{_escape_text(rel_path)}\" />
         <input type=\"hidden\" name=\"config_path\" value=\"{_escape_text(selected_path)}\" />
@@ -1200,7 +1326,9 @@ def _render_run_control_panel(config: ServerConfig, selected_path: Optional[str]
 
 _PIPELINE_STAGES = [
     ("initializing", "Init"),
+    ("diagnostics", "Diagnostics"),
     ("snapshot_build", "Snapshot"),
+    ("trial", "HPO"),
     ("training", "Training"),
     ("evaluation", "Eval"),
 ]
@@ -1399,6 +1527,8 @@ def _render_ui_page(_config: ServerConfig) -> str:
       .progress-bar-inner.training {{ background: linear-gradient(90deg, #22c55e, #4ade80); }}
       .progress-bar-inner.snapshot_build {{ background: linear-gradient(90deg, #3b82f6, #60a5fa); }}
       .progress-bar-inner.evaluation {{ background: linear-gradient(90deg, #a855f7, #c084fc); }}
+      .progress-bar-inner.trial {{ background: linear-gradient(90deg, #f59e0b, #fbbf24); }}
+      .progress-bar-inner.diagnostics {{ background: linear-gradient(90deg, #06b6d4, #22d3ee); }}
       .progress-bar-inner.active {{
         background-image: linear-gradient(
           -45deg, rgba(255,255,255,0.15) 25%, transparent 25%,
@@ -1528,6 +1658,75 @@ def _render_ui_page(_config: ServerConfig) -> str:
         max-width: 300px; opacity: 0; pointer-events: none; transition: opacity 0.15s; z-index: 10;
       }}
       .hint:hover::after {{ opacity: 1; }}
+      /* Config inheritance chain graph */
+      .chain-graph {{
+        margin: 12px 0; padding: 10px 14px; border-radius: var(--radius);
+        background: var(--bg-alt); border: 1px solid var(--border);
+      }}
+      .chain-label {{ font-size: 0.78rem; font-weight: 600; color: var(--ink-2); margin-bottom: 6px; }}
+      .chain-nodes {{ display: flex; align-items: center; gap: 0; flex-wrap: wrap; }}
+      .chain-node {{
+        display: inline-flex; align-items: center; gap: 5px;
+        padding: 5px 12px; border-radius: 6px; font-family: var(--mono);
+        font-size: 0.78rem; font-weight: 600; white-space: nowrap;
+      }}
+      .chain-leaf {{ background: var(--accent-soft); color: var(--accent); border: 1px solid var(--accent); }}
+      .chain-base {{ background: var(--panel); color: var(--ink-2); border: 1px solid var(--border); }}
+      .chain-tag {{
+        font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.04em;
+        padding: 1px 5px; border-radius: 4px; background: rgba(0,0,0,0.06); color: var(--ink-3);
+      }}
+      [data-theme="dark"] .chain-tag {{ background: rgba(255,255,255,0.06); }}
+      .chain-arrow {{ color: var(--ink-3); font-size: 0.85rem; margin: 0 6px; }}
+      /* YAML viewer blocks */
+      .yaml-viewer-section {{ margin: 14px 0; }}
+      .yaml-block {{ margin-bottom: 6px; }}
+      .yaml-block summary {{
+        cursor: pointer; font-weight: 600; font-size: 0.82rem; color: var(--ink);
+        padding: 6px 10px; border-radius: 6px; background: var(--bg-alt);
+        border: 1px solid var(--border); user-select: none;
+      }}
+      .yaml-block summary:hover {{ background: var(--border); }}
+      .yaml-block[open] summary {{ border-radius: 6px 6px 0 0; border-bottom: none; }}
+      .yaml-pre {{
+        margin: 0; padding: 10px 14px; font-family: var(--mono); font-size: 0.76rem;
+        line-height: 1.6; background: #0d1117; color: #c9d1d9; border-radius: 0 0 6px 6px;
+        border: 1px solid var(--border); border-top: none; max-height: 400px; overflow: auto;
+        white-space: pre-wrap; word-break: break-all;
+      }}
+      [data-theme="dark"] .yaml-pre {{ background: #010409; }}
+      .yaml-key {{ color: #7ee787; }}
+      .yaml-list {{ color: #79c0ff; }}
+      /* Structured config sections (accordion) */
+      .cfg-section {{ margin-bottom: 4px; border: 1px solid var(--border); border-radius: var(--radius); }}
+      .cfg-section-title {{
+        cursor: pointer; font-weight: 700; font-size: 0.88rem; color: var(--ink);
+        padding: 10px 14px; background: var(--bg-alt); border-radius: var(--radius);
+        user-select: none; list-style: none;
+        display: flex; align-items: center; gap: 6px;
+      }}
+      .cfg-section-title::before {{ content: "\\25BC"; font-size: 0.6rem; color: var(--ink-3); transition: transform 0.15s; }}
+      .cfg-section[open] .cfg-section-title {{ border-radius: var(--radius) var(--radius) 0 0; }}
+      .cfg-section:not([open]) .cfg-section-title::before {{ transform: rotate(-90deg); }}
+      .cfg-section-title::-webkit-details-marker {{ display: none; }}
+      .cfg-section-body {{ padding: 8px 14px 12px 14px; }}
+      .cfg-subsection {{
+        margin-bottom: 8px; padding: 6px 0 6px 10px;
+        border-left: 3px solid var(--border);
+      }}
+      .cfg-subsection-title {{
+        font-weight: 600; font-size: 0.8rem; color: var(--accent);
+        margin-bottom: 6px; padding-bottom: 3px;
+        border-bottom: 1px dashed var(--border);
+      }}
+      .cfg-field {{
+        display: grid; grid-template-columns: minmax(120px, 1fr) 2fr; gap: 4px 10px;
+        align-items: center; padding: 3px 0; font-size: 0.8rem;
+      }}
+      .cfg-field label {{ font-weight: 500; font-size: 0.78rem; color: var(--ink-2); }}
+      .cfg-field.missing input, .cfg-field.missing textarea, .cfg-field.missing select {{ border-color: var(--danger); }}
+      .cfg-field input:not([type="checkbox"]), .cfg-field select {{ font-size: 0.78rem; padding: 5px 8px; }}
+      .cfg-field textarea {{ font-size: 0.76rem; padding: 5px 8px; }}
       @media (max-width: 720px) {{
         .shell {{ padding: 12px; }}
         .card-grid {{ grid-template-columns: 1fr; }}
@@ -1584,7 +1783,7 @@ def _render_ui_page(_config: ServerConfig) -> str:
             <button onclick="toggleAutoScroll()" id="autoscroll-btn">Auto-scroll: ON</button>
           </div>
           <div id="logs-panel" hx-get="/ui/logs" hx-trigger="load, every 2s"
-               hx-on::afterSwap="if(window._autoScroll!==false){{const el=this.querySelector('.log-viewer');if(el)el.scrollTop=el.scrollHeight;}}"></div>
+               hx-on::after-swap="if(window._autoScroll!==false){{const el=this.querySelector('.log-viewer');if(el)el.scrollTop=0;}}"></div>
         </div>
       </div>
       <div id="tab-history" class="tab-panel">
@@ -2111,6 +2310,7 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
         if path == "/ui/logs":
             cfg = self.server_state.config
             lines = _tail_log(cfg.run_log_path, max_lines=cfg.tail_max_lines)
+            lines.reverse()
             colored_lines: List[str] = []
             for line in lines:
                 css_class = "log-line"
@@ -2296,6 +2496,84 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
             self._send_json({"lines": lines})
             return
 
+        if path == "/api/system":
+            metrics = self.server_state.get_system_metrics()
+            self._send_json(metrics)
+            return
+
+        if path == "/api/history":
+            history = load_run_history(self.server_state.config.run_state_path, limit=50)
+            self._send_json({"runs": history})
+            return
+
+        if path == "/api/hpo":
+            state = load_run_state(self.server_state.config.run_state_path) or {}
+            trials = state.get("hpo_trial_results")
+            self._send_json({
+                "trials": trials if isinstance(trials, list) else [],
+                "hpo_trials_total": state.get("hpo_trials_total", 0),
+                "hpo_trials_completed": state.get("hpo_trials_completed", 0),
+                "hpo_trials_pruned": state.get("hpo_trials_pruned", 0),
+                "hpo_trials_failed": state.get("hpo_trials_failed", 0),
+            })
+            return
+
+        if path == "/api/config/list":
+            configs = sorted(str(p) for p in _CONFIG_ROOT.rglob("*.yaml"))
+            configs += sorted(str(p) for p in _CONFIG_ROOT.rglob("*.yml"))
+            rel_configs = []
+            for c in sorted(set(configs)):
+                try:
+                    rel_configs.append(str(Path(c).relative_to(_CONFIG_ROOT.parent)))
+                except ValueError:
+                    rel_configs.append(c)
+            self._send_json({"configs": rel_configs})
+            return
+
+        if path == "/api/config/effective":
+            qs = parse_qs(urlparse(self.path).query)
+            config_path_param = qs.get("path", [""])[0]
+            if not config_path_param:
+                self._send_json({"error": "path parameter is required"}, status=400)
+                return
+            resolved = _resolve_selected_path(config_path_param)
+            if resolved is None or not resolved.exists():
+                self._send_json({"error": "config file not found"}, status=404)
+                return
+            try:
+                effective = _load_training_config(resolved)
+                self._send_json(effective)
+            except Exception as exc:  # noqa: BLE001
+                self._send_json({"error": str(exc)}, status=500)
+            return
+
+        if path == "/api/config/chain":
+            qs = parse_qs(urlparse(self.path).query)
+            config_path_param = qs.get("path", [""])[0]
+            if not config_path_param:
+                self._send_json({"error": "path parameter is required"}, status=400)
+                return
+            resolved = _resolve_selected_path(config_path_param)
+            if resolved is None or not resolved.exists():
+                self._send_json({"error": "config file not found"}, status=404)
+                return
+            try:
+                chain = _resolve_config_chain(resolved)
+                result = []
+                for entry in chain:
+                    entry_path = entry.get("path", "")
+                    entry_data = entry.get("data", {})
+                    filtered = {k: v for k, v in entry_data.items() if k != "base_config"}
+                    result.append({
+                        "path": entry_path,
+                        "name": Path(entry_path).name if entry_path else "",
+                        "keys": sorted(filtered.keys()),
+                    })
+                self._send_json({"chain": result})
+            except Exception as exc:  # noqa: BLE001
+                self._send_json({"error": str(exc)}, status=500)
+            return
+
         if path.startswith("/static/"):
             cfg = self.server_state.config
             static_path = _safe_static_file_path(static_dir=cfg.static_dir, request_path=path)
@@ -2385,6 +2663,7 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
                 self._send_html(body_html)
                 return
             try:
+                chain = _resolve_config_chain(resolved)
                 config_data = _load_training_config(resolved)
                 merged_config = config_data
                 if mode == "simple":
@@ -2410,6 +2689,8 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
                     schema_fields=schema_fields,
                     message=message,
                     message_level=level,
+                    chain=chain,
+                    merged_config=merged_config,
                 )
             except Exception as exc:  # noqa: BLE001
                 body_html = _render_training_config_panel(
@@ -2536,6 +2817,8 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
             errors: List[str] = []
             message = f"Switched to {mode} mode."
             level = "info"
+            chain_data: Optional[List[Dict[str, Any]]] = None
+            merged_cfg: Optional[Dict[str, Any]] = None
             if selected_path:
                 resolved = _resolve_selected_path(selected_path)
                 if resolved is None or not resolved.exists():
@@ -2543,13 +2826,14 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
                     level = "error"
                 else:
                     try:
+                        chain_data = _resolve_config_chain(resolved)
                         config_data = _load_training_config(resolved)
-                        merged_config = config_data
+                        merged_cfg = config_data
                         if mode == "simple":
                             defaults = _load_default_simple_config()
-                            merged_config = _deep_merge(defaults, config_data)
-                        values = _build_render_values_from_config(merged_config, schema_fields)
-                        missing = _missing_fields(merged_config, schema_fields)
+                            merged_cfg = _deep_merge(defaults, config_data)
+                        values = _build_render_values_from_config(merged_cfg, schema_fields)
+                        missing = _missing_fields(merged_cfg, schema_fields)
                         for field_key in missing:
                             values[field_key] = ""
                     except Exception as exc:  # noqa: BLE001
@@ -2565,6 +2849,8 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
                 schema_fields=schema_fields,
                 message=message,
                 message_level=level,
+                chain=chain_data,
+                merged_config=merged_cfg,
             )
             self._send_html(body_html)
             return
