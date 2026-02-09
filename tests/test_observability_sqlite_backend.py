@@ -98,6 +98,7 @@ class TestObservabilityServerConfigValidation(unittest.TestCase):
                 {
                     "OBSERVABILITY_USER": "user",
                     "OBSERVABILITY_PASSWORD": "pass",
+                    "RUN_STATE_PATH": "",
                 },
                 clear=False,
             ):

@@ -43,6 +43,7 @@ class TestMainSnapshotHPOFlows(unittest.TestCase):
     @mock.patch("main.run_hyperparameter_search")
     @mock.patch("main.start_run")
     @mock.patch("main.validate_environment")
+    @mock.patch("main.run_snapshot_diagnostics")
     @mock.patch("main.setup_colored_logging")
     @mock.patch("main.load_config")
     @mock.patch("main._parse_args")
@@ -51,6 +52,7 @@ class TestMainSnapshotHPOFlows(unittest.TestCase):
         mock_parse_args: mock.MagicMock,
         mock_load_config: mock.MagicMock,
         mock_setup_logger: mock.MagicMock,
+        mock_run_diagnostics: mock.MagicMock,
         mock_validate_env: mock.MagicMock,
         mock_start_run: mock.MagicMock,
         mock_run_hpo: mock.MagicMock,
@@ -84,6 +86,7 @@ class TestMainSnapshotHPOFlows(unittest.TestCase):
     @mock.patch("main.run_hyperparameter_search")
     @mock.patch("main.start_run")
     @mock.patch("main.validate_environment")
+    @mock.patch("main.run_snapshot_diagnostics")
     @mock.patch("main.setup_colored_logging")
     @mock.patch("main.load_config")
     @mock.patch("main._parse_args")
@@ -92,6 +95,7 @@ class TestMainSnapshotHPOFlows(unittest.TestCase):
         mock_parse_args: mock.MagicMock,
         mock_load_config: mock.MagicMock,
         mock_setup_logger: mock.MagicMock,
+        mock_run_diagnostics: mock.MagicMock,
         mock_validate_env: mock.MagicMock,
         mock_start_run: mock.MagicMock,
         mock_run_hpo: mock.MagicMock,
