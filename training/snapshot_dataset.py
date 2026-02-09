@@ -775,10 +775,13 @@ def build_training_generator(
 
                 n_chunk = x_chunk.shape[0]
                 for offset in range(0, n_chunk, batch_size):
-                    x_batch = x_chunk[offset : offset + batch_size]
-                    y_up = y_up_chunk[offset : offset + batch_size]
-                    y_down = y_down_chunk[offset : offset + batch_size]
-                    duty_cycle = duty_cycle_chunk[offset : offset + batch_size].astype("float32")
+                    end = offset + batch_size
+                    if end > n_chunk:
+                        break  # drop incomplete tail batch to keep shapes uniform
+                    x_batch = x_chunk[offset : end]
+                    y_up = y_up_chunk[offset : end]
+                    y_down = y_down_chunk[offset : end]
+                    duty_cycle = duty_cycle_chunk[offset : end].astype("float32")
 
                     y_up_oh = eye[y_up]
                     y_down_oh = eye[y_down]
@@ -792,7 +795,7 @@ def build_training_generator(
                     if use_decay_weights:
                         if current_day is None or decay_const is None:
                             raise ValueError("Sample weighting requires current_day and decay_const")
-                        anchor_slice = anchor_ts[offset : offset + batch_size]
+                        anchor_slice = anchor_ts[offset : end]
                         anchor_days = (anchor_slice // 86400).astype("float64")
                         age_days = float(current_day) - anchor_days
                         decay_weights = np.exp(-age_days * float(decay_const)).astype("float32")

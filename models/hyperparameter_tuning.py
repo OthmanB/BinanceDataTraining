@@ -567,6 +567,12 @@ def _apply_worker_resource(config: Dict[str, Any], resource: str) -> Dict[str, A
             f"Got: {resource!r}"
         )
 
+    # Each HPO worker runs on a single resource; disable distributed
+    # training to prevent MirroredStrategy deadlocks.
+    dist_cfg = runtime_cfg.get("distributed")
+    if isinstance(dist_cfg, dict):
+        dist_cfg["enabled"] = False
+
     training_cfg["runtime"] = runtime_cfg
     cfg["training"] = training_cfg
     return cfg
