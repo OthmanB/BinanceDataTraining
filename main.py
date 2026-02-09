@@ -318,6 +318,11 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to start run-state writer: %s", exc)
 
+    # Suppress TF C++ INFO/WARNING noise (e.g. benign OUT_OF_RANGE at epoch
+    # boundaries under MirroredStrategy).  Must be set before TF is imported.
+    # Override by setting TF_CPP_MIN_LOG_LEVEL in the environment.
+    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+
     try:
         _apply_runtime_device(config, logger)
         _apply_mixed_precision_policy(config, logger)
@@ -449,6 +454,8 @@ def main() -> int:
             )
         else:
             logger.error("Run failed: %s", exc)
+        logger.error("Traceback:\n%s", traceback.format_exc())
+        sys.stderr.flush()
         if writer is not None:
             writer.set_error(str(exc), traceback_text=traceback.format_exc())
         return 1
