@@ -811,8 +811,38 @@ def _run_snapshot_training_pipeline_sequential(
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to import MLFlow TensorFlow integration for sequential model logging: %s", exc)
         else:
+            signature = None
             try:
-                mlflow_tf.log_model(model, "model")
+                from mlflow.models import infer_signature  # type: ignore[import]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to import MLFlow infer_signature for sequential model logging: %s",
+                    exc,
+                )
+            else:
+                try:
+                    inp_shape = model.input_shape
+                    _safe = lambda s: tuple(1 if d is None else d for d in s)
+                    if isinstance(inp_shape, list):
+                        x_sample = [
+                            np.zeros(_safe(s), dtype=np.float32) for s in inp_shape
+                        ]
+                    else:
+                        x_sample = np.zeros(_safe(inp_shape), dtype=np.float32)
+                    y_pred = model.predict(x_sample, verbose=0)
+                    signature = infer_signature(x_sample, y_pred)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Failed to infer MLFlow model signature for sequential model: %s",
+                        exc,
+                    )
+
+            logger.info("Logging sequentially trained model to MLFlow using mlflow.tensorflow.log_model.")
+            try:
+                if signature is not None:
+                    mlflow_tf.log_model(model, "model", signature=signature)
+                else:
+                    mlflow_tf.log_model(model, "model")
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to log sequentially trained model to MLFlow: %s", exc)
 
