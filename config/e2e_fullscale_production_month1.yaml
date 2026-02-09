@@ -1,4 +1,4 @@
-base_config: "training_config.yaml"
+base_config: "training_config_default.yaml"
 
 run_mode:
   mode: "production"
@@ -10,7 +10,6 @@ data:
   asset_pairs:
     alignment:
       missing_policy: "forward_fill"
-  asset_pairs:
     target_asset: "BTCUSDT"
     correlated_assets: ["ETHUSDT"]
   validation:
