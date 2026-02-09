@@ -317,6 +317,12 @@ def _fit_snapshot_model_once(
     debug_max_samples = int(training_cfg["debug_max_samples"])
     epochs = int(training_cfg["epochs"])
     batch_size = int(training_cfg["batch_size"])
+    # MirroredStrategy splits each dataset element across replicas, so the
+    # generator must yield global-batch-size samples per step.
+    generator_batch_size = (
+        dist_ctx.global_batch_size(batch_size) if dist_ctx is not None
+        else batch_size
+    )
 
     split_cfg = config["preprocessing"]["train_test_split"]
     train_ratio = float(split_cfg["train_ratio"])
@@ -508,7 +514,7 @@ def _fit_snapshot_model_once(
             dataset=snapshot_dataset,
             start_index=0,
             end_index=effective_train_n,
-            batch_size=batch_size,
+            batch_size=generator_batch_size,
             num_classes=num_classes,
             normalization=train_stats,
             sample_weight_cfg=training_cfg["sample_weighting"],
@@ -527,7 +533,7 @@ def _fit_snapshot_model_once(
         dataset=snapshot_dataset,
         start_index=0,
         end_index=effective_train_n,
-        batch_size=batch_size,
+        batch_size=generator_batch_size,
         num_classes=num_classes,
         normalization=train_stats,
         sample_weight_cfg=training_cfg["sample_weighting"],
@@ -538,7 +544,7 @@ def _fit_snapshot_model_once(
     )
 
     if dist_ctx is not None:
-        global_batch_size = dist_ctx.global_batch_size(batch_size)
+        global_batch_size = generator_batch_size
         train_data: Any = wrap_generator_as_dataset(
             generator_factory=_make_train_gen,
             input_shape=input_shape,
@@ -566,7 +572,7 @@ def _fit_snapshot_model_once(
                 dataset=snapshot_dataset,
                 start_index=val_start,
                 end_index=val_end,
-                batch_size=batch_size,
+                batch_size=generator_batch_size,
                 num_classes=num_classes,
                 normalization=val_stats,
                 sample_weight_cfg=None,
@@ -585,7 +591,7 @@ def _fit_snapshot_model_once(
             dataset=snapshot_dataset,
             start_index=val_start,
             end_index=val_end,
-            batch_size=batch_size,
+            batch_size=generator_batch_size,
             num_classes=num_classes,
             normalization=val_stats,
             sample_weight_cfg=None,
@@ -601,7 +607,7 @@ def _fit_snapshot_model_once(
                 input_shape=input_shape,
                 num_classes=num_classes,
                 long_term_dim=long_term_input_dim,
-                global_batch_size=dist_ctx.global_batch_size(batch_size),
+                global_batch_size=generator_batch_size,
                 steps_per_epoch=val_steps,
                 distributed_ctx=dist_ctx,
             )
@@ -827,6 +833,12 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
     # Distributed training setup (opt-in via config)
     runtime_cfg = training_cfg.get("runtime") or {}
     dist_ctx: Optional[DistributedContext] = build_distributed_context(runtime_cfg)
+    # MirroredStrategy splits each dataset element across replicas, so the
+    # generator must yield global-batch-size samples per step.
+    generator_batch_size = (
+        dist_ctx.global_batch_size(batch_size) if dist_ctx is not None
+        else batch_size
+    )
 
     split_cfg = config["preprocessing"]["train_test_split"]
     train_ratio = float(split_cfg["train_ratio"])
@@ -1138,7 +1150,7 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
             dataset=snapshot_dataset,
             start_index=0,
             end_index=effective_train_n,
-            batch_size=batch_size,
+            batch_size=generator_batch_size,
             num_classes=num_classes,
             normalization=train_stats,
             sample_weight_cfg=training_cfg["sample_weighting"],
@@ -1158,7 +1170,7 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
         dataset=snapshot_dataset,
         start_index=0,
         end_index=effective_train_n,
-        batch_size=batch_size,
+        batch_size=generator_batch_size,
         num_classes=num_classes,
         normalization=train_stats,
         sample_weight_cfg=training_cfg["sample_weighting"],
@@ -1169,7 +1181,7 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
     )
 
     if dist_ctx is not None:
-        global_batch_size = dist_ctx.global_batch_size(batch_size)
+        global_batch_size = generator_batch_size
         train_data: Any = wrap_generator_as_dataset(
             generator_factory=_make_train_gen,
             input_shape=input_shape,
@@ -1220,7 +1232,7 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
                 dataset=snapshot_dataset,
                 start_index=val_start,
                 end_index=val_end,
-                batch_size=batch_size,
+                batch_size=generator_batch_size,
                 num_classes=num_classes,
                 normalization=val_stats,
                 sample_weight_cfg=None,
@@ -1239,7 +1251,7 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
             dataset=snapshot_dataset,
             start_index=val_start,
             end_index=val_end,
-            batch_size=batch_size,
+            batch_size=generator_batch_size,
             num_classes=num_classes,
             normalization=val_stats,
             sample_weight_cfg=None,
@@ -1255,7 +1267,7 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
                 input_shape=input_shape,
                 num_classes=num_classes,
                 long_term_dim=long_term_input_dim,
-                global_batch_size=dist_ctx.global_batch_size(batch_size),
+                global_batch_size=generator_batch_size,
                 steps_per_epoch=val_steps,
                 distributed_ctx=dist_ctx,
             )
