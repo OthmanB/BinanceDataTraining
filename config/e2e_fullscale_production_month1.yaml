@@ -8,8 +8,13 @@ data:
     start_date: "2024-01-01"
     end_date: "2024-02-01"
   asset_pairs:
+    alignment:
+      missing_policy: "forward_fill"
+  asset_pairs:
     target_asset: "BTCUSDT"
     correlated_assets: ["ETHUSDT"]
+  validation:
+    fail_on_invalid: false
 
 model:
   long_term:
@@ -49,7 +54,7 @@ training:
 hyperparameter_optimization:
   enabled: true
   framework: "optuna"
-  n_trials: 10
+  n_trials: 20
   direction: "minimize"
   metric: "loss"
   trial_model_logging:
@@ -79,14 +84,6 @@ hyperparameter_optimization:
       min_success_trials: 2
       headroom_fraction: 1.0
       persistence_enabled: true
-  search_space:
-    cnn:
-      - filters: [16, 160]
-      - filters: [32, 320]
-    lstm:
-      - units: [16, 128]
-    learning_rate: [0.0003, 0.0012]
-    batch_size: [6, 12]
 
 snapshot:
   enabled: true
