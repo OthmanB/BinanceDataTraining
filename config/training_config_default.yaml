@@ -66,7 +66,7 @@ data:  # Controls where raw data come from and over which time windows.
     alignment:
       method: "interpolate"  # Alignment strategy: "interpolate" (default) or "bucket".
       missing_policy: "forward_fill"  # Gap handling for aligned assets: "forward_fill", "skip", or "error".
-      max_gap_seconds: 600  # Max gap size (seconds) allowed for forward fill/interpolation.
+      max_gap_seconds: 1200  # Max gap size (seconds) allowed for forward fill/interpolation.
       bucket_tolerance_seconds: 2  # Alignment tolerance for bucket method (seconds).
       include_mask_channel: true  # Append per-asset confidence mask channels (0..1) to inputs.
 
@@ -81,11 +81,11 @@ data:  # Controls where raw data come from and over which time windows.
     max_concurrent_chunk_fetches: 1  # Concurrency cap for chunk fetches; keep at 1 for low DB load.
 
   order_book:
-    depth_levels: 50  # Maximum number of price levels per side to ingest for order-book snapshots.
+    depth_levels: 100  # Maximum number of price levels per side to ingest for order-book snapshots.
     representation: "hybrid"  # Order-book representation strategy: "full", "aggregated", or "hybrid" (current model expects hybrid).
     hybrid:
-      raw_levels: 10           # Keep top N levels as-is (must be < depth_levels).
-      aggregated_bins: 10      # Number of bins for deeper levels (must be > 0).
+      raw_levels: 20           # Keep top N levels as-is (must be < depth_levels).
+      aggregated_bins: 20      # Number of bins for deeper levels (must be > 0).
       bin_strategy: "equal_width"  # Binning strategy: "equal_width" or "log_spaced" for bin distribution.
     schema:
       timestamp_column: "ts"           # Column name in the DB table containing snapshot timestamps.
@@ -124,7 +124,7 @@ data:  # Controls where raw data come from and over which time windows.
 # Target Configuration
 targets:  # Defines what future event the model predicts and how labels are constructed.
   prediction_horizon_seconds: 1800  # Prediction horizon in seconds (here: 30 minutes ahead price change).
-  visible_window_seconds: 600      # Length of past window (in seconds) visible to the model when forming a prediction.
+  visible_window_seconds: 7200      # Length of past window (in seconds) visible to the model when forming a prediction.
 
   price_classes:
     definition_type: "percentage"  # How price-move bins are defined: by percentage, absolute size, or adaptive rules.

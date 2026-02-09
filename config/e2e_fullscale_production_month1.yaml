@@ -1,4 +1,4 @@
-base_config: "training_config_default.yaml"
+base_config: "training_config.yaml"
 
 run_mode:
   mode: "production"
@@ -10,6 +10,7 @@ data:
   asset_pairs:
     alignment:
       missing_policy: "forward_fill"
+  asset_pairs:
     target_asset: "BTCUSDT"
     correlated_assets: ["ETHUSDT"]
   validation:
@@ -53,7 +54,7 @@ training:
 hyperparameter_optimization:
   enabled: true
   framework: "optuna"
-  n_trials: 20
+  n_trials: 10
   direction: "minimize"
   metric: "loss"
   trial_model_logging:
