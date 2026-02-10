@@ -1470,4 +1470,41 @@ def run_training_pipeline(config: Dict[str, Any], data_object: Optional[Dict[str
     )
 
 
-__all__ = ["run_training_pipeline"]
+def pre_build_snapshots(config: Dict[str, Any]) -> None:
+    """Pre-build all snapshot datasets required by the current config.
+
+    When sequential training is enabled, this iterates over every time window
+    and calls :func:`prepare_snapshot_dataset` for each so the ``.npz`` chunk
+    files exist on disk before any parallel HPO worker is spawned.  For
+    non-sequential configs a single snapshot is built.
+
+    This is intentionally a **no-op** for already-cached snapshots (the
+    underlying :func:`prepare_snapshot_dataset` short-circuits when the
+    manifest is marked complete and all chunk files are present).
+    """
+
+    if not bool(config.get("snapshot", {}).get("enabled", False)):
+        return
+
+    windows = _resolve_sequential_windows(config)
+    if windows is not None and len(windows) > 1:
+        for idx, (window_start, window_end) in enumerate(windows):
+            window_config = copy.deepcopy(config)
+            window_config["data"]["time_range"]["start_date"] = window_start
+            window_config["data"]["time_range"]["end_date"] = window_end
+            logger.info(
+                "Pre-building snapshot for sequential window %s/%s: %s -> %s",
+                idx + 1,
+                len(windows),
+                window_start,
+                window_end,
+            )
+            prepare_snapshot_dataset(window_config)
+    else:
+        logger.info("Pre-building snapshot for single training window.")
+        prepare_snapshot_dataset(config)
+
+    logger.info("Snapshot pre-build complete; all chunks cached on disk.")
+
+
+__all__ = ["pre_build_snapshots", "run_training_pipeline"]

@@ -1312,6 +1312,22 @@ def run_hyperparameter_search(
                 )
                 pre_existing_finished = 0
 
+        # Pre-build all snapshot datasets in the supervisor process so that
+        # parallel workers find them already cached on disk.  This prevents
+        # multiple workers from simultaneously fetching raw data from the
+        # database and building the same snapshot, which would double (or
+        # more) system RAM usage and trigger the RSS watchdog.
+        try:
+            from training.pipeline import pre_build_snapshots
+
+            logger.info("Pre-building snapshots before launching parallel HPO workers.")
+            pre_build_snapshots(config)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Snapshot pre-build failed; workers will attempt to build on demand: %s",
+                exc,
+            )
+
         logger.info(
             "Starting parallel HPO with %s workers over %s trials. resources=%s storage=%s study=%s",
             n_workers,
