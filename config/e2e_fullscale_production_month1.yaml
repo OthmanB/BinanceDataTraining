@@ -1,4 +1,4 @@
-base_config: "training_config.yaml"
+base_config: "training_config_default.yaml"
 
 run_mode:
   mode: "production"
