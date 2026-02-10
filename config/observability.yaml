@@ -34,3 +34,7 @@ static_dir: "static"
 
 # Max lines to show in log tail.
 tail_max_lines: 200
+
+# Resolution (in days) for the duty cycle time-series chart.
+# Duty cycle median values are aggregated into bins of this size.
+duty_cycle_chart_resolution_days: 1

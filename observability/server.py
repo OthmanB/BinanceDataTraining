@@ -72,6 +72,9 @@ class ServerConfig:
         self.allowed_configs_glob = allowed_configs_glob
         self.static_dir = static_dir
         self.tail_max_lines = tail_max_lines
+        self.duty_cycle_chart_resolution_days = int(
+            file_config.get("duty_cycle_chart_resolution_days", 1)
+        )
         self.config_path = config_path
         self.file_config = dict(file_config)
 
@@ -565,10 +568,14 @@ _MISSING = object()
 _SELECT_OPTIONS: Dict[str, List[str]] = {
     "run_mode.mode": ["production", "trial"],
     "data.source_type": ["database", "file"],
+    "data.multi_database.strategy": ["round_robin", "failover", "merge"],
     "data.asset_pairs.alignment.method": ["interpolate", "bucket"],
     "data.asset_pairs.alignment.missing_policy": ["forward_fill", "skip", "error"],
     "data.order_book.representation": ["full", "aggregated", "hybrid"],
     "data.order_book.hybrid.bin_strategy": ["equal_width", "log_spaced"],
+    "targets.price_classes.definition_type": ["fixed", "quantile"],
+    "targets.labeling.scheme": ["threshold", "triple_barrier", "fixed_horizon"],
+    "targets.labeling.handle_gaps": ["skip", "interpolate", "error"],
     "preprocessing.normalization.method": ["min_max", "standard", "robust"],
     "preprocessing.feature_engineering.volume_proxy_method": ["top_of_book", "total_depth"],
     "preprocessing.feature_engineering.edge_decay.method": ["linear", "exponential"],
@@ -579,14 +586,113 @@ _SELECT_OPTIONS: Dict[str, List[str]] = {
     "model.architecture": ["CNN_LSTM_MultiClass"],
     "model.input_representation.strategy": ["stacked_channels"],
     "model.input_representation.temporal_features.integration_mode": ["concat_channels"],
+    "model.cnn.activation": ["relu", "elu", "selu", "leaky_relu", "swish", "tanh", "sigmoid"],
+    "model.output.type": ["classification", "regression"],
+    "model.output.activation": ["softmax", "sigmoid", "linear"],
+    "model.compilation.optimizer": ["adam", "sgd", "rmsprop", "adamw"],
+    "model.compilation.loss": [
+        "categorical_crossentropy", "sparse_categorical_crossentropy",
+        "binary_crossentropy", "mse", "mae", "focal_loss",
+    ],
+    "model.long_term.summary_method": ["mean", "median", "ewma", "last"],
+    "model.long_term.architecture.conv1d.activation": ["relu", "elu", "selu", "leaky_relu", "swish", "tanh"],
     "training.missing_snapshot_strategy": ["fail", "skip", "synthetic"],
+    "training.runtime.device": ["cpu", "gpu"],
     "training.sample_weighting.method": ["exponential_decay"],
     "training.sample_weighting.apply_to": ["loss_function"],
     "training.fine_tuning.freeze_layers": ["none", "cnn", "cnn_lstm", "all_but_output"],
+    "snapshot.on_config_mismatch": ["error", "warn", "ignore", "rebuild"],
+    "hyperparameter_optimization.framework": ["optuna"],
+    "hyperparameter_optimization.direction": ["minimize", "maximize"],
+    "hyperparameter_optimization.metric": [
+        "val_loss", "val_accuracy", "val_f1_score", "val_precision", "val_recall",
+    ],
     "evaluation.post_hoc_calibration.method": ["temperature_scaling", "isotonic"],
     "evaluation.backtesting.signal_strategy": ["net_intensity", "threshold"],
     "evaluation.backtesting.position_sizing": ["equal", "confidence"],
     "evaluation.missing_snapshot_strategy": ["fail", "skip", "synthetic"],
+    "logging.level": ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+    "diagnostics.sampling.method": ["uniform", "random"],
+}
+
+_COLOR_OPTIONS: List[str] = [
+    "red", "green", "yellow", "blue", "magenta", "cyan", "white", "grey",
+    "light_red", "light_green", "light_yellow", "light_blue",
+    "light_magenta", "light_cyan",
+]
+
+_COLOR_FIELDS: List[str] = [
+    "logging.colors.function_names",
+    "logging.colors.parameter_names",
+    "logging.colors.parameter_values",
+    "logging.colors.info",
+    "logging.colors.warning",
+    "logging.colors.error",
+    "logging.colors.debug",
+]
+
+for _cf in _COLOR_FIELDS:
+    _SELECT_OPTIONS[_cf] = _COLOR_OPTIONS
+
+_HIDDEN_SECTIONS: set = {"security"}
+
+_HIDDEN_FIELDS: set = {
+    "logging.format",
+    "model.long_term.input_dim",
+}
+
+_ASSET_SELECTOR_FIELDS: set = {
+    "data.asset_pairs.target_asset",
+}
+
+_ASSET_LIST_FIELDS: set = {
+    "data.asset_pairs.correlated_assets",
+}
+
+_DATE_FIELDS: set = {
+    "data.time_range.start_date",
+    "data.time_range.end_date",
+}
+
+_LIST_FIELD_OPTIONS: Dict[str, List[str]] = {
+    "data.asset_pairs.correlated_assets": [],
+    "data.temporal_features.local": [
+        "hour_sin", "hour_cos", "day_of_week_sin", "day_of_week_cos",
+        "minute_sin", "minute_cos", "second_sin", "second_cos",
+    ],
+    "data.temporal_features.global": [
+        "day_of_month_sin", "day_of_month_cos",
+        "month_sin", "month_cos", "week_of_year_sin", "week_of_year_cos",
+    ],
+    "preprocessing.feature_engineering.order_book_features": [
+        "bid_ask_spread", "mid_price", "weighted_mid_price",
+        "bid_depth", "ask_depth", "depth_imbalance", "volume_imbalance",
+        "cumulative_depth_ratio", "price_gradient",
+    ],
+    "preprocessing.feature_engineering.derived_features": [
+        "spread_ma", "mid_price_returns", "volatility",
+        "momentum", "trade_intensity", "order_flow_imbalance",
+        "depth_weighted_price", "vwap_proxy",
+    ],
+    "targets.price_classes.boundaries": [],
+    "model.long_term.windows_days": [],
+    "model.long_term.features": [
+        "close", "volume", "spread", "volatility", "momentum",
+        "depth_imbalance", "trade_intensity",
+    ],
+    "model.compilation.metrics": [
+        "accuracy", "precision", "recall", "f1_score",
+        "categorical_accuracy", "top_k_categorical_accuracy", "AUC",
+    ],
+    "evaluation.metrics": [
+        "accuracy", "precision", "recall", "f1_score",
+        "confusion_matrix", "classification_report", "roc_auc",
+        "log_loss", "brier_score", "calibration_error",
+    ],
+    "diagnostics.visualization.heatmaps.types": [
+        "spread_time", "depth_time", "imbalance_time",
+        "price_level", "volume_profile",
+    ],
 }
 
 
@@ -1053,6 +1159,251 @@ def _render_yaml_block(data: Dict[str, Any], *, title: str, css_id: str) -> str:
     )
 
 
+_NN_LAYER_PARAMS: Dict[str, List[Dict[str, str]]] = {
+    "cnn": [
+        {"name": "filters", "type": "number", "default": "32"},
+        {"name": "kernel_size", "type": "text", "default": "[3,3]"},
+        {"name": "pool_size", "type": "text", "default": "[2,2]"},
+        {"name": "normalization", "type": "select", "default": "null",
+         "options": "null,batch,group,layer"},
+        {"name": "dropout", "type": "number", "default": "0.0"},
+    ],
+    "lstm": [
+        {"name": "units", "type": "number", "default": "64"},
+        {"name": "dropout", "type": "number", "default": "0.0"},
+        {"name": "recurrent_dropout", "type": "number", "default": "0.0"},
+        {"name": "post_dropout", "type": "number", "default": "0.0"},
+    ],
+    "dense": [
+        {"name": "units", "type": "number", "default": "64"},
+        {"name": "dropout", "type": "number", "default": "0.0"},
+    ],
+}
+
+
+def _render_nn_builder(
+    cnn_layers: Any, lstm_layers: Any, dense_layers: Any,
+    output_value: Any, cnn_activation: str,
+) -> str:
+    """Render horizontal accordion NN layer builder."""
+    def _parse_layers(raw: Any) -> List[Dict[str, Any]]:
+        if isinstance(raw, list):
+            return [d for d in raw if isinstance(d, dict)]
+        if isinstance(raw, str) and raw.strip():
+            try:
+                import yaml as _yaml  # type: ignore[import]
+                parsed = _yaml.safe_load(raw)
+                if isinstance(parsed, list):
+                    return [d for d in parsed if isinstance(d, dict)]
+            except Exception:  # noqa: BLE001
+                pass
+        return []
+
+    def _layer_card(layer_type: str, idx: int, params: Dict[str, Any]) -> str:
+        card_id = f"nn_{layer_type}_{idx}"
+        fields_html = ""
+        for pdef in _NN_LAYER_PARAMS.get(layer_type, []):
+            pname = pdef["name"]
+            ptype = pdef["type"]
+            pval = str(params.get(pname, pdef["default"]))
+            if ptype == "select":
+                opts = pdef.get("options", "").split(",")
+                opt_html = ""
+                for o in opts:
+                    sel = "selected" if pval == o else ""
+                    opt_html += f'<option value="{_escape_text(o)}" {sel}>{_escape_text(o)}</option>'
+                fields_html += (
+                    f'<div class="nn-param"><label>{_escape_text(pname)}</label>'
+                    f'<select class="nn-p" data-param="{_escape_text(pname)}">{opt_html}</select></div>'
+                )
+            elif ptype == "number":
+                fields_html += (
+                    f'<div class="nn-param"><label>{_escape_text(pname)}</label>'
+                    f'<input type="number" step="any" class="nn-p" data-param="{_escape_text(pname)}" '
+                    f'value="{_escape_text(pval)}" /></div>'
+                )
+            else:
+                fields_html += (
+                    f'<div class="nn-param"><label>{_escape_text(pname)}</label>'
+                    f'<input type="text" class="nn-p" data-param="{_escape_text(pname)}" '
+                    f'value="{_escape_text(pval)}" /></div>'
+                )
+        return (
+            f'<div class="nn-card" data-layer-type="{layer_type}" data-idx="{idx}" id="{card_id}">'
+            f'<div class="nn-card-header">'
+            f'<span class="nn-card-type">{layer_type.upper()} {idx + 1}</span>'
+            f'<button type="button" class="list-btn-sm danger" '
+            f'onclick="removeNNCard(this)">-</button>'
+            f'</div>'
+            f'<div class="nn-card-body">{fields_html}</div>'
+            f'</div>'
+        )
+
+    cards_html = ""
+    cnn_list = _parse_layers(cnn_layers)
+    lstm_list = _parse_layers(lstm_layers)
+    dense_list = _parse_layers(dense_layers)
+
+    cards_html += '<div class="nn-fixed-card input">INPUT</div>'
+    for i, layer in enumerate(cnn_list):
+        cards_html += _layer_card("cnn", i, layer)
+    for i, layer in enumerate(lstm_list):
+        cards_html += _layer_card("lstm", i, layer)
+    for i, layer in enumerate(dense_list):
+        cards_html += _layer_card("dense", i, layer)
+    cards_html += '<div class="nn-fixed-card output">OUTPUT</div>'
+
+    add_btns = (
+        '<div class="nn-add-bar">'
+        '<span class="muted" style="font-size:0.75rem">Add layer:</span>'
+        '<button type="button" class="list-btn-sm primary" style="width:auto;padding:2px 8px" '
+        'onclick="addNNCard(\'cnn\')">+ CNN</button>'
+        '<button type="button" class="list-btn-sm primary" style="width:auto;padding:2px 8px" '
+        'onclick="addNNCard(\'lstm\')">+ LSTM</button>'
+        '<button type="button" class="list-btn-sm primary" style="width:auto;padding:2px 8px" '
+        'onclick="addNNCard(\'dense\')">+ Dense</button>'
+        '</div>'
+    )
+
+    return (
+        '<div class="nn-builder-wrap">'
+        f'<div class="nn-cards-row" id="nn-cards-row">{cards_html}</div>'
+        f'{add_btns}'
+        f'<textarea name="model.cnn.layers" class="list-hidden-ta" id="ta_nn_cnn" rows="1"></textarea>'
+        f'<textarea name="model.lstm.layers" class="list-hidden-ta" id="ta_nn_lstm" rows="1"></textarea>'
+        f'<textarea name="model.dense.layers" class="list-hidden-ta" id="ta_nn_dense" rows="1"></textarea>'
+        '</div>'
+    )
+
+
+def _render_connections_table(value: Any) -> str:
+    """Render multi_database.connections as an editable table with +/- buttons."""
+    connections: List[Dict[str, Any]] = []
+    if isinstance(value, list):
+        connections = [c for c in value if isinstance(c, dict)]
+    elif isinstance(value, str) and value.strip():
+        try:
+            import yaml as _yaml  # type: ignore[import]
+            parsed = _yaml.safe_load(value)
+            if isinstance(parsed, list):
+                connections = [c for c in parsed if isinstance(c, dict)]
+        except Exception:  # noqa: BLE001
+            pass
+
+    rows_html = ""
+    for idx, conn in enumerate(connections):
+        tr = conn.get("time_range") or {}
+        rows_html += (
+            f'<tr class="conn-row" data-idx="{idx}">'
+            f'<td><input type="text" class="conn-f" data-field="name" value="{_escape_text(conn.get("name", ""))}" /></td>'
+            f'<td><input type="text" class="conn-f" data-field="database_uri" value="{_escape_text(conn.get("database_uri", ""))}" /></td>'
+            f'<td><input type="text" class="conn-f" data-field="table_prefix" value="{_escape_text(conn.get("table_prefix", ""))}" /></td>'
+            f'<td><input type="date" class="conn-f" data-field="start_date" value="{_escape_text(tr.get("start_date", ""))}" /></td>'
+            f'<td><input type="date" class="conn-f" data-field="end_date" value="{_escape_text(tr.get("end_date", ""))}" /></td>'
+            f'<td><button type="button" class="list-btn-sm danger" onclick="removeConnRow(this)">-</button></td>'
+            f'</tr>'
+        )
+
+    try:
+        import yaml as _yaml  # type: ignore[import]
+        ta_val = _yaml.safe_dump(connections, default_flow_style=False).strip() if connections else "[]"
+    except Exception:  # noqa: BLE001
+        ta_val = str(connections)
+
+    return (
+        '<div class="conn-table-wrap">'
+        '<table class="conn-table"><thead><tr>'
+        '<th>Name</th><th>Database URI</th><th>Table Prefix</th>'
+        '<th>Start Date</th><th>End Date</th><th></th>'
+        '</tr></thead>'
+        f'<tbody id="conn-tbody">{rows_html}</tbody></table>'
+        '<button type="button" class="list-btn-sm primary" style="margin-top:4px;width:auto;padding:2px 10px" '
+        'onclick="addConnRow()">+ Add Connection</button>'
+        f'<textarea name="data.multi_database.connections" class="list-hidden-ta" '
+        f'id="ta_conn" rows="1">{_escape_text(ta_val)}</textarea>'
+        '</div>'
+    )
+
+
+def _render_list_field(full_key: str, value: Any) -> str:
+    """Render a list field with +/- buttons and optional selectable options."""
+    options = _LIST_FIELD_OPTIONS.get(full_key, [])
+    escaped_key = _escape_text(full_key)
+    uid = full_key.replace(".", "_")
+
+    current_items: List[str] = []
+    if isinstance(value, list):
+        current_items = [str(v) for v in value]
+    elif isinstance(value, str) and value.strip():
+        try:
+            import yaml as _yaml  # type: ignore[import]
+            parsed = _yaml.safe_load(value)
+            if isinstance(parsed, list):
+                current_items = [str(v) for v in parsed]
+        except Exception:  # noqa: BLE001
+            pass
+
+    items_html = ""
+    for idx, item in enumerate(current_items):
+        items_html += (
+            f'<div class="list-item" data-list="{uid}">'
+            f'<span class="list-item-text">{_escape_text(item)}</span>'
+            f'<button type="button" class="list-btn-sm danger" '
+            f'onclick="removeListItem(this,\'{uid}\')">-</button>'
+            f'</div>'
+        )
+
+    add_html = ""
+    if options:
+        opt_html = '<option value="">Add...</option>'
+        for opt in options:
+            opt_html += f'<option value="{_escape_text(opt)}">{_escape_text(opt)}</option>'
+        add_html = (
+            f'<div class="list-add-row">'
+            f'<select id="sel_{uid}" class="list-add-select">{opt_html}</select>'
+            f'<button type="button" class="list-btn-sm primary" '
+            f'onclick="addListItemFromSelect(\'{uid}\')">+</button>'
+            f'</div>'
+        )
+    else:
+        add_html = (
+            f'<div class="list-add-row">'
+            f'<input type="text" id="inp_{uid}" class="list-add-input" placeholder="value" />'
+            f'<button type="button" class="list-btn-sm primary" '
+            f'onclick="addListItemFromInput(\'{uid}\')">+</button>'
+            f'</div>'
+        )
+
+    return (
+        f'<div class="list-field-wrap" id="lf_{uid}">'
+        f'<div class="list-items" id="items_{uid}">{items_html}</div>'
+        f'{add_html}'
+        f'<textarea name="{escaped_key}" class="list-hidden-ta" '
+        f'id="ta_{uid}" rows="1">{_escape_text(_list_to_yaml(current_items))}</textarea>'
+        f'</div>'
+    )
+
+
+def _list_to_yaml(items: List[str]) -> str:
+    """Convert a list of string items to YAML list format."""
+    if not items:
+        return "[]"
+    try:
+        import yaml as _yaml  # type: ignore[import]
+        coerced: List[Any] = []
+        for item in items:
+            try:
+                coerced.append(int(item))
+            except ValueError:
+                try:
+                    coerced.append(float(item))
+                except ValueError:
+                    coerced.append(item)
+        return _yaml.safe_dump(coerced, default_flow_style=True).strip()
+    except Exception:  # noqa: BLE001
+        return str(items)
+
+
 def _render_config_fields(
     values: Dict[str, Any],
     missing: List[str],
@@ -1072,6 +1423,8 @@ def _render_config_fields(
 
     out: List[str] = []
     for section_name, subsections in sections.items():
+        if section_name in _HIDDEN_SECTIONS:
+            continue
         out.append(
             f'<details class="cfg-section" open>'
             f'<summary class="cfg-section-title">{_escape_text(section_name)}</summary>'
@@ -1087,6 +1440,8 @@ def _render_config_fields(
                 out.append('<div class="cfg-subsection">')
 
             for field in fields:
+                if field.full_key in _HIDDEN_FIELDS:
+                    continue
                 parts = field.dotted_key.split(".") if field.dotted_key else []
                 label = parts[-1] if parts else field.section
                 depth = max(len(parts) - 1, 0)
@@ -1102,12 +1457,51 @@ def _render_config_fields(
                         f'<input type="checkbox" name="{_escape_text(field.full_key)}" '
                         f'value="true" {checked} />'
                     )
+                elif field.full_key == "model.cnn.layers":
+                    nn_cnn = values.get("model.cnn.layers", "")
+                    nn_lstm = values.get("model.lstm.layers", "")
+                    nn_dense = values.get("model.dense.layers", "")
+                    nn_output = values.get("model.output.type", "")
+                    nn_act = str(values.get("model.cnn.activation", "relu"))
+                    input_html = _render_nn_builder(nn_cnn, nn_lstm, nn_dense, nn_output, nn_act)
+                elif field.full_key in ("model.lstm.layers", "model.dense.layers"):
+                    continue
+                elif field.full_key in _ASSET_SELECTOR_FIELDS:
+                    val_str = _escape_text(value) if value else ""
+                    input_html = (
+                        f'<div class="asset-select-wrap">'
+                        f'<select name="{_escape_text(field.full_key)}" id="asset_sel_{_escape_text(field.full_key)}" '
+                        f'class="asset-select">'
+                        f'<option value="{val_str}" selected>{val_str or "Loading..."}</option>'
+                        f'</select>'
+                        f'<button type="button" class="list-btn-sm primary" '
+                        f'onclick="loadAssets(\'{_escape_text(field.full_key)}\')">&orarr;</button>'
+                        f'</div>'
+                    )
+                elif field.full_key in _ASSET_LIST_FIELDS:
+                    input_html = (
+                        f'<div class="asset-list-wrap" id="al_{field.full_key.replace(".", "_")}">'
+                        f'{_render_list_field(field.full_key, value)}'
+                        f'<button type="button" class="list-btn-sm primary" style="margin-top:2px;width:auto;padding:2px 8px" '
+                        f'onclick="loadAssetsForList(\'{field.full_key.replace(".", "_")}\')">&orarr; DB</button>'
+                        f'</div>'
+                    )
+                elif field.full_key == "data.multi_database.connections":
+                    input_html = _render_connections_table(value)
+                elif field.field_type in {"list"} and field.full_key in _LIST_FIELD_OPTIONS:
+                    input_html = _render_list_field(field.full_key, value)
                 elif field.field_type in {"list", "dict", "any"}:
                     input_html = (
                         f'<textarea name="{_escape_text(field.full_key)}" rows="2">'
                         f'{_escape_text(value)}</textarea>'
                     )
-                elif field.field_type == "string" and field.full_key in _SELECT_OPTIONS:
+                elif field.full_key in _DATE_FIELDS:
+                    date_val = str(value).strip() if value else ""
+                    input_html = (
+                        f'<input type="date" name="{_escape_text(field.full_key)}" '
+                        f'value="{_escape_text(date_val)}" />'
+                    )
+                elif field.full_key in _SELECT_OPTIONS:
                     options = list(_SELECT_OPTIONS[field.full_key])
                     if value and str(value) not in options:
                         options = [str(value)] + options
@@ -1497,6 +1891,7 @@ def _render_ui_page(_config: ServerConfig) -> str:
       .badge.unknown {{ background: var(--bg-alt); color: var(--ink-3); }}
       .badge.warn {{ background: var(--warning-soft); color: var(--warning); }}
       .badge.ok {{ background: var(--success-soft); color: var(--success); }}
+      .badge.abandoned {{ background: var(--bg-alt); color: var(--ink-3); }}
       /* KV rows */
       .kv {{ display: flex; justify-content: space-between; padding: 5px 0; font-size: 0.85rem; }}
       .kv .k {{ color: var(--ink-2); }}
@@ -1599,7 +1994,9 @@ def _render_ui_page(_config: ServerConfig) -> str:
       .file-entry.file.selected {{ border-color: var(--accent); background: var(--accent-soft); }}
       .load-form {{ margin-top: 10px; }}
       .config-form {{ margin-top: 16px; display: grid; gap: 12px; }}
-      .config-fields {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; }}
+      .config-fields {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }}
+      @media (max-width: 1100px) {{ .config-fields {{ grid-template-columns: repeat(2, 1fr); }} }}
+      @media (max-width: 720px) {{ .config-fields {{ grid-template-columns: 1fr; }} }}
       .section-title {{
         grid-column: 1 / -1; font-weight: 700; margin-top: 14px; padding-bottom: 4px;
         border-bottom: 2px solid var(--border); font-size: 0.9rem; cursor: pointer;
@@ -1727,6 +2124,57 @@ def _render_ui_page(_config: ServerConfig) -> str:
       .cfg-field.missing input, .cfg-field.missing textarea, .cfg-field.missing select {{ border-color: var(--danger); }}
       .cfg-field input:not([type="checkbox"]), .cfg-field select {{ font-size: 0.78rem; padding: 5px 8px; }}
       .cfg-field textarea {{ font-size: 0.76rem; padding: 5px 8px; }}
+      .list-field-wrap {{ display: flex; flex-direction: column; gap: 4px; }}
+      .list-items {{ display: flex; flex-wrap: wrap; gap: 4px; }}
+      .list-item {{
+        display: inline-flex; align-items: center; gap: 4px;
+        padding: 2px 8px; border-radius: 6px; font-size: 0.75rem;
+        background: var(--accent-soft); color: var(--accent); border: 1px solid var(--accent);
+      }}
+      .list-item-text {{ font-family: var(--mono); }}
+      .list-btn-sm {{
+        width: 20px; height: 20px; padding: 0; border: none; border-radius: 4px;
+        font-size: 0.75rem; font-weight: 700; cursor: pointer; line-height: 1;
+        display: inline-flex; align-items: center; justify-content: center;
+      }}
+      .list-btn-sm.danger {{ background: var(--danger-soft); color: var(--danger); }}
+      .list-btn-sm.danger:hover {{ background: var(--danger); color: #fff; }}
+      .list-btn-sm.primary {{ background: var(--accent-soft); color: var(--accent); }}
+      .list-btn-sm.primary:hover {{ background: var(--accent); color: #fff; }}
+      .list-add-row {{ display: flex; gap: 4px; align-items: center; }}
+      .list-add-select, .list-add-input {{ font-size: 0.75rem; padding: 3px 6px; flex: 1; min-width: 0; }}
+      .list-hidden-ta {{ display: none; }}
+      .asset-select-wrap {{ display: flex; gap: 4px; align-items: center; }}
+      .asset-select {{ flex: 1; min-width: 0; }}
+      .asset-list-wrap {{ display: flex; flex-direction: column; gap: 4px; }}
+      .conn-table-wrap {{ grid-column: 1 / -1; }}
+      .conn-table {{ width: 100%; border-collapse: collapse; font-size: 0.75rem; }}
+      .conn-table th {{ padding: 4px 6px; text-align: left; font-weight: 600; color: var(--ink-2); border-bottom: 2px solid var(--border); }}
+      .conn-table td {{ padding: 3px 4px; border-bottom: 1px solid var(--border); }}
+      .conn-table input {{ width: 100%; font-size: 0.74rem; padding: 3px 5px; }}
+      .nn-builder-wrap {{ grid-column: 1 / -1; margin: 8px 0; }}
+      .nn-cards-row {{ display: flex; gap: 6px; overflow-x: auto; padding: 8px 0; align-items: stretch; }}
+      .nn-card {{
+        min-width: 130px; max-width: 180px; border: 2px solid var(--accent);
+        border-radius: 8px; background: var(--bg); font-size: 0.72rem; flex-shrink: 0;
+      }}
+      .nn-card-header {{
+        display: flex; justify-content: space-between; align-items: center;
+        padding: 4px 8px; background: var(--accent-soft); border-radius: 6px 6px 0 0;
+      }}
+      .nn-card-type {{ font-weight: 700; color: var(--accent); font-size: 0.72rem; }}
+      .nn-card-body {{ padding: 6px 8px; display: grid; gap: 3px; }}
+      .nn-param {{ display: flex; justify-content: space-between; align-items: center; gap: 4px; }}
+      .nn-param label {{ font-size: 0.68rem; color: var(--ink-2); white-space: nowrap; }}
+      .nn-param input, .nn-param select {{ width: 65px; font-size: 0.7rem; padding: 2px 4px; }}
+      .nn-fixed-card {{
+        min-width: 70px; display: flex; align-items: center; justify-content: center;
+        padding: 8px 12px; border: 2px dashed var(--border); border-radius: 8px;
+        font-weight: 700; font-size: 0.72rem; color: var(--ink-3); flex-shrink: 0;
+      }}
+      .nn-fixed-card.input {{ border-color: var(--success); color: var(--success); }}
+      .nn-fixed-card.output {{ border-color: var(--warning); color: var(--warning); }}
+      .nn-add-bar {{ display: flex; gap: 6px; align-items: center; margin-top: 6px; }}
       @media (max-width: 720px) {{
         .shell {{ padding: 12px; }}
         .card-grid {{ grid-template-columns: 1fr; }}
@@ -1802,6 +2250,22 @@ def _render_ui_page(_config: ServerConfig) -> str:
       document.addEventListener('click',function(e){{if(e.target.classList.contains('section-title')){{e.target.classList.toggle('collapsed');var el=e.target.nextElementSibling;while(el&&!el.classList.contains('section-title')){{el.style.display=e.target.classList.contains('collapsed')?'none':'';el=el.nextElementSibling;}}}}}});
       function exportRunState(){{fetch('/api/run-state').then(function(r){{return r.json()}}).then(function(d){{var blob=new Blob([JSON.stringify(d,null,2)],{{type:'application/json'}});var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='run_state_'+new Date().toISOString().slice(0,19).replace(/:/g,'-')+'.json';a.click();}}).catch(function(e){{alert('Export failed: '+e);}});}}
       function setRefreshRate(sec){{var val=parseInt(sec,10)||5;document.querySelectorAll('[hx-trigger*="every"]').forEach(function(el){{var t=el.getAttribute('hx-trigger');if(t){{var newT=t.replace(/every \\d+s/g,'every '+val+'s');el.setAttribute('hx-trigger',newT);if(window.htmx)htmx.process(el);}}}});}}
+      function _syncListTA(uid){{var c=document.getElementById('items_'+uid);if(!c)return;var items=[];c.querySelectorAll('.list-item-text').forEach(function(s){{items.push(s.textContent)}});var ta=document.getElementById('ta_'+uid);if(ta)ta.value=items.length?'['+items.map(function(v){{return /^\\d+(\\.\\d+)?$/.test(v)?v:'"'+v.replace(/"/g,'\\\\"')+'"'}}).join(', ')+']':'[]';}}
+      function removeListItem(btn,uid){{btn.parentElement.remove();_syncListTA(uid);}}
+      function addListItemFromSelect(uid){{var sel=document.getElementById('sel_'+uid);if(!sel||!sel.value)return;var v=sel.value;var c=document.getElementById('items_'+uid);var existing=[];c.querySelectorAll('.list-item-text').forEach(function(s){{existing.push(s.textContent)}});if(existing.indexOf(v)!==-1){{sel.value='';return;}}var d=document.createElement('div');d.className='list-item';d.setAttribute('data-list',uid);d.innerHTML='<span class="list-item-text">'+v+'</span><button type="button" class="list-btn-sm danger" onclick="removeListItem(this,\\''+uid+'\\')">-</button>';c.appendChild(d);sel.value='';_syncListTA(uid);}}
+      function addListItemFromInput(uid){{var inp=document.getElementById('inp_'+uid);if(!inp||!inp.value.trim())return;var v=inp.value.trim();var c=document.getElementById('items_'+uid);var d=document.createElement('div');d.className='list-item';d.setAttribute('data-list',uid);d.innerHTML='<span class="list-item-text">'+v+'</span><button type="button" class="list-btn-sm danger" onclick="removeListItem(this,\\''+uid+'\\')">-</button>';c.appendChild(d);inp.value='';_syncListTA(uid);}}
+      function _syncConnTA(){{var rows=document.querySelectorAll('#conn-tbody .conn-row');var conns=[];rows.forEach(function(r){{var c={{}};r.querySelectorAll('.conn-f').forEach(function(f){{var k=f.getAttribute('data-field');if(k==='start_date'||k==='end_date'){{if(!c.time_range)c.time_range={{}};c.time_range[k]=f.value;}}else{{c[k]=f.value;}}}});conns.push(c);}});var ta=document.getElementById('ta_conn');if(ta){{var lines=[];conns.forEach(function(c){{lines.push('- name: "'+((c.name||'').replace(/"/g,'\\\\"'))+'"\n  database_uri: "'+((c.database_uri||'').replace(/"/g,'\\\\"'))+'"\n  table_prefix: "'+((c.table_prefix||'').replace(/"/g,'\\\\"'))+'"\n  time_range:\n    start_date: "'+((c.time_range&&c.time_range.start_date)||'')+'"\n    end_date: "'+((c.time_range&&c.time_range.end_date)||'')+'"');}});ta.value=lines.length?lines.join('\n'):'[]';}}}}
+      function removeConnRow(btn){{btn.closest('tr').remove();_syncConnTA();}}
+      function addConnRow(){{var tb=document.getElementById('conn-tbody');if(!tb)return;var tr=document.createElement('tr');tr.className='conn-row';tr.innerHTML='<td><input type="text" class="conn-f" data-field="name" value="" /></td><td><input type="text" class="conn-f" data-field="database_uri" value="" /></td><td><input type="text" class="conn-f" data-field="table_prefix" value="orderbook_" /></td><td><input type="date" class="conn-f" data-field="start_date" value="" /></td><td><input type="date" class="conn-f" data-field="end_date" value="" /></td><td><button type="button" class="list-btn-sm danger" onclick="removeConnRow(this)">-</button></td>';tb.appendChild(tr);tr.querySelectorAll('.conn-f').forEach(function(f){{f.addEventListener('change',_syncConnTA);}});_syncConnTA();}}
+      document.addEventListener('change',function(e){{if(e.target.classList.contains('conn-f'))_syncConnTA();}});
+      function loadAssets(fieldKey){{fetch('/api/config/assets').then(function(r){{return r.json()}}).then(function(d){{var sel=document.getElementById('asset_sel_'+fieldKey);if(!sel)return;var cur=sel.value;var opts='';(d.assets||[]).forEach(function(a){{var s=(a===cur)?'selected':'';opts+='<option value="'+a+'" '+s+'>'+a+'</option>';}});if(opts)sel.innerHTML=opts;else sel.innerHTML='<option value="">No assets found</option>';}}).catch(function(e){{alert('Failed to load assets: '+e);}});}}
+      function loadAssetsForList(uid){{fetch('/api/config/assets').then(function(r){{return r.json()}}).then(function(d){{var sel=document.getElementById('sel_'+uid);if(!sel)return;var opts='<option value="">Add...</option>';(d.assets||[]).forEach(function(a){{opts+='<option value="'+a+'">'+a+'</option>';}});sel.innerHTML=opts;}}).catch(function(e){{alert('Failed to load assets: '+e);}});}}
+      var _nnParams={{"cnn":[{{"name":"filters","type":"number","default":"32"}},{{"name":"kernel_size","type":"text","default":"[3,3]"}},{{"name":"pool_size","type":"text","default":"[2,2]"}},{{"name":"normalization","type":"select","default":"null","options":"null,batch,group,layer"}},{{"name":"dropout","type":"number","default":"0.0"}}],"lstm":[{{"name":"units","type":"number","default":"64"}},{{"name":"dropout","type":"number","default":"0.0"}},{{"name":"recurrent_dropout","type":"number","default":"0.0"}},{{"name":"post_dropout","type":"number","default":"0.0"}}],"dense":[{{"name":"units","type":"number","default":"64"}},{{"name":"dropout","type":"number","default":"0.0"}}]}};
+      function _syncNNTA(){{var row=document.getElementById('nn-cards-row');if(!row)return;['cnn','lstm','dense'].forEach(function(lt){{var cards=row.querySelectorAll('.nn-card[data-layer-type="'+lt+'"]');var layers=[];cards.forEach(function(c){{var l={{}};c.querySelectorAll('.nn-p').forEach(function(f){{var k=f.getAttribute('data-param');var v=f.value;if(/^\\d+$/.test(v))l[k]=parseInt(v,10);else if(/^\\d+\\.\\d*$/.test(v)||/^\\d*\\.\\d+$/.test(v))l[k]=parseFloat(v);else if(v==='null')l[k]=null;else if(v.startsWith('[')){{try{{l[k]=JSON.parse(v)}}catch(e){{l[k]=v}}}}else l[k]=v;}});layers.push(l);}});var ta=document.getElementById('ta_nn_'+lt);if(ta){{try{{ta.value=JSON.stringify(layers)}}catch(e){{ta.value='[]'}}}}}});}}
+      function removeNNCard(btn){{btn.closest('.nn-card').remove();_syncNNTA();}}
+      function addNNCard(lt){{var row=document.getElementById('nn-cards-row');if(!row)return;var params=_nnParams[lt]||[];var html='';params.forEach(function(p){{if(p.type==='select'){{var opts='';p.options.split(',').forEach(function(o){{var s=(o===p.default)?'selected':'';opts+='<option value="'+o+'" '+s+'>'+o+'</option>';}});html+='<div class="nn-param"><label>'+p.name+'</label><select class="nn-p" data-param="'+p.name+'">'+opts+'</select></div>';}}else{{var it=p.type==='number'?'number':'text';var st=p.type==='number'?' step="any"':'';html+='<div class="nn-param"><label>'+p.name+'</label><input type="'+it+'"'+st+' class="nn-p" data-param="'+p.name+'" value="'+p.default+'" /></div>';}}}});var idx=row.querySelectorAll('.nn-card[data-layer-type="'+lt+'"]').length;var card=document.createElement('div');card.className='nn-card';card.setAttribute('data-layer-type',lt);card.setAttribute('data-idx',idx);card.innerHTML='<div class="nn-card-header"><span class="nn-card-type">'+lt.toUpperCase()+' '+(idx+1)+'</span><button type="button" class="list-btn-sm danger" onclick="removeNNCard(this)">-</button></div><div class="nn-card-body">'+html+'</div>';var output=row.querySelector('.nn-fixed-card.output');if(output)row.insertBefore(card,output);else row.appendChild(card);_syncNNTA();}}
+      document.addEventListener('change',function(e){{if(e.target.classList.contains('nn-p'))_syncNNTA();}});
+      document.addEventListener('DOMContentLoaded',function(){{_syncNNTA();}});
     </script>
   </body>
 </html>
@@ -1944,7 +2408,7 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
             stage = str(state.get("stage", "idle"))
             eta_display = f"{int(eta)}s" if eta is not None else "n/a"
             active_class = " active" if run_status == "running" else ""
-            stage_class = stage if stage in ("training", "snapshot_build", "evaluation") else ""
+            stage_class = stage if stage in ("training", "snapshot_build", "evaluation", "trial", "diagnostics") else ""
             body = (
                 '<div class="card-header"><h3>Progress</h3></div>'
                 '<div class="progress-wrap">'
@@ -1968,6 +2432,54 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
                     return "n/a"
 
             body = '<div class="card-header"><h3>Duty Cycle</h3></div>'
+
+            duty_history = state.get("duty_cycle_history")
+            if isinstance(duty_history, list) and duty_history:
+                res_days = self.server_state.config.duty_cycle_chart_resolution_days
+                res_seconds = max(res_days, 1) * 86400
+                bins: Dict[int, List[float]] = {}
+                for entry in duty_history:
+                    ts = entry.get("timestamp")
+                    med = entry.get("median")
+                    if ts is None or med is None:
+                        continue
+                    bucket = int(float(ts) // res_seconds)
+                    bins.setdefault(bucket, []).append(float(med))
+                if bins:
+                    sorted_buckets = sorted(bins.keys())
+                    chart_labels: List[str] = []
+                    chart_values: List[str] = []
+                    for b in sorted_buckets:
+                        ts_label = datetime.fromtimestamp(b * res_seconds).strftime("%Y-%m-%d")
+                        vals = bins[b]
+                        mean_val = sum(vals) / len(vals)
+                        chart_labels.append(ts_label)
+                        chart_values.append(f"{mean_val:.4f}")
+                    chart_id = "dutyCycleChart"
+                    body += (
+                        f'<canvas id="{chart_id}" style="width:100%;max-height:200px"></canvas>'
+                        '<script>'
+                        f'(function(){{'
+                        f'var ctx=document.getElementById("{chart_id}");'
+                        f'if(!ctx)return;'
+                        f'if(ctx._chartInstance){{ctx._chartInstance.destroy();}}'
+                        f'var isDark=document.documentElement.getAttribute("data-theme")==="dark";'
+                        f'var gridColor=isDark?"rgba(255,255,255,0.08)":"rgba(0,0,0,0.06)";'
+                        f'var tickColor=isDark?"#9499ad":"#5a6072";'
+                        f'ctx._chartInstance=new Chart(ctx,{{'
+                        f'type:"line",'
+                        f'data:{{labels:[{",".join(repr(l) for l in chart_labels)}],'
+                        f'datasets:[{{label:"Median Duty Cycle",data:[{",".join(chart_values)}],'
+                        f'borderColor:"#3b82f6",backgroundColor:"#3b82f622",tension:0.3,pointRadius:2,borderWidth:2,fill:true}}]}},'
+                        f'options:{{responsive:true,maintainAspectRatio:false,animation:false,'
+                        f'plugins:{{legend:{{display:false}}}},'
+                        f'scales:{{x:{{grid:{{color:gridColor}},ticks:{{color:tickColor,font:{{size:10}}}}}},'
+                        f'y:{{grid:{{color:gridColor}},ticks:{{color:tickColor,font:{{size:10}}}},'
+                        f'title:{{display:true,text:"Duty Cycle",color:tickColor}}}}}}}}'
+                        f'}});'
+                        f'}})()</script>'
+                    )
+
             body += f'<div class="kv"><span class="k">Min</span><span class="v">{_fmt(state.get("duty_cycle_min"))}</span></div>'
             body += f'<div class="kv"><span class="k">Median</span><span class="v">{_fmt(state.get("duty_cycle_median"))}</span></div>'
             body += f'<div class="kv"><span class="k">P95</span><span class="v">{_fmt(state.get("duty_cycle_p95"))}</span></div>'
@@ -2013,6 +2525,10 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
                 except (TypeError, ValueError):
                     heartbeat_age = None
 
+            run_stage = str(state.get("stage", "idle"))
+            is_hpo_phase = run_stage == "trial"
+            hpo_na = '<span class="muted">\u2014 (HPO phase)</span>'
+
             body = '<div class="card-header"><h3>Run Stats</h3></div>'
             body += f'<div class="kv"><span class="k">Start</span><span class="v">{_fmt_time(start_ts)}</span></div>'
             body += f'<div class="kv"><span class="k">Runtime</span><span class="v">{_fmt_duration(runtime)}</span></div>'
@@ -2021,18 +2537,23 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
                 f'<div class="kv"><span class="k">Snapshots</span>'
                 f'<span class="v">{state.get("snapshot_chunks_processed", 0)} / {state.get("snapshot_chunks_total", 0)}</span></div>'
             )
-            body += (
-                f'<div class="kv"><span class="k">Epochs</span>'
-                f'<span class="v">{state.get("training_epochs_done", 0)} / {state.get("training_epochs_total", 0)}</span></div>'
-            )
-            body += (
-                f'<div class="kv"><span class="k">Batches</span>'
-                f'<span class="v">{state.get("training_batches_done", 0)} / {state.get("training_batches_total", 0)}</span></div>'
-            )
-            body += (
-                f'<div class="kv"><span class="k">Eval</span>'
-                f'<span class="v">{state.get("eval_batches_done", 0)} / {state.get("eval_batches_total", 0)}</span></div>'
-            )
+            if is_hpo_phase:
+                body += f'<div class="kv"><span class="k">Epochs</span><span class="v">{hpo_na}</span></div>'
+                body += f'<div class="kv"><span class="k">Batches</span><span class="v">{hpo_na}</span></div>'
+                body += f'<div class="kv"><span class="k">Eval</span><span class="v">{hpo_na}</span></div>'
+            else:
+                body += (
+                    f'<div class="kv"><span class="k">Epochs</span>'
+                    f'<span class="v">{state.get("training_epochs_done", 0)} / {state.get("training_epochs_total", 0)}</span></div>'
+                )
+                body += (
+                    f'<div class="kv"><span class="k">Batches</span>'
+                    f'<span class="v">{state.get("training_batches_done", 0)} / {state.get("training_batches_total", 0)}</span></div>'
+                )
+                body += (
+                    f'<div class="kv"><span class="k">Eval</span>'
+                    f'<span class="v">{state.get("eval_batches_done", 0)} / {state.get("eval_batches_total", 0)}</span></div>'
+                )
             body += (
                 f'<div class="kv"><span class="k">HPO Trials</span>'
                 f'<span class="v">{state.get("hpo_trials_completed", 0)} / {state.get("hpo_trials_total", 0)}'
@@ -2152,19 +2673,28 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
             param_keys = sorted({k for t in trials for k in (t.get("params") or {})})
             body += '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:0.82rem">'
             body += '<thead><tr style="border-bottom:2px solid var(--border);text-align:left">'
-            body += '<th style="padding:5px 8px">#</th><th style="padding:5px 8px">Status</th><th style="padding:5px 8px">Value</th><th style="padding:5px 8px">Duration</th>'
+            body += '<th style="padding:5px 8px">#</th><th style="padding:5px 8px">Status</th><th style="padding:5px 8px">Objective Value</th><th style="padding:5px 8px">Duration</th>'
             for pk in param_keys:
                 body += f'<th style="padding:5px 8px">{_escape_text(pk)}</th>'
             body += '</tr></thead><tbody>'
 
+            run_status = str(state.get("status", "idle"))
             for t in trials:
                 number = t.get("number", "-")
                 status = str(t.get("status", "-"))
-                badge_class = status if status in ("completed", "pruned", "failed", "running") else "idle"
+                if status == "running" and run_status in ("completed", "failed"):
+                    status = "abandoned"
+                badge_class = status if status in ("completed", "pruned", "failed", "running", "abandoned") else "idle"
                 value = t.get("value")
-                value_str = f"{float(value):.5f}" if value is not None else "-"
+                if status == "running":
+                    value_str = "\u2014"
+                else:
+                    value_str = f"{float(value):.5f}" if value is not None else "-"
                 dur = t.get("duration")
-                dur_str = f"{int(dur)}s" if dur is not None else "-"
+                if status == "running":
+                    dur_str = "\u2014"
+                else:
+                    dur_str = f"{int(dur)}s" if dur is not None else "-"
                 is_best = (number == best_number and status == "completed")
                 row_style = "border-bottom:1px solid var(--border);"
                 if is_best:
@@ -2261,9 +2791,14 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
             state = load_run_state(self.server_state.config.run_state_path) or {}
             epoch_metrics = state.get("training_epoch_metrics")
             if not isinstance(epoch_metrics, list) or not epoch_metrics:
+                run_stage = str(state.get("stage", "idle"))
+                if run_stage == "trial":
+                    msg = "Training curves available after HPO completes."
+                else:
+                    msg = "No epoch data yet."
                 self._send_html(
                     '<div class="card-header"><h3>Training Curves</h3></div>'
-                    '<div class="muted" style="padding:20px 0;text-align:center">No epoch data yet.</div>'
+                    f'<div class="muted" style="padding:20px 0;text-align:center">{msg}</div>'
                 )
                 return
             epochs = [str(m.get("epoch", i + 1)) for i, m in enumerate(epoch_metrics)]
@@ -2516,6 +3051,52 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
                 "hpo_trials_pruned": state.get("hpo_trials_pruned", 0),
                 "hpo_trials_failed": state.get("hpo_trials_failed", 0),
             })
+            return
+
+        if path == "/api/config/assets":
+            qs = parse_qs(urlparse(self.path).query)
+            db_uri = qs.get("db_uri", [""])[0]
+            table_prefix = qs.get("table_prefix", ["orderbook_"])[0]
+            if not db_uri:
+                selected = self.server_state.get_selected_config_path()
+                if selected:
+                    resolved = _resolve_selected_path(selected)
+                    if resolved and resolved.exists():
+                        try:
+                            cfg_data = _load_training_config(resolved)
+                            data_cfg = cfg_data.get("data", {})
+                            conn_cfg = data_cfg.get("connection", {})
+                            db_uri = str(conn_cfg.get("database_uri", ""))
+                            table_prefix = str(conn_cfg.get("table_prefix", table_prefix))
+                        except Exception:  # noqa: BLE001
+                            pass
+            if not db_uri:
+                self._send_json({"assets": [], "error": "No database_uri available"})
+                return
+            try:
+                import requests as _requests  # type: ignore[import]
+                url = db_uri.rstrip("/") + "/v1/sql"
+                resp = _requests.post(
+                    url,
+                    data={"sql": "SHOW TABLES"},
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    timeout=(5, 10),
+                )
+                assets: List[str] = []
+                if resp.status_code == 200:
+                    result = resp.json()
+                    rows = result.get("output", [{}])[0].get("records", {}).get("rows", [])
+                    prefix_lower = table_prefix.lower()
+                    for row in rows:
+                        table_name = str(row[0]) if isinstance(row, (list, tuple)) and row else str(row)
+                        if table_name.lower().startswith(prefix_lower):
+                            asset = table_name[len(prefix_lower):].upper()
+                            if asset:
+                                assets.append(asset)
+                    assets.sort()
+                self._send_json({"assets": assets})
+            except Exception as exc:  # noqa: BLE001
+                self._send_json({"assets": [], "error": str(exc)})
             return
 
         if path == "/api/config/list":

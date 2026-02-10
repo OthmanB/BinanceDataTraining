@@ -9,6 +9,7 @@ import tempfile
 
 import numpy as np
 
+from observability.run_state import get_run_state_writer
 from training.long_term_context import load_anchor_timestamps, load_snapshot_series
 from training.snapshot_dataset import iter_snapshot_batches, prepare_snapshot_dataset
 
@@ -94,6 +95,10 @@ def run_snapshot_diagnostics(config: Dict[str, Any]) -> None:
     This keeps diagnostics useful in snapshot-only mode, where legacy in-memory
     diagnostics are not applicable.
     """
+
+    writer = get_run_state_writer()
+    if writer is not None:
+        writer.set_stage("diagnostics")
 
     diagnostics_cfg = config["diagnostics"]
     if not bool(diagnostics_cfg["enabled"]):

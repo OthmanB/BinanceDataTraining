@@ -16,6 +16,16 @@ logger = logging.getLogger(__name__)
 
 _WRITER: Optional["RunStateWriter"] = None
 
+_STAGE_ORDER: Dict[str, int] = {
+    "idle": 0,
+    "initializing": 1,
+    "diagnostics": 2,
+    "snapshot_build": 3,
+    "trial": 4,
+    "training": 5,
+    "evaluation": 6,
+}
+
 
 @dataclass
 class RunState:
@@ -59,6 +69,7 @@ class RunState:
     training_epoch_metrics: Optional[List[Dict[str, Any]]] = None
     stage_timestamps: Optional[Dict[str, float]] = None
     hpo_trial_results: Optional[List[Dict[str, Any]]] = None
+    duty_cycle_history: Optional[List[Dict[str, Any]]] = None
 
 
 class RunStateWriter:
@@ -177,8 +188,16 @@ class RunStateWriter:
             if stage not in self._state.stage_timestamps:
                 self._state.stage_timestamps[stage] = time.time()
 
+    def _is_stage_forward_locked(self, target: str) -> bool:
+        """Return True if *target* is at or ahead of the current stage (must hold _lock)."""
+        cur_order = _STAGE_ORDER.get(self._state.stage, -1)
+        tgt_order = _STAGE_ORDER.get(target, -1)
+        return tgt_order >= cur_order
+
     def set_stage(self, stage: str) -> None:
         with self._lock:
+            if not self._is_stage_forward_locked(stage):
+                return
             self._record_stage_if_new_locked(stage)
             self._state.stage = stage
             if self._state.status != "failed":
@@ -187,7 +206,7 @@ class RunStateWriter:
 
     def heartbeat(self, stage: Optional[str] = None) -> None:
         with self._lock:
-            if stage is not None:
+            if stage is not None and self._is_stage_forward_locked(stage):
                 self._record_stage_if_new_locked(stage)
                 self._state.stage = stage
             if self._state.status != "failed":
@@ -203,8 +222,9 @@ class RunStateWriter:
         failed: int = 0,
     ) -> None:
         with self._lock:
-            self._record_stage_if_new_locked("trial")
-            self._state.stage = "trial"
+            if self._is_stage_forward_locked("trial"):
+                self._record_stage_if_new_locked("trial")
+                self._state.stage = "trial"
             self._state.hpo_trials_total = max(0, int(total))
             self._state.hpo_trials_completed = max(0, int(completed))
             self._state.hpo_trials_pruned = max(0, int(pruned))
@@ -250,11 +270,14 @@ class RunStateWriter:
 
     def update_snapshot_progress(self, processed: int, total: int) -> None:
         with self._lock:
-            self._record_stage_if_new_locked("snapshot_build")
-            self._state.stage = "snapshot_build"
-            self._state.snapshot_chunks_processed = processed
-            self._state.snapshot_chunks_total = total
-            self._update_progress_locked(processed, total)
+            if self._is_stage_forward_locked("snapshot_build"):
+                self._record_stage_if_new_locked("snapshot_build")
+                self._state.stage = "snapshot_build"
+                self._state.snapshot_chunks_processed = processed
+                self._state.snapshot_chunks_total = total
+                self._update_progress_locked(processed, total)
+            else:
+                self._touch_locked()
 
     def update_training_progress(
         self,
@@ -264,8 +287,9 @@ class RunStateWriter:
         batches_total: int,
     ) -> None:
         with self._lock:
-            self._record_stage_if_new_locked("training")
-            self._state.stage = "training"
+            if self._is_stage_forward_locked("training"):
+                self._record_stage_if_new_locked("training")
+                self._state.stage = "training"
             self._state.training_epochs_done = epochs_done
             self._state.training_epochs_total = epochs_total
             self._state.training_batches_done = batches_done
@@ -280,17 +304,28 @@ class RunStateWriter:
 
     def update_eval_progress(self, processed: int, total: int) -> None:
         with self._lock:
-            self._record_stage_if_new_locked("evaluation")
-            self._state.stage = "evaluation"
+            if self._is_stage_forward_locked("evaluation"):
+                self._record_stage_if_new_locked("evaluation")
+                self._state.stage = "evaluation"
             self._state.eval_batches_done = processed
             self._state.eval_batches_total = total
             self._update_progress_locked(processed, total)
+
+    _DUTY_CYCLE_HISTORY_CAP = 10000
 
     def update_duty_cycle_stats(self, minimum: float, median: float, p95: float) -> None:
         with self._lock:
             self._state.duty_cycle_min = float(minimum)
             self._state.duty_cycle_median = float(median)
             self._state.duty_cycle_p95 = float(p95)
+            if self._state.duty_cycle_history is None:
+                self._state.duty_cycle_history = []
+            self._state.duty_cycle_history.append({
+                "timestamp": time.time(),
+                "median": float(median),
+            })
+            if len(self._state.duty_cycle_history) > self._DUTY_CYCLE_HISTORY_CAP:
+                self._state.duty_cycle_history = self._state.duty_cycle_history[-self._DUTY_CYCLE_HISTORY_CAP:]
             self._touch_locked()
 
     def update_epoch_metrics(self, epoch: int, metrics: Dict[str, Any]) -> None:
