@@ -64,9 +64,6 @@ def _snapshot_config_subset(config: Dict[str, Any]) -> Dict[str, Any]:
         "model": {
             "architecture": model_cfg["architecture"],
             "input_representation": model_cfg["input_representation"],
-            "cnn": {
-                "layers": model_cfg["cnn"]["layers"],
-            },
             "output": model_cfg["output"],
         },
     }
