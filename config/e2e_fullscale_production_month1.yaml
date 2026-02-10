@@ -22,7 +22,7 @@ model:
     windows_days: [3, 7]
 
 training:
-  epochs: 20
+  epochs: 10
   batch_size: 12
   debug_max_samples: 100000000
   runtime:
@@ -54,7 +54,7 @@ training:
 hyperparameter_optimization:
   enabled: true
   framework: "optuna"
-  n_trials: 10
+  n_trials: 6
   direction: "minimize"
   metric: "loss"
   trial_model_logging:
@@ -68,9 +68,9 @@ hyperparameter_optimization:
   regime:
     enabled: true
     retry_on_oom: true
-    max_retry_attempts: 4
+    max_retry_attempts: 2
     batch_backoff_factor: 0.6
-    min_batch_size: 8
+    min_batch_size: 4
     failure_policy: "prune"
     failure_penalty_value: 1000000.0
     max_vram_fraction: 0.93

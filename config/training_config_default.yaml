@@ -219,7 +219,6 @@ model:  # Defines the neural network architecture and its compilation settings.
         dropout: 0.3              # Keras LSTM input dropout.
         recurrent_dropout: 0.0    # Recurrent dropout; keep 0.0 for cuDNN acceleration.
         post_dropout: 0.2         # Standalone Dropout layer after this LSTM; 0.0 to skip.
-    layers:                       # Per-layer configuration; supports stacked LSTMs.
       - units: 128                 # Number of hidden units in this LSTM layer.
         dropout: 0.3              # Keras LSTM input dropout.
         recurrent_dropout: 0.0    # Recurrent dropout; keep 0.0 for cuDNN acceleration.
