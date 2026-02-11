@@ -29,6 +29,7 @@ from .snapshot_dataset import (
     build_training_generator,
     compute_label_distribution,
     compute_normalization_stats,
+    get_chunk_x_shape,
     get_mask_channel_info,
     load_label_stats_from_manifest,
     load_normalization_stats,
@@ -481,8 +482,7 @@ def _fit_snapshot_model_once(
         return model, 0, None, 0.0
 
     first_chunk = snapshot_dataset.chunks[0]
-    with np.load(first_chunk.file_path, mmap_mode="r") as npz:
-        x_shape = npz["x"].shape
+    x_shape = get_chunk_x_shape(first_chunk)
     if len(x_shape) != 5:
         raise ValueError("Snapshot input tensors must have rank 5")
     input_shape = tuple(int(d) for d in x_shape[1:])
@@ -1008,8 +1008,7 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
         return None
 
     first_chunk = snapshot_dataset.chunks[0]
-    with np.load(first_chunk.file_path, mmap_mode="r") as npz:
-        x_shape = npz["x"].shape
+    x_shape = get_chunk_x_shape(first_chunk)
     if len(x_shape) != 5:
         raise ValueError("Snapshot input tensors must have rank 5")
     input_shape = tuple(int(d) for d in x_shape[1:])

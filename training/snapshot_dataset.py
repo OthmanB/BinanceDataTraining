@@ -33,6 +33,10 @@ from .snapshot_store import (
 logger = logging.getLogger(__name__)
 
 
+CHUNK_STORAGE_NPZ = "npz"
+CHUNK_STORAGE_NPY_SHARDS_V1 = "npy_shards_v1"
+
+
 @dataclass(frozen=True)
 class SnapshotChunk:
     """Chunk metadata for a snapshot dataset."""
@@ -42,6 +46,8 @@ class SnapshotChunk:
     file_path: str
     num_samples: int
     start_index: int
+    storage_format: str = CHUNK_STORAGE_NPZ
+    array_paths: Optional[Dict[str, str]] = None
 
 
 @dataclass(frozen=True)
@@ -556,15 +562,18 @@ def load_snapshot_dataset(context: SnapshotContext, config: Dict[str, Any]) -> S
 
     chunks_meta = []
     for entry in manifest.get("chunks", []) or []:
-        file_path = os.path.join(context.snapshot_dir, entry["file"])
-        if not os.path.exists(file_path):
+        resolved = _resolve_chunk_paths_from_entry(context, entry)
+        if resolved is None:
             continue
+        file_path, array_paths, storage_format = resolved
         chunks_meta.append(
             {
                 "start": entry["start"],
                 "end": entry["end"],
                 "file": file_path,
                 "num_samples": int(entry["num_samples"]),
+                "format": storage_format,
+                "array_paths": array_paths,
             }
         )
 
@@ -579,6 +588,8 @@ def load_snapshot_dataset(context: SnapshotContext, config: Dict[str, Any]) -> S
                 file_path=entry["file"],
                 num_samples=entry["num_samples"],
                 start_index=start_idx,
+                storage_format=str(entry.get("format") or CHUNK_STORAGE_NPZ),
+                array_paths=entry.get("array_paths"),
             )
         )
         start_idx += entry["num_samples"]
@@ -590,6 +601,100 @@ def load_snapshot_dataset(context: SnapshotContext, config: Dict[str, Any]) -> S
         total_samples=start_idx,
         config_hash=context.config_hash,
     )
+
+
+def _resolve_chunk_paths_from_entry(
+    context: SnapshotContext,
+    entry: Dict[str, Any],
+) -> Optional[Tuple[str, Optional[Dict[str, str]], str]]:
+    storage_format = str(entry.get("format") or CHUNK_STORAGE_NPZ)
+
+    if storage_format == CHUNK_STORAGE_NPZ:
+        file_rel = entry.get("file")
+        if not file_rel:
+            return None
+        file_path = os.path.join(context.snapshot_dir, file_rel)
+        if not os.path.exists(file_path):
+            return None
+        return file_path, None, storage_format
+
+    if storage_format == CHUNK_STORAGE_NPY_SHARDS_V1:
+        files_meta = entry.get("files")
+        if not isinstance(files_meta, dict):
+            return None
+
+        required = ["x", "y_up", "y_down", "anchor_ts", "duty_cycle"]
+        resolved_paths: Dict[str, str] = {}
+        for key in required:
+            rel = files_meta.get(key)
+            if not isinstance(rel, str) or not rel:
+                return None
+            abs_path = os.path.join(context.snapshot_dir, rel)
+            if not os.path.exists(abs_path):
+                return None
+            resolved_paths[key] = abs_path
+
+        file_path = resolved_paths["x"]
+        return file_path, resolved_paths, storage_format
+
+    logger.warning("Unsupported snapshot chunk storage format in manifest: %s", storage_format)
+    return None
+
+
+def _slice_chunk_arrays(
+    chunk: SnapshotChunk,
+    local_start: int,
+    local_end: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if chunk.storage_format == CHUNK_STORAGE_NPY_SHARDS_V1:
+        if chunk.array_paths is None:
+            raise ConfigError("Snapshot chunk array_paths are required for npy_shards_v1 format")
+        x = np.load(chunk.array_paths["x"], mmap_mode="r")[local_start:local_end]
+        y_up = np.load(chunk.array_paths["y_up"], mmap_mode="r")[local_start:local_end]
+        y_down = np.load(chunk.array_paths["y_down"], mmap_mode="r")[local_start:local_end]
+        anchor_ts = np.load(chunk.array_paths["anchor_ts"], mmap_mode="r")[local_start:local_end]
+        duty_cycle = np.load(chunk.array_paths["duty_cycle"], mmap_mode="r")[local_start:local_end]
+        return (
+            np.asarray(x),
+            np.asarray(y_up),
+            np.asarray(y_down),
+            np.asarray(anchor_ts),
+            np.asarray(duty_cycle),
+        )
+
+    with np.load(chunk.file_path) as npz:
+        x = npz["x"][local_start:local_end]
+        y_up = npz["y_up"][local_start:local_end]
+        y_down = npz["y_down"][local_start:local_end]
+        anchor_ts = npz["anchor_ts"][local_start:local_end]
+        if "duty_cycle" not in npz:
+            raise ConfigError(
+                "Snapshot chunk missing duty_cycle. Rebuild snapshot dataset to enable duty-cycle weighting."
+            )
+        duty_cycle = npz["duty_cycle"][local_start:local_end]
+    return x, y_up, y_down, anchor_ts, duty_cycle
+
+
+def load_chunk_anchor_timestamps(chunk: SnapshotChunk) -> np.ndarray:
+    """Load anchor timestamps for a chunk across storage formats."""
+    if chunk.storage_format == CHUNK_STORAGE_NPY_SHARDS_V1:
+        if chunk.array_paths is None:
+            raise ConfigError("Snapshot chunk array_paths are required for npy_shards_v1 format")
+        return np.asarray(np.load(chunk.array_paths["anchor_ts"], mmap_mode="r"), dtype="int64")
+
+    with np.load(chunk.file_path) as npz:
+        return np.asarray(npz["anchor_ts"], dtype="int64")
+
+
+def get_chunk_x_shape(chunk: SnapshotChunk) -> Tuple[int, ...]:
+    """Return chunk x tensor shape without loading all chunk data."""
+    if chunk.storage_format == CHUNK_STORAGE_NPY_SHARDS_V1:
+        if chunk.array_paths is None:
+            raise ConfigError("Snapshot chunk array_paths are required for npy_shards_v1 format")
+        return tuple(int(v) for v in np.load(chunk.array_paths["x"], mmap_mode="r").shape)
+
+    with np.load(chunk.file_path, mmap_mode="r") as npz:
+        return tuple(int(v) for v in npz["x"].shape)
 
 
 def iter_snapshot_batches(
@@ -618,16 +723,7 @@ def iter_snapshot_batches(
         if local_end <= local_start:
             continue
 
-        with np.load(chunk.file_path) as npz:
-            x = npz["x"][local_start:local_end]
-            y_up = npz["y_up"][local_start:local_end]
-            y_down = npz["y_down"][local_start:local_end]
-            anchor_ts = npz["anchor_ts"][local_start:local_end]
-            if "duty_cycle" not in npz:
-                raise ConfigError(
-                    "Snapshot chunk missing duty_cycle. Rebuild snapshot dataset to enable duty-cycle weighting."
-                )
-            duty_cycle = npz["duty_cycle"][local_start:local_end]
+        x, y_up, y_down, anchor_ts, duty_cycle = _slice_chunk_arrays(chunk, local_start, local_end)
 
         if duty_cycle.shape[0] != x.shape[0]:
             raise ConfigError(
@@ -1768,16 +1864,28 @@ def _build_snapshot_chunks(
         if boundary["cached"]:
             key = (boundary["start_str"], boundary["end_str"])
             entry = existing_entries.get(key, {})
-            file_rel = entry.get("file")
-            if file_rel:
-                file_path = os.path.join(context.snapshot_dir, file_rel)
-                try:
-                    with np.load(file_path) as npz:
-                        if "duty_cycle" in npz:
-                            duty_cycle_stats.add_values(npz["duty_cycle"])
-                            _update_duty_cycle_writer()
-                except Exception:  # noqa: BLE001
-                    logger.warning("Failed to load duty_cycle from cached chunk: %s", file_path)
+            try:
+                resolved = _resolve_chunk_paths_from_entry(context, entry)
+                if resolved is not None:
+                    file_path, array_paths, storage_format = resolved
+                    chunk_for_stats = SnapshotChunk(
+                        start=str(entry.get("start") or ""),
+                        end=str(entry.get("end") or ""),
+                        file_path=file_path,
+                        num_samples=int(entry.get("num_samples") or 0),
+                        start_index=0,
+                        storage_format=storage_format,
+                        array_paths=array_paths,
+                    )
+                    _, _, _, _, duty_cycle = _slice_chunk_arrays(
+                        chunk_for_stats,
+                        0,
+                        max(0, chunk_for_stats.num_samples),
+                    )
+                    duty_cycle_stats.add_values(duty_cycle)
+                    _update_duty_cycle_writer()
+            except Exception:  # noqa: BLE001
+                logger.warning("Failed to load duty_cycle from cached chunk for %s", key, exc_info=True)
             chunk_samples = []
             chunks_processed += 1
             if writer is not None:
@@ -1799,9 +1907,10 @@ def _build_snapshot_chunks(
 
         chunk_start = boundary["start_str"]
         chunk_end = boundary["end_str"]
-        filename = _chunk_filename(chunk_start, chunk_end)
-        file_rel = os.path.join("chunks", filename)
-        file_path = os.path.join(context.snapshot_dir, file_rel)
+        chunk_stem = _chunk_storage_stem(chunk_start, chunk_end)
+        chunk_dir_rel = os.path.join("chunks", chunk_stem)
+        chunk_dir = os.path.join(context.snapshot_dir, chunk_dir_rel)
+        os.makedirs(chunk_dir, exist_ok=True)
 
         x = np.stack([s.x for s in chunk_samples]).astype("float32")
         y_up = np.asarray([s.y_up for s in chunk_samples], dtype="int64")
@@ -1812,19 +1921,25 @@ def _build_snapshot_chunks(
         duty_cycle_stats.add_values(duty_cycle)
         _update_duty_cycle_writer()
 
-        np.savez_compressed(
-            file_path,
-            x=x,
-            y_up=y_up,
-            y_down=y_down,
-            anchor_ts=anchor_ts,
-            duty_cycle=duty_cycle,
-        )
+        files_rel = {
+            "x": os.path.join(chunk_dir_rel, "x.npy"),
+            "y_up": os.path.join(chunk_dir_rel, "y_up.npy"),
+            "y_down": os.path.join(chunk_dir_rel, "y_down.npy"),
+            "anchor_ts": os.path.join(chunk_dir_rel, "anchor_ts.npy"),
+            "duty_cycle": os.path.join(chunk_dir_rel, "duty_cycle.npy"),
+        }
+        np.save(os.path.join(context.snapshot_dir, files_rel["x"]), x, allow_pickle=False)
+        np.save(os.path.join(context.snapshot_dir, files_rel["y_up"]), y_up, allow_pickle=False)
+        np.save(os.path.join(context.snapshot_dir, files_rel["y_down"]), y_down, allow_pickle=False)
+        np.save(os.path.join(context.snapshot_dir, files_rel["anchor_ts"]), anchor_ts, allow_pickle=False)
+        np.save(os.path.join(context.snapshot_dir, files_rel["duty_cycle"]), duty_cycle, allow_pickle=False)
 
         entry = {
             "start": chunk_start,
             "end": chunk_end,
-            "file": file_rel,
+            "format": CHUNK_STORAGE_NPY_SHARDS_V1,
+            "file": files_rel["x"],
+            "files": files_rel,
             "num_samples": int(x.shape[0]),
             "created_at": datetime.utcnow().isoformat() + "Z",
         }
@@ -2004,11 +2119,9 @@ def _existing_chunk_entries(context: SnapshotContext, manifest: Dict[str, Any]) 
     for entry in manifest.get("chunks", []) or []:
         start = entry.get("start")
         end = entry.get("end")
-        file_rel = entry.get("file")
-        if not start or not end or not file_rel:
+        if not start or not end:
             continue
-        file_path = os.path.join(context.snapshot_dir, file_rel)
-        if not os.path.exists(file_path):
+        if _resolve_chunk_paths_from_entry(context, entry) is None:
             continue
         existing[(start, end)] = entry
     return existing
@@ -2036,6 +2149,12 @@ def _chunk_filename(start_str: str, end_str: str) -> str:
     safe_start = start_str.replace(" ", "_").replace(":", "-")
     safe_end = end_str.replace(" ", "_").replace(":", "-")
     return f"{safe_start}_{safe_end}.npz"
+
+
+def _chunk_storage_stem(start_str: str, end_str: str) -> str:
+    filename = _chunk_filename(start_str, end_str)
+    stem, _ = os.path.splitext(filename)
+    return stem
 
 
 def _upsert_chunk_entry(manifest: Dict[str, Any], entry: Dict[str, Any]) -> None:
@@ -2490,6 +2609,8 @@ def _interpolate_depth(
 
 
 __all__ = [
+    "CHUNK_STORAGE_NPY_SHARDS_V1",
+    "CHUNK_STORAGE_NPZ",
     "LabelDistribution",
     "NormalizationStats",
     "SnapshotChunk",
@@ -2497,8 +2618,10 @@ __all__ = [
     "build_training_generator",
     "compute_label_distribution",
     "compute_normalization_stats",
+    "get_chunk_x_shape",
     "get_mask_channel_info",
     "iter_snapshot_batches",
+    "load_chunk_anchor_timestamps",
     "load_label_stats_from_manifest",
     "load_normalization_stats",
     "load_snapshot_dataset",

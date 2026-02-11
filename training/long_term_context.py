@@ -30,6 +30,7 @@ import os
 
 import numpy as np
 
+from .snapshot_dataset import load_chunk_anchor_timestamps
 from utils.config_loader import ConfigError
 
 
@@ -99,8 +100,7 @@ def _load_anchor_timestamps(snapshot_dataset: Any) -> np.ndarray:
 
     anchor_list = []
     for chunk in snapshot_dataset.chunks:
-        with np.load(chunk.file_path) as npz:
-            anchor_ts = np.asarray(npz["anchor_ts"], dtype="int64")
+        anchor_ts = load_chunk_anchor_timestamps(chunk)
         if anchor_ts.ndim != 1:
             raise ConfigError("Anchor timestamps array must be 1D")
         anchor_list.append(anchor_ts)
