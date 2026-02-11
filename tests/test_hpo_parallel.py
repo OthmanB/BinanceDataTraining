@@ -15,8 +15,10 @@ from models.hyperparameter_tuning import (
     _apply_worker_runtime_environment,
     _compute_next_batch_size,
     _compute_safe_batch_cap_from_memory,
+    _extract_trial_details,
     _evaluate_trial_objective,
     _is_resource_exhaustion_error,
+    _record_trial_phase_memory_event,
     _select_wave_resources,
     _should_trigger_rss_watchdog,
     _resolve_failure_objective_value,
@@ -309,6 +311,83 @@ class TestHPOParallelHelpers(unittest.TestCase):
         self.assertEqual(trial_cap, 2)
         self.assertEqual(stable_waves, 0)
 
+    def test_record_trial_phase_memory_event_tracks_max_per_phase(self) -> None:
+        trial = types.SimpleNamespace(user_attrs={})
+
+        def _set_user_attr(key: str, value: object) -> None:
+            trial.user_attrs[key] = value
+
+        trial.set_user_attr = _set_user_attr
+
+        with mock.patch("models.hyperparameter_tuning._read_process_rss_bytes", side_effect=[1024, 512, 2048]):
+            with mock.patch("models.hyperparameter_tuning.time.time", side_effect=[10.0, 11.0, 12.0]):
+                _record_trial_phase_memory_event(
+                    trial,
+                    phase="after_snapshot_load",
+                    resource="gpu:0",
+                    details={"n_samples": 100},
+                )
+                _record_trial_phase_memory_event(
+                    trial,
+                    phase="after_snapshot_load",
+                    resource="gpu:0",
+                    details={"n_samples": 100},
+                )
+                _record_trial_phase_memory_event(
+                    trial,
+                    phase="after_normalization_stats",
+                    resource="gpu:0",
+                    details={"val_count": 20},
+                )
+
+        events = trial.user_attrs.get("phase_memory_events")
+        self.assertIsInstance(events, list)
+        assert isinstance(events, list)
+        self.assertEqual(len(events), 3)
+        self.assertEqual(events[0].get("phase"), "after_snapshot_load")
+        self.assertEqual(events[2].get("phase"), "after_normalization_stats")
+
+        max_by_phase = trial.user_attrs.get("phase_memory_max_by_phase")
+        self.assertIsInstance(max_by_phase, dict)
+        assert isinstance(max_by_phase, dict)
+        self.assertEqual(int(float(max_by_phase["after_snapshot_load"])), 1024)
+        self.assertEqual(int(float(max_by_phase["after_normalization_stats"])), 2048)
+
+    def test_extract_trial_details_includes_phase_memory_fields(self) -> None:
+        trial = types.SimpleNamespace(
+            state=types.SimpleNamespace(name="COMPLETE"),
+            number=3,
+            value=0.5,
+            params={"batch_size": 16},
+            datetime_start=None,
+            datetime_complete=None,
+            user_attrs={
+                "phase_memory_events": [
+                    {
+                        "phase": "after_snapshot_load",
+                        "rss_bytes": 1024,
+                        "timestamp": 100.0,
+                    }
+                ],
+                "phase_memory_max_by_phase": {
+                    "after_snapshot_load": 1024,
+                },
+            },
+        )
+        study = types.SimpleNamespace(trials=[trial])
+
+        details = _extract_trial_details(study)
+
+        self.assertEqual(len(details), 1)
+        entry = details[0]
+        self.assertIn("phase_memory_events", entry)
+        self.assertIn("phase_memory_max_by_phase", entry)
+        events = entry["phase_memory_events"]
+        self.assertIsInstance(events, list)
+        self.assertEqual(events[0].get("phase"), "after_snapshot_load")
+        max_by_phase = entry["phase_memory_max_by_phase"]
+        self.assertEqual(int(float(max_by_phase["after_snapshot_load"])), 1024)
+
     def test_resolve_worker_runtime_options_parses_explicit_values(self) -> None:
         runtime_cfg = {
             "gpu_memory_growth": True,
@@ -529,6 +608,9 @@ class TestHPOParallelHelpers(unittest.TestCase):
         }
 
         def _run_training_pipeline(cfg: dict, _data_obj: object) -> None:
+            phase_probe = cfg.get("_hpo_phase_memory_probe")
+            if callable(phase_probe):
+                phase_probe("after_snapshot_load", {"n_samples": 321})
             captured["trial_config"] = copy.deepcopy(cfg)
             cfg["_hpo_last_metric"] = 0.321
 
@@ -560,6 +642,10 @@ class TestHPOParallelHelpers(unittest.TestCase):
         self.assertIn("attempt=0", namespace)
         self.assertIn("resource=gpu:0", namespace)
         self.assertEqual(trial.user_attrs.get("sequential_resume_namespace"), namespace)
+        phase_max = trial.user_attrs.get("phase_memory_max_by_phase")
+        self.assertIsInstance(phase_max, dict)
+        assert isinstance(phase_max, dict)
+        self.assertIn("after_snapshot_load", phase_max)
 
     def test_evaluate_trial_objective_calls_cleanup_on_success(self) -> None:
         trial = types.SimpleNamespace(number=1, user_attrs={})

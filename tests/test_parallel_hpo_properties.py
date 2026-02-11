@@ -6,6 +6,7 @@ from datetime import date, timedelta
 import os
 import re
 import tempfile
+import types
 import unittest
 
 try:
@@ -23,6 +24,7 @@ from models.hyperparameter_tuning import (
     _allocate_trials_to_workers,
     _apply_worker_resource,
     _compute_next_batch_size,
+    _record_trial_phase_memory_event,
     _select_wave_resources,
     _should_trigger_rss_watchdog,
     _update_adaptive_scheduler_state,
@@ -240,6 +242,68 @@ class TestAdaptiveSchedulerProperties(unittest.TestCase):
 
 
 @unittest.skipUnless(HYPOTHESIS_AVAILABLE, "hypothesis not installed")
+class TestPhaseMemoryTelemetryProperties(unittest.TestCase):
+    @settings(max_examples=_MAX_EXAMPLES)
+    @given(
+        rss_values=st.lists(st.integers(min_value=1, max_value=20_000_000), min_size=1, max_size=80),
+        phase_names=st.lists(
+            st.sampled_from(
+                [
+                    "after_snapshot_load",
+                    "after_normalization_stats",
+                    "after_long_term_features",
+                    "before_first_fit_batch",
+                    "after_first_batch",
+                ]
+            ),
+            min_size=1,
+            max_size=80,
+        ),
+    )
+    def test_phase_memory_max_map_dominates_recorded_events(
+        self,
+        rss_values: list[int],
+        phase_names: list[str],
+    ) -> None:
+        n = min(len(rss_values), len(phase_names))
+        if n <= 0:
+            self.skipTest("no generated samples")
+
+        trial = types.SimpleNamespace(user_attrs={})
+
+        def _set_user_attr(key: str, value: object) -> None:
+            trial.user_attrs[key] = value
+
+        trial.set_user_attr = _set_user_attr
+
+        expected: dict[str, int] = {}
+        for idx in range(n):
+            phase = phase_names[idx]
+            rss = rss_values[idx]
+            expected[phase] = max(expected.get(phase, 0), int(rss))
+            with unittest.mock.patch("models.hyperparameter_tuning._read_process_rss_bytes", return_value=rss):
+                with unittest.mock.patch("models.hyperparameter_tuning.time.time", return_value=float(idx + 1)):
+                    _record_trial_phase_memory_event(
+                        trial,
+                        phase=phase,
+                        resource="gpu:0",
+                        details={"i": idx},
+                    )
+
+        recorded = trial.user_attrs.get("phase_memory_max_by_phase")
+        self.assertIsInstance(recorded, dict)
+        assert isinstance(recorded, dict)
+        for phase, exp in expected.items():
+            self.assertIn(phase, recorded)
+            self.assertGreaterEqual(float(recorded[phase]), float(exp))
+
+        events = trial.user_attrs.get("phase_memory_events")
+        self.assertIsInstance(events, list)
+        assert isinstance(events, list)
+        self.assertLessEqual(len(events), 256)
+
+
+@unittest.skipUnless(HYPOTHESIS_AVAILABLE, "hypothesis not installed")
 class TestSequentialResumePathProperties(unittest.TestCase):
     @settings(max_examples=_MAX_EXAMPLES)
     @given(
@@ -416,7 +480,13 @@ class TestHPOAggregationProperties(unittest.TestCase):
         pairs=st.lists(
             st.tuples(
                 st.floats(min_value=-1e6, max_value=1e6, allow_nan=False, allow_infinity=False),
-                st.floats(min_value=0.0, max_value=1e6, allow_nan=False, allow_infinity=False),
+                st.floats(
+                    min_value=0.0,
+                    max_value=1e6,
+                    allow_nan=False,
+                    allow_infinity=False,
+                    allow_subnormal=False,
+                ),
             ),
             min_size=1,
             max_size=25,

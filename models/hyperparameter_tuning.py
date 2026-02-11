@@ -24,6 +24,12 @@ from utils.config_loader import ConfigError
 logger = logging.getLogger(__name__)
 
 
+_PHASE_MEMORY_EVENTS_ATTR = "phase_memory_events"
+_PHASE_MEMORY_MAX_BY_PHASE_ATTR = "phase_memory_max_by_phase"
+_PHASE_MEMORY_EVENTS_LIMIT = 256
+_PHASE_MEMORY_EXPORT_LIMIT = 64
+
+
 def _summarize_trial_states(study: Any) -> Dict[str, int]:
     counts = {
         "completed": 0,
@@ -68,6 +74,115 @@ def _format_search_space_guidance(search_space: Dict[str, Any]) -> str:
     return "\n".join(guidance_lines)
 
 
+def _normalize_phase_memory_events(raw_events: Any, *, limit: int) -> List[Dict[str, Any]]:
+    events: List[Dict[str, Any]] = []
+    if not isinstance(raw_events, list):
+        return events
+
+    for item in raw_events[-max(0, int(limit)) :]:
+        if not isinstance(item, dict):
+            continue
+        phase = str(item.get("phase") or "").strip()
+        if not phase:
+            continue
+
+        normalized: Dict[str, Any] = {"phase": phase}
+
+        timestamp_value = item.get("timestamp")
+        try:
+            if timestamp_value is not None:
+                normalized["timestamp"] = float(timestamp_value)
+        except (TypeError, ValueError):
+            pass
+
+        rss_value = item.get("rss_bytes")
+        try:
+            if rss_value is not None:
+                normalized["rss_bytes"] = float(rss_value)
+        except (TypeError, ValueError):
+            pass
+
+        resource_value = item.get("resource")
+        if resource_value is not None:
+            normalized["resource"] = str(resource_value)
+
+        details_value = item.get("details")
+        if isinstance(details_value, dict):
+            details: Dict[str, Any] = {}
+            for key, value in details_value.items():
+                if isinstance(value, (str, int, float, bool)) or value is None:
+                    details[str(key)] = value
+            if details:
+                normalized["details"] = details
+
+        events.append(normalized)
+
+    return events
+
+
+def _normalize_phase_memory_max(raw_max: Any) -> Dict[str, float]:
+    max_by_phase: Dict[str, float] = {}
+    if not isinstance(raw_max, dict):
+        return max_by_phase
+
+    for key, value in raw_max.items():
+        phase = str(key).strip()
+        if not phase:
+            continue
+        try:
+            rss_bytes = float(value)
+        except (TypeError, ValueError):
+            continue
+        if rss_bytes <= 0:
+            continue
+        max_by_phase[phase] = rss_bytes
+
+    return max_by_phase
+
+
+def _record_trial_phase_memory_event(
+    trial: Any,
+    *,
+    phase: str,
+    resource: Optional[str],
+    details: Optional[Dict[str, Any]] = None,
+) -> None:
+    phase_name = str(phase).strip()
+    if not phase_name or not hasattr(trial, "set_user_attr"):
+        return
+
+    rss_bytes = _read_process_rss_bytes(os.getpid())
+    event: Dict[str, Any] = {
+        "phase": phase_name,
+        "timestamp": float(time.time()),
+    }
+    if rss_bytes is not None and rss_bytes > 0:
+        event["rss_bytes"] = float(rss_bytes)
+    if resource is not None:
+        event["resource"] = str(resource)
+    if isinstance(details, dict):
+        sanitized_details: Dict[str, Any] = {}
+        for key, value in details.items():
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                sanitized_details[str(key)] = value
+        if sanitized_details:
+            event["details"] = sanitized_details
+
+    existing_events = _normalize_phase_memory_events(
+        getattr(trial, "user_attrs", {}).get(_PHASE_MEMORY_EVENTS_ATTR),
+        limit=max(0, _PHASE_MEMORY_EVENTS_LIMIT - 1),
+    )
+    existing_events.append(event)
+    trial.set_user_attr(_PHASE_MEMORY_EVENTS_ATTR, existing_events[-_PHASE_MEMORY_EVENTS_LIMIT:])
+
+    max_by_phase = _normalize_phase_memory_max(getattr(trial, "user_attrs", {}).get(_PHASE_MEMORY_MAX_BY_PHASE_ATTR))
+    if rss_bytes is not None and rss_bytes > 0:
+        current_max = max_by_phase.get(phase_name)
+        if current_max is None or float(rss_bytes) > float(current_max):
+            max_by_phase[phase_name] = float(rss_bytes)
+    trial.set_user_attr(_PHASE_MEMORY_MAX_BY_PHASE_ATTR, max_by_phase)
+
+
 def _extract_trial_details(study: Any, *, max_trials: int = 200) -> List[Dict[str, Any]]:
     """Extract per-trial details from an Optuna study for observability."""
     results: List[Dict[str, Any]] = []
@@ -93,6 +208,20 @@ def _extract_trial_details(study: Any, *, max_trials: int = 200) -> List[Dict[st
             "duration": duration,
             "params": dict(trial.params) if trial.params else {},
         }
+
+        user_attrs = getattr(trial, "user_attrs", {})
+        if isinstance(user_attrs, dict):
+            phase_events = _normalize_phase_memory_events(
+                user_attrs.get(_PHASE_MEMORY_EVENTS_ATTR),
+                limit=_PHASE_MEMORY_EXPORT_LIMIT,
+            )
+            if phase_events:
+                entry[_PHASE_MEMORY_EVENTS_ATTR] = phase_events
+
+            phase_max = _normalize_phase_memory_max(user_attrs.get(_PHASE_MEMORY_MAX_BY_PHASE_ATTR))
+            if phase_max:
+                entry[_PHASE_MEMORY_MAX_BY_PHASE_ATTR] = phase_max
+
         results.append(entry)
     return results
 
@@ -1095,6 +1224,24 @@ def _evaluate_trial_objective(
         trial_config = _apply_hyperparameters(base_config, params_for_attempt)
         if resource is not None:
             trial_config = _apply_worker_resource(trial_config, resource)
+
+        def _phase_memory_probe(phase: str, details: Optional[Dict[str, Any]] = None) -> None:
+            payload: Dict[str, Any] = {
+                "attempt": int(attempt),
+                "batch_size": int(active_batch_size),
+            }
+            if isinstance(details, dict):
+                for key, value in details.items():
+                    if isinstance(value, (str, int, float, bool)) or value is None:
+                        payload[str(key)] = value
+            _record_trial_phase_memory_event(
+                trial,
+                phase=phase,
+                resource=resource,
+                details=payload,
+            )
+
+        trial_config["_hpo_phase_memory_probe"] = _phase_memory_probe
 
         resume_namespace = _apply_hpo_resume_namespace(
             trial_config,

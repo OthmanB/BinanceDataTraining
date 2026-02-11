@@ -4,7 +4,7 @@ Builds training datasets from snapshots, trains models, and logs metrics and
 artifacts to MLflow when configured.
 """
 
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 from datetime import datetime, timedelta
 import contextlib
 import copy
@@ -53,6 +53,63 @@ from .long_term_context import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _emit_hpo_phase_memory_probe(
+    config: Dict[str, Any],
+    phase: str,
+    details: Optional[Dict[str, Any]] = None,
+) -> None:
+    probe = config.get("_hpo_phase_memory_probe")
+    if not callable(probe):
+        return
+
+    payload: Dict[str, Any] = {}
+    if isinstance(details, dict):
+        for key, value in details.items():
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                payload[str(key)] = value
+
+    try:
+        if payload:
+            probe(str(phase), payload)
+        else:
+            probe(str(phase), None)
+    except Exception:  # noqa: BLE001
+        logger.warning("Failed to publish HPO phase memory probe for phase=%s", phase, exc_info=True)
+
+
+def _create_first_batch_probe_callback(config: Dict[str, Any]) -> Optional[Any]:
+    probe = config.get("_hpo_phase_memory_probe")
+    if not callable(probe):
+        return None
+
+    try:
+        from tensorflow import keras  # type: ignore[import]
+    except Exception:  # noqa: BLE001
+        return None
+
+    class _FirstBatchProbeCallback(keras.callbacks.Callback):
+        def __init__(self, callback: Callable[[str, Optional[Dict[str, Any]]], Any]) -> None:
+            super().__init__()
+            self._callback = callback
+            self._emitted = False
+
+        def on_batch_end(self, batch: int, logs: Optional[Any] = None) -> None:
+            if self._emitted:
+                return
+            self._emitted = True
+            details: Dict[str, Any] = {"batch_index": int(batch)}
+            if isinstance(logs, dict):
+                for key, value in logs.items():
+                    if isinstance(value, (int, float)):
+                        details[str(key)] = float(value)
+            try:
+                self._callback("after_first_batch", details)
+            except Exception:  # noqa: BLE001
+                logger.warning("Failed to publish first-batch memory probe", exc_info=True)
+
+    return _FirstBatchProbeCallback(probe)
 
 
 def _compute_split_boundaries(
@@ -467,6 +524,15 @@ def _fit_snapshot_model_once(
         logger.info("Snapshot training window skipped: snapshot dataset has no samples.")
         return model, 0, None, 0.0
 
+    _emit_hpo_phase_memory_probe(
+        config,
+        "after_snapshot_load",
+        {
+            "n_samples": int(n_samples),
+            "n_chunks": int(len(getattr(snapshot_dataset, "chunks", []) or [])),
+        },
+    )
+
     _enforce_production_sample_cap_snapshot(config, n_samples)
 
     split_indices = _resolve_snapshot_training_indices(config, n_samples)
@@ -505,6 +571,15 @@ def _fit_snapshot_model_once(
             )
         long_term_input_dim = int(long_term_features.shape[1])
 
+    _emit_hpo_phase_memory_probe(
+        config,
+        "after_long_term_features",
+        {
+            "long_term_enabled": bool(long_term_features is not None),
+            "long_term_dim": int(long_term_input_dim or 0),
+        },
+    )
+
     context = resolve_snapshot_context(config)
     manifest = load_or_create_manifest(context, config)
 
@@ -535,6 +610,15 @@ def _fit_snapshot_model_once(
             val_end,
             "val",
         )
+
+    _emit_hpo_phase_memory_probe(
+        config,
+        "after_normalization_stats",
+        {
+            "fit_on_train_only": bool(fit_on_train_only),
+            "val_count": int(val_count),
+        },
+    )
 
     class_weights_up: Optional[Dict[int, float]] = None
     class_weights_down: Optional[Dict[int, float]] = None
@@ -661,6 +745,9 @@ def _fit_snapshot_model_once(
         train_data = _make_train_gen()
 
     callbacks = create_callbacks(config)
+    first_batch_probe_cb = _create_first_batch_probe_callback(config)
+    if first_batch_probe_cb is not None:
+        callbacks.append(first_batch_probe_cb)
     fit_kwargs: Dict[str, Any] = {
         "x": train_data,
         "epochs": epochs,
@@ -722,6 +809,16 @@ def _fit_snapshot_model_once(
 
     if model is None:
         raise ConfigError("Model is not initialized for snapshot training window")
+
+    _emit_hpo_phase_memory_probe(
+        config,
+        "before_first_fit_batch",
+        {
+            "train_steps": int(train_steps),
+            "epochs": int(epochs),
+        },
+    )
+
     history = model.fit(**fit_kwargs)
 
     hpo_metric_value = _extract_hpo_metric_from_history(config, history)
@@ -993,6 +1090,15 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
         logger.info("Snapshot training skipped: snapshot dataset has no samples.")
         return None
 
+    _emit_hpo_phase_memory_probe(
+        config,
+        "after_snapshot_load",
+        {
+            "n_samples": int(n_samples),
+            "n_chunks": int(len(getattr(snapshot_dataset, "chunks", []) or [])),
+        },
+    )
+
     _enforce_production_sample_cap_snapshot(config, n_samples)
 
     split_indices = _resolve_snapshot_training_indices(config, n_samples)
@@ -1031,6 +1137,15 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
             )
         long_term_input_dim = int(long_term_features.shape[1])
 
+    _emit_hpo_phase_memory_probe(
+        config,
+        "after_long_term_features",
+        {
+            "long_term_enabled": bool(long_term_features is not None),
+            "long_term_dim": int(long_term_input_dim or 0),
+        },
+    )
+
     context = resolve_snapshot_context(config)
     manifest = load_or_create_manifest(context, config)
 
@@ -1061,6 +1176,15 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
             val_end,
             "val",
         )
+
+    _emit_hpo_phase_memory_probe(
+        config,
+        "after_normalization_stats",
+        {
+            "fit_on_train_only": bool(fit_on_train_only),
+            "val_count": int(val_count),
+        },
+    )
 
     # Compute class weights for imbalanced label handling if configured.
     # Class weights are computed from training data only to avoid data leakage.
@@ -1308,6 +1432,10 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
     else:
         train_data = _make_train_gen()
 
+    first_batch_probe_cb = _create_first_batch_probe_callback(config)
+    if first_batch_probe_cb is not None:
+        callbacks.append(first_batch_probe_cb)
+
     writer = None
     try:
         from observability.run_state import get_run_state_writer
@@ -1384,6 +1512,15 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
 
         fit_kwargs["validation_data"] = val_data
         fit_kwargs["validation_steps"] = val_steps
+
+    _emit_hpo_phase_memory_probe(
+        config,
+        "before_first_fit_batch",
+        {
+            "train_steps": int(train_steps),
+            "epochs": int(epochs),
+        },
+    )
 
     history = model.fit(**fit_kwargs)
 

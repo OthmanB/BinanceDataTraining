@@ -2254,7 +2254,40 @@ def _render_ui_page(_config: ServerConfig) -> str:
       function removeListItem(btn,uid){{btn.parentElement.remove();_syncListTA(uid);}}
       function addListItemFromSelect(uid){{var sel=document.getElementById('sel_'+uid);if(!sel||!sel.value)return;var v=sel.value;var c=document.getElementById('items_'+uid);var existing=[];c.querySelectorAll('.list-item-text').forEach(function(s){{existing.push(s.textContent)}});if(existing.indexOf(v)!==-1){{sel.value='';return;}}var d=document.createElement('div');d.className='list-item';d.setAttribute('data-list',uid);d.innerHTML='<span class="list-item-text">'+v+'</span><button type="button" class="list-btn-sm danger" onclick="removeListItem(this,\\''+uid+'\\')">-</button>';c.appendChild(d);sel.value='';_syncListTA(uid);}}
       function addListItemFromInput(uid){{var inp=document.getElementById('inp_'+uid);if(!inp||!inp.value.trim())return;var v=inp.value.trim();var c=document.getElementById('items_'+uid);var d=document.createElement('div');d.className='list-item';d.setAttribute('data-list',uid);d.innerHTML='<span class="list-item-text">'+v+'</span><button type="button" class="list-btn-sm danger" onclick="removeListItem(this,\\''+uid+'\\')">-</button>';c.appendChild(d);inp.value='';_syncListTA(uid);}}
-      function _syncConnTA(){{var rows=document.querySelectorAll('#conn-tbody .conn-row');var conns=[];rows.forEach(function(r){{var c={{}};r.querySelectorAll('.conn-f').forEach(function(f){{var k=f.getAttribute('data-field');if(k==='start_date'||k==='end_date'){{if(!c.time_range)c.time_range={{}};c.time_range[k]=f.value;}}else{{c[k]=f.value;}}}});conns.push(c);}});var ta=document.getElementById('ta_conn');if(ta){{var lines=[];conns.forEach(function(c){{lines.push('- name: "'+((c.name||'').replace(/"/g,'\\\\"'))+'"\n  database_uri: "'+((c.database_uri||'').replace(/"/g,'\\\\"'))+'"\n  table_prefix: "'+((c.table_prefix||'').replace(/"/g,'\\\\"'))+'"\n  time_range:\n    start_date: "'+((c.time_range&&c.time_range.start_date)||'')+'"\n    end_date: "'+((c.time_range&&c.time_range.end_date)||'')+'"');}});ta.value=lines.length?lines.join('\n'):'[]';}}}}
+      function _syncConnTA(){{
+        var rows=document.querySelectorAll('#conn-tbody .conn-row');
+        var conns=[];
+        rows.forEach(function(r){{
+          var c={{}};
+          r.querySelectorAll('.conn-f').forEach(function(f){{
+            var k=f.getAttribute('data-field');
+            if(k==='start_date'||k==='end_date'){{
+              if(!c.time_range)c.time_range={{}};
+              c.time_range[k]=f.value;
+            }}else{{
+              c[k]=f.value;
+            }}
+          }});
+          conns.push(c);
+        }});
+
+        var ta=document.getElementById('ta_conn');
+        if(!ta)return;
+
+        var lines=[];
+        conns.forEach(function(c){{
+          var part=[
+            '- name: "'+((c.name||'').replace(/"/g,'\\\\"'))+'"',
+            '  database_uri: "'+((c.database_uri||'').replace(/"/g,'\\\\"'))+'"',
+            '  table_prefix: "'+((c.table_prefix||'').replace(/"/g,'\\\\"'))+'"',
+            '  time_range:',
+            '    start_date: "'+((c.time_range&&c.time_range.start_date)||'')+'"',
+            '    end_date: "'+((c.time_range&&c.time_range.end_date)||'')+'"'
+          ];
+          lines.push(part.join('\\n'));
+        }});
+        ta.value=lines.length?lines.join('\\n'):'[]';
+      }}
       function removeConnRow(btn){{btn.closest('tr').remove();_syncConnTA();}}
       function addConnRow(){{var tb=document.getElementById('conn-tbody');if(!tb)return;var tr=document.createElement('tr');tr.className='conn-row';tr.innerHTML='<td><input type="text" class="conn-f" data-field="name" value="" /></td><td><input type="text" class="conn-f" data-field="database_uri" value="" /></td><td><input type="text" class="conn-f" data-field="table_prefix" value="orderbook_" /></td><td><input type="date" class="conn-f" data-field="start_date" value="" /></td><td><input type="date" class="conn-f" data-field="end_date" value="" /></td><td><button type="button" class="list-btn-sm danger" onclick="removeConnRow(this)">-</button></td>';tb.appendChild(tr);tr.querySelectorAll('.conn-f').forEach(function(f){{f.addEventListener('change',_syncConnTA);}});_syncConnTA();}}
       document.addEventListener('change',function(e){{if(e.target.classList.contains('conn-f'))_syncConnTA();}});
@@ -2663,6 +2696,22 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
 
             best_value: Optional[float] = None
             best_number: Optional[int] = None
+
+            def _fmt_bytes_short(value: Any) -> str:
+                if value is None:
+                    return "-"
+                try:
+                    num = float(value)
+                except (TypeError, ValueError):
+                    return "-"
+                if num <= 0:
+                    return "-"
+                units = ["B", "KiB", "MiB", "GiB", "TiB"]
+                idx = 0
+                while num >= 1024.0 and idx < len(units) - 1:
+                    num /= 1024.0
+                    idx += 1
+                return f"{num:.2f}{units[idx]}"
             for t in trials:
                 if t.get("status") == "completed" and t.get("value") is not None:
                     v = float(t["value"])
@@ -2673,7 +2722,7 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
             param_keys = sorted({k for t in trials for k in (t.get("params") or {})})
             body += '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:0.82rem">'
             body += '<thead><tr style="border-bottom:2px solid var(--border);text-align:left">'
-            body += '<th style="padding:5px 8px">#</th><th style="padding:5px 8px">Status</th><th style="padding:5px 8px">Objective Value</th><th style="padding:5px 8px">Duration</th>'
+            body += '<th style="padding:5px 8px">#</th><th style="padding:5px 8px">Status</th><th style="padding:5px 8px">Objective Value</th><th style="padding:5px 8px">Duration</th><th style="padding:5px 8px">Phase RSS</th>'
             for pk in param_keys:
                 body += f'<th style="padding:5px 8px">{_escape_text(pk)}</th>'
             body += '</tr></thead><tbody>'
@@ -2695,6 +2744,33 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
                     dur_str = "\u2014"
                 else:
                     dur_str = f"{int(dur)}s" if dur is not None else "-"
+
+                phase_summary = "-"
+                phase_max_raw = t.get("phase_memory_max_by_phase")
+                if isinstance(phase_max_raw, dict) and phase_max_raw:
+                    phase_aliases = [
+                        ("after_snapshot_load", "snap"),
+                        ("after_normalization_stats", "norm"),
+                        ("after_long_term_features", "lt"),
+                        ("before_first_fit_batch", "prefit"),
+                        ("after_first_batch", "batch1"),
+                    ]
+                    remaining_keys = {
+                        str(key)
+                        for key in phase_max_raw
+                        if isinstance(key, str)
+                    }
+                    parts: List[str] = []
+                    for phase_key, alias in phase_aliases:
+                        if phase_key in phase_max_raw:
+                            parts.append(f"{alias}:{_fmt_bytes_short(phase_max_raw.get(phase_key))}")
+                            if phase_key in remaining_keys:
+                                remaining_keys.remove(phase_key)
+                    for phase_key in sorted(remaining_keys):
+                        parts.append(f"{phase_key}:{_fmt_bytes_short(phase_max_raw.get(phase_key))}")
+                    if parts:
+                        phase_summary = " | ".join(parts)
+
                 is_best = (number == best_number and status == "completed")
                 row_style = "border-bottom:1px solid var(--border);"
                 if is_best:
@@ -2705,6 +2781,7 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
                 body += f'<td style="padding:5px 8px"><span class="badge {badge_class}">{_escape_text(status)}</span></td>'
                 body += f'<td style="padding:5px 8px;font-variant-numeric:tabular-nums">{value_str}</td>'
                 body += f'<td style="padding:5px 8px">{dur_str}</td>'
+                body += f'<td style="padding:5px 8px;font-family:var(--mono);font-size:0.72rem">{_escape_text(phase_summary)}</td>'
                 params = t.get("params") or {}
                 for pk in param_keys:
                     pv = params.get(pk)
