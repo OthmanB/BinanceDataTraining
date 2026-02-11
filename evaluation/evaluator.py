@@ -48,6 +48,70 @@ CALIBRATION_MEMORY_WARN_THRESHOLD = 1_000_000
 BACKTEST_MEMORY_WARN_THRESHOLD = 1_000_000
 
 
+def _resolve_min_predict_batch_size(model: Any) -> int:
+    """Return the minimum safe batch size for ``model.predict``.
+
+    Under mirrored/distributed strategies, very small batches can produce empty
+    per-replica tensors on some devices, which may fail inside Conv kernels.
+    """
+    try:
+        strategy = getattr(model, "distribute_strategy", None)
+    except Exception:
+        strategy = None
+
+    if strategy is None:
+        return 1
+
+    try:
+        replicas = int(getattr(strategy, "num_replicas_in_sync", 1))
+    except Exception:
+        replicas = 1
+
+    return max(1, replicas)
+
+
+def _predict_two_head_with_safe_batching(
+    model: Any,
+    x_batch: np.ndarray,
+    *,
+    lt_batch: Optional[np.ndarray],
+    batch_size: int,
+    min_predict_batch_size: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Predict two-head probabilities with optional padding for tiny batches."""
+    sample_count = int(x_batch.shape[0])
+    if sample_count <= 0:
+        raise ValueError("Cannot run prediction on an empty batch")
+
+    x_input = x_batch
+    lt_input = lt_batch
+
+    if sample_count < int(min_predict_batch_size):
+        pad_count = int(min_predict_batch_size) - sample_count
+        x_pad = np.repeat(x_batch[-1:], pad_count, axis=0)
+        x_input = np.concatenate([x_batch, x_pad], axis=0)
+
+        if lt_batch is not None:
+            lt_pad = np.repeat(lt_batch[-1:], pad_count, axis=0)
+            lt_input = np.concatenate([lt_batch, lt_pad], axis=0)
+
+    model_input: Any
+    if lt_input is not None:
+        model_input = [x_input, lt_input]
+    else:
+        model_input = x_input
+
+    effective_batch_size = max(1, min(int(batch_size), int(x_input.shape[0])))
+    y_pred = model.predict(model_input, batch_size=effective_batch_size, verbose=0)
+    if not isinstance(y_pred, (list, tuple)) or len(y_pred) != 2:
+        raise ValueError("Expected model.predict to return two outputs for two_head_intensity")
+
+    y_prob_up = np.asarray(y_pred[0], dtype="float64")
+    y_prob_down = np.asarray(y_pred[1], dtype="float64")
+
+    return y_prob_up[:sample_count], y_prob_down[:sample_count]
+
+
 def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, Any]) -> None:
     """Evaluate a trained model."""
 
@@ -878,6 +942,8 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
     if batch_size <= 0:
         raise ValueError("training.batch_size must be positive")
 
+    min_predict_batch_size = _resolve_min_predict_batch_size(model)
+
     total_eval_samples = test_end - test_start
     total_eval_batches = int(np.ceil(total_eval_samples / float(batch_size))) if total_eval_samples > 0 else 0
     eval_batches_done = 0
@@ -1072,23 +1138,22 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
                 x_batch = x_chunk[offset : offset + batch_size]
                 y_true_up = y_up_chunk[offset : offset + batch_size]
                 y_true_down = y_down_chunk[offset : offset + batch_size]
+                if x_batch.shape[0] == 0:
+                    continue
 
-                model_input: Any
+                lt_batch: Optional[np.ndarray] = None
                 if lt_features is not None:
                     lt_batch = lt_features[current_idx : current_idx + x_batch.shape[0]]
                     if lt_batch.shape[0] != x_batch.shape[0]:
                         raise ValueError("Long-term feature batch size mismatch during calibration")
-                    model_input = [x_batch, lt_batch]
-                else:
-                    model_input = x_batch
 
-                y_pred = model.predict(model_input, batch_size=batch_size, verbose=0)
-                if not isinstance(y_pred, (list, tuple)) or len(y_pred) != 2:
-                    raise ValueError("Expected model.predict to return two outputs for two_head_intensity")
-
-                y_prob_up, y_prob_down = y_pred
-                y_prob_up = np.asarray(y_prob_up, dtype="float64")
-                y_prob_down = np.asarray(y_prob_down, dtype="float64")
+                y_prob_up, y_prob_down = _predict_two_head_with_safe_batching(
+                    model,
+                    x_batch,
+                    lt_batch=lt_batch,
+                    batch_size=batch_size,
+                    min_predict_batch_size=min_predict_batch_size,
+                )
 
                 if y_prob_up.shape[1] != num_classes or y_prob_down.shape[1] != num_classes:
                     raise ValueError("Prediction output classes do not match model.output.num_classes")
@@ -1207,23 +1272,22 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
             x_batch = x_chunk[offset : offset + batch_size]
             y_true_up = y_up_chunk[offset : offset + batch_size]
             y_true_down = y_down_chunk[offset : offset + batch_size]
+            if x_batch.shape[0] == 0:
+                continue
 
-            model_input: Any
+            lt_batch: Optional[np.ndarray] = None
             if long_term_test_features is not None:
                 lt_batch = long_term_test_features[sample_offset : sample_offset + x_batch.shape[0]]
                 if lt_batch.shape[0] != x_batch.shape[0]:
                     raise ValueError("Long-term feature batch size mismatch during evaluation")
-                model_input = [x_batch, lt_batch]
-            else:
-                model_input = x_batch
 
-            y_pred = model.predict(model_input, batch_size=batch_size, verbose=0)
-            if not isinstance(y_pred, (list, tuple)) or len(y_pred) != 2:
-                raise ValueError("Expected model.predict to return two outputs for two_head_intensity")
-
-            y_prob_up, y_prob_down = y_pred
-            y_prob_up = np.asarray(y_prob_up, dtype="float64")
-            y_prob_down = np.asarray(y_prob_down, dtype="float64")
+            y_prob_up, y_prob_down = _predict_two_head_with_safe_batching(
+                model,
+                x_batch,
+                lt_batch=lt_batch,
+                batch_size=batch_size,
+                min_predict_batch_size=min_predict_batch_size,
+            )
 
             if y_prob_up.shape[1] != num_classes or y_prob_down.shape[1] != num_classes:
                 raise ValueError("Prediction output classes do not match model.output.num_classes")

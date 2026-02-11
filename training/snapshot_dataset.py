@@ -991,6 +991,66 @@ def iter_snapshot_batches(
     if start_index < 0 or end_index < 0 or start_index > end_index:
         raise ValueError("Invalid start_index/end_index for snapshot batch iteration")
 
+    for chunk, local_start, local_end in _iter_snapshot_chunk_ranges(dataset, start_index, end_index):
+        x, y_up, y_down, anchor_ts, duty_cycle = _slice_chunk_arrays(chunk, local_start, local_end)
+
+        if duty_cycle.shape[0] != x.shape[0]:
+            raise ConfigError(
+                "Snapshot chunk duty_cycle length does not match x length. Rebuild snapshot dataset."
+            )
+
+        yield x, y_up, y_down, anchor_ts, duty_cycle
+
+
+def iter_snapshot_minibatches(
+    dataset: SnapshotDataset,
+    start_index: int,
+    end_index: int,
+    batch_size: int,
+) -> Iterator[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    """Iterate fixed-size mini-batches directly from snapshot chunks.
+
+    This iterator slices each chunk at mini-batch granularity so storage-backed
+    reconstruction and normalization can run on mini-batches instead of full
+    chunk slices.
+
+    Notes
+    -----
+    Incomplete tail batches are dropped per chunk to preserve fixed batch
+    shapes, matching the historical ``build_training_generator`` behaviour.
+    """
+    if batch_size <= 0:
+        raise ValueError("training.batch_size must be positive")
+
+    for chunk, local_start, local_end in _iter_snapshot_chunk_ranges(dataset, start_index, end_index):
+        for batch_local_start in range(local_start, local_end, batch_size):
+            batch_local_end = batch_local_start + batch_size
+            if batch_local_end > local_end:
+                break
+
+            x, y_up, y_down, anchor_ts, duty_cycle = _slice_chunk_arrays(
+                chunk,
+                batch_local_start,
+                batch_local_end,
+            )
+
+            if duty_cycle.shape[0] != x.shape[0]:
+                raise ConfigError(
+                    "Snapshot chunk duty_cycle length does not match x length. Rebuild snapshot dataset."
+                )
+
+            yield x, y_up, y_down, anchor_ts, duty_cycle
+
+
+def _iter_snapshot_chunk_ranges(
+    dataset: SnapshotDataset,
+    start_index: int,
+    end_index: int,
+) -> Iterator[Tuple[SnapshotChunk, int, int]]:
+    """Yield overlapping chunk-local ranges for a global sample index span."""
+    if start_index < 0 or end_index < 0 or start_index > end_index:
+        raise ValueError("Invalid start_index/end_index for snapshot batch iteration")
+
     for chunk in dataset.chunks:
         chunk_start = chunk.start_index
         chunk_end = chunk.start_index + chunk.num_samples
@@ -1004,14 +1064,7 @@ def iter_snapshot_batches(
         if local_end <= local_start:
             continue
 
-        x, y_up, y_down, anchor_ts, duty_cycle = _slice_chunk_arrays(chunk, local_start, local_end)
-
-        if duty_cycle.shape[0] != x.shape[0]:
-            raise ConfigError(
-                "Snapshot chunk duty_cycle length does not match x length. Rebuild snapshot dataset."
-            )
-
-        yield x, y_up, y_down, anchor_ts, duty_cycle
+        yield chunk, local_start, local_end
 
 
 def get_mask_channel_info(config: Dict[str, Any]) -> Tuple[int, int]:
@@ -1145,48 +1198,41 @@ def build_training_generator(
 
     def _generator_with_weights() -> Iterator[Tuple[np.ndarray, Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]]:
         while True:
-            for x_chunk, y_up_chunk, y_down_chunk, anchor_ts, duty_cycle_chunk in iter_snapshot_batches(
-                dataset, start_index, end_index
+            for x_batch, y_up, y_down, anchor_ts, duty_cycle in iter_snapshot_minibatches(
+                dataset,
+                start_index,
+                end_index,
+                batch_size,
             ):
-                x_chunk = _apply_normalization(x_chunk, normalization, mask_start, mask_count)
+                x_batch = _apply_normalization(x_batch, normalization, mask_start, mask_count)
+                duty_cycle = duty_cycle.astype("float32")
 
-                n_chunk = x_chunk.shape[0]
-                for offset in range(0, n_chunk, batch_size):
-                    end = offset + batch_size
-                    if end > n_chunk:
-                        break  # drop incomplete tail batch to keep shapes uniform
-                    x_batch = x_chunk[offset : end]
-                    y_up = y_up_chunk[offset : end]
-                    y_down = y_down_chunk[offset : end]
-                    duty_cycle = duty_cycle_chunk[offset : end].astype("float32")
+                y_up_oh = eye[y_up]
+                y_down_oh = eye[y_down]
+                y_batch = (y_up_oh, y_down_oh)
 
-                    y_up_oh = eye[y_up]
-                    y_down_oh = eye[y_down]
-                    y_batch = (y_up_oh, y_down_oh)
+                # Start with duty-cycle weights
+                weights_up = duty_cycle
+                weights_down = duty_cycle.copy()
 
-                    # Start with duty-cycle weights
-                    weights_up = duty_cycle
-                    weights_down = duty_cycle.copy()
+                # Apply exponential decay if enabled
+                if use_decay_weights:
+                    if current_day is None or decay_const is None:
+                        raise ValueError("Sample weighting requires current_day and decay_const")
+                    anchor_days = (anchor_ts // 86400).astype("float64")
+                    age_days = float(current_day) - anchor_days
+                    decay_weights = np.exp(-age_days * float(decay_const)).astype("float32")
+                    weights_up = weights_up * decay_weights
+                    weights_down = weights_down * decay_weights
 
-                    # Apply exponential decay if enabled
-                    if use_decay_weights:
-                        if current_day is None or decay_const is None:
-                            raise ValueError("Sample weighting requires current_day and decay_const")
-                        anchor_slice = anchor_ts[offset : end]
-                        anchor_days = (anchor_slice // 86400).astype("float64")
-                        age_days = float(current_day) - anchor_days
-                        decay_weights = np.exp(-age_days * float(decay_const)).astype("float32")
-                        weights_up = weights_up * decay_weights
-                        weights_down = weights_down * decay_weights
+                # Apply class weights if enabled
+                if use_class_weights:
+                    class_w_up, class_w_down = _compute_class_sample_weights(y_up, y_down)
+                    weights_up = weights_up * class_w_up
+                    weights_down = weights_down * class_w_down
 
-                    # Apply class weights if enabled
-                    if use_class_weights:
-                        class_w_up, class_w_down = _compute_class_sample_weights(y_up, y_down)
-                        weights_up = weights_up * class_w_up
-                        weights_down = weights_down * class_w_down
-
-                    sample_weight = (weights_up, weights_down)
-                    yield x_batch, y_batch, sample_weight
+                sample_weight = (weights_up, weights_down)
+                yield x_batch, y_batch, sample_weight
 
     return _generator_with_weights(), steps
 
@@ -1509,9 +1555,21 @@ def _strip_mask_channels(
 
 def _compute_current_day(dataset: SnapshotDataset, start_index: int, end_index: int) -> int:
     max_day = None
-    for _, _, _, anchor_ts, _ in iter_snapshot_batches(dataset, start_index, end_index):
+    for chunk, local_start, local_end in _iter_snapshot_chunk_ranges(dataset, start_index, end_index):
+        anchor_ts_all = load_chunk_anchor_timestamps(chunk)
+        if anchor_ts_all.ndim != 1:
+            raise ConfigError("Snapshot chunk anchor_ts must be rank 1")
+
+        if int(anchor_ts_all.shape[0]) < int(local_end):
+            raise ConfigError(
+                "Snapshot chunk anchor_ts length does not match declared num_samples. "
+                "Rebuild snapshot dataset."
+            )
+
+        anchor_ts = anchor_ts_all[local_start:local_end]
         if anchor_ts.size == 0:
             continue
+
         days = (anchor_ts // 86400).astype("int64")
         batch_max = int(days.max())
         if max_day is None or batch_max > max_day:
@@ -3193,6 +3251,7 @@ __all__ = [
     "get_chunk_x_shape",
     "get_mask_channel_info",
     "iter_snapshot_batches",
+    "iter_snapshot_minibatches",
     "load_chunk_anchor_timestamps",
     "load_label_stats_from_manifest",
     "load_normalization_stats",

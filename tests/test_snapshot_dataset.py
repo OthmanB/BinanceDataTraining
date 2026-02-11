@@ -7,14 +7,17 @@ import numpy as np
 from hypothesis import given, strategies as st
 
 from training.snapshot_dataset import (
+    CHUNK_STORAGE_NPY_SHARDS_V1,
     GapHandler,
     SnapshotChunk,
     SnapshotDataset,
     SnapshotRecord,
     _compute_intensity_bins,
+    _compute_current_day,
     build_training_generator,
     compute_normalization_stats,
     iter_snapshot_batches,
+    iter_snapshot_minibatches,
 )
 
 
@@ -225,6 +228,108 @@ class TestSnapshotDataset(unittest.TestCase):
             result = np.concatenate(collected, axis=0)
             expected = np.concatenate([x1[2:3], x2[:2]], axis=0)
             np.testing.assert_allclose(result, expected)
+
+    def test_compute_current_day_uses_anchor_timestamps_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            anchor_ts = np.asarray([0, 86400, 2 * 86400], dtype="int64")
+            anchor_path = os.path.join(tmp_dir, "anchor_ts.npy")
+            np.save(anchor_path, anchor_ts, allow_pickle=False)
+
+            chunk = SnapshotChunk(
+                start="2024-01-01 00:00:00",
+                end="2024-01-01 01:00:00",
+                file_path=os.path.join(tmp_dir, "missing_x.npy"),
+                num_samples=3,
+                start_index=0,
+                storage_format=CHUNK_STORAGE_NPY_SHARDS_V1,
+                array_paths={"anchor_ts": anchor_path},
+            )
+            dataset = SnapshotDataset(
+                snapshot_dir=tmp_dir,
+                manifest={"chunks": []},
+                chunks=[chunk],
+                total_samples=3,
+                config_hash="hash",
+            )
+
+            current_day = _compute_current_day(dataset, 0, 3)
+            self.assertEqual(current_day, 2)
+
+    def test_iter_snapshot_minibatches_drops_incomplete_tail_per_chunk(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            x1 = np.asarray(
+                [
+                    [[[[0.0]]]],
+                    [[[[1.0]]]],
+                    [[[[2.0]]]],
+                ],
+                dtype="float32",
+            )
+            x2 = np.asarray(
+                [
+                    [[[[3.0]]]],
+                    [[[[4.0]]]],
+                    [[[[5.0]]]],
+                ],
+                dtype="float32",
+            )
+
+            def _save_chunk(path: str, x: np.ndarray, base_ts: int) -> None:
+                n = x.shape[0]
+                np.savez_compressed(
+                    path,
+                    x=x,
+                    y_up=np.arange(n, dtype="int64"),
+                    y_down=np.arange(n, dtype="int64"),
+                    anchor_ts=np.arange(base_ts, base_ts + n, dtype="int64"),
+                    duty_cycle=np.ones((n,), dtype="float32"),
+                )
+
+            chunk1_path = os.path.join(tmp_dir, "chunk1.npz")
+            chunk2_path = os.path.join(tmp_dir, "chunk2.npz")
+            _save_chunk(chunk1_path, x1, 100)
+            _save_chunk(chunk2_path, x2, 200)
+
+            chunk1 = SnapshotChunk(
+                start="2024-01-01 00:00:00",
+                end="2024-01-01 01:00:00",
+                file_path=chunk1_path,
+                num_samples=3,
+                start_index=0,
+            )
+            chunk2 = SnapshotChunk(
+                start="2024-01-01 01:00:01",
+                end="2024-01-01 02:00:00",
+                file_path=chunk2_path,
+                num_samples=3,
+                start_index=3,
+            )
+
+            dataset = SnapshotDataset(
+                snapshot_dir=tmp_dir,
+                manifest={"chunks": []},
+                chunks=[chunk1, chunk2],
+                total_samples=6,
+                config_hash="hash",
+            )
+
+            outputs = list(iter_snapshot_minibatches(dataset, 0, 6, batch_size=2))
+            self.assertEqual(len(outputs), 2)
+
+            x_batch0, y_up0, y_down0, anchor0, duty0 = outputs[0]
+            x_batch1, y_up1, y_down1, anchor1, duty1 = outputs[1]
+
+            np.testing.assert_allclose(x_batch0, x1[:2])
+            np.testing.assert_array_equal(y_up0, np.array([0, 1], dtype="int64"))
+            np.testing.assert_array_equal(y_down0, np.array([0, 1], dtype="int64"))
+            np.testing.assert_array_equal(anchor0, np.array([100, 101], dtype="int64"))
+            np.testing.assert_allclose(duty0, np.ones((2,), dtype="float32"))
+
+            np.testing.assert_allclose(x_batch1, x2[:2])
+            np.testing.assert_array_equal(y_up1, np.array([0, 1], dtype="int64"))
+            np.testing.assert_array_equal(y_down1, np.array([0, 1], dtype="int64"))
+            np.testing.assert_array_equal(anchor1, np.array([200, 201], dtype="int64"))
+            np.testing.assert_allclose(duty1, np.ones((2,), dtype="float32"))
 
     def test_build_training_generator_applies_duty_cycle(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
