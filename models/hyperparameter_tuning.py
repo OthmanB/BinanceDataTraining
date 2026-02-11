@@ -5,7 +5,7 @@ driven entirely by the ``hyperparameter_optimization`` section of the
 configuration.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 import copy
 import fcntl
@@ -29,6 +29,7 @@ def _summarize_trial_states(study: Any) -> Dict[str, int]:
         "completed": 0,
         "pruned": 0,
         "failed": 0,
+        "running": 0,
     }
     for trial in study.trials:
         state_name = str(getattr(trial.state, "name", "")).upper()
@@ -38,6 +39,8 @@ def _summarize_trial_states(study: Any) -> Dict[str, int]:
             counts["pruned"] += 1
         elif state_name in {"FAIL", "FAILED"}:
             counts["failed"] += 1
+        elif state_name == "RUNNING":
+            counts["running"] += 1
     return counts
 
 
@@ -533,6 +536,48 @@ def _collect_wave_worker_rss_bytes(executor: ProcessPoolExecutor) -> Dict[int, i
     return rss_by_pid
 
 
+def _should_trigger_rss_watchdog(
+    *,
+    rss_watchdog_enabled: bool,
+    rss_by_pid: Dict[int, int],
+    rss_watchdog_limit_bytes: int,
+    wave_started_monotonic: float,
+    now_monotonic: float,
+    startup_grace_seconds: float,
+    require_trial_start: bool,
+    trial_started_in_wave: bool,
+    startup_timeout_seconds: float,
+) -> Tuple[bool, Optional[int], Optional[int]]:
+    if not rss_watchdog_enabled or not rss_by_pid:
+        return False, None, None
+
+    hottest_pid, hottest_rss = max(rss_by_pid.items(), key=lambda item: item[1])
+    if hottest_rss < rss_watchdog_limit_bytes:
+        return False, None, None
+
+    elapsed = max(0.0, float(now_monotonic) - float(wave_started_monotonic))
+    if elapsed < startup_grace_seconds:
+        return False, None, None
+
+    if require_trial_start and not trial_started_in_wave:
+        if startup_timeout_seconds > 0 and elapsed >= startup_timeout_seconds:
+            return True, int(hottest_pid), int(hottest_rss)
+        return False, None, None
+
+    return True, int(hottest_pid), int(hottest_rss)
+
+
+def _select_wave_resources(resources: List[str], remaining_trials: int, force_single_worker: bool) -> List[str]:
+    if remaining_trials <= 0:
+        return []
+    limit = min(len(resources), remaining_trials)
+    if limit <= 0:
+        return []
+    if force_single_worker:
+        return resources[:1]
+    return resources[:limit]
+
+
 def _allocate_trials_to_workers(n_trials: int, n_workers: int) -> list[int]:
     if n_trials <= 0:
         return []
@@ -647,6 +692,53 @@ def _resolve_parallel_settings(hpo_cfg: Dict[str, Any]) -> Dict[str, Any]:
             "hyperparameter_optimization.parallel.rss_watchdog_check_interval_seconds must be > 0"
         )
 
+    rss_watchdog_startup_grace_seconds_raw = parallel_cfg.get("rss_watchdog_startup_grace_seconds", 60.0)
+    try:
+        rss_watchdog_startup_grace_seconds = float(rss_watchdog_startup_grace_seconds_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "hyperparameter_optimization.parallel.rss_watchdog_startup_grace_seconds must be a number >= 0"
+        ) from exc
+    if rss_watchdog_startup_grace_seconds < 0:
+        raise ValueError(
+            "hyperparameter_optimization.parallel.rss_watchdog_startup_grace_seconds must be >= 0"
+        )
+
+    rss_watchdog_require_trial_start = bool(parallel_cfg.get("rss_watchdog_require_trial_start", True))
+
+    rss_watchdog_startup_timeout_seconds_raw = parallel_cfg.get("rss_watchdog_startup_timeout_seconds", 1800.0)
+    try:
+        rss_watchdog_startup_timeout_seconds = float(rss_watchdog_startup_timeout_seconds_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "hyperparameter_optimization.parallel.rss_watchdog_startup_timeout_seconds must be a number > 0"
+        ) from exc
+    if rss_watchdog_startup_timeout_seconds <= 0:
+        raise ValueError(
+            "hyperparameter_optimization.parallel.rss_watchdog_startup_timeout_seconds must be > 0"
+        )
+
+    rss_watchdog_single_worker_fallback_enabled = bool(
+        parallel_cfg.get("rss_watchdog_single_worker_fallback_enabled", True)
+    )
+
+    rss_watchdog_max_restarts_before_single_worker_raw = parallel_cfg.get(
+        "rss_watchdog_max_restarts_before_single_worker",
+        2,
+    )
+    try:
+        rss_watchdog_max_restarts_before_single_worker = int(
+            rss_watchdog_max_restarts_before_single_worker_raw
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "hyperparameter_optimization.parallel.rss_watchdog_max_restarts_before_single_worker must be an integer >= 1"
+        ) from exc
+    if rss_watchdog_max_restarts_before_single_worker < 1:
+        raise ValueError(
+            "hyperparameter_optimization.parallel.rss_watchdog_max_restarts_before_single_worker must be >= 1"
+        )
+
     return {
         "enabled": enabled,
         "resources": resources,
@@ -657,6 +749,11 @@ def _resolve_parallel_settings(hpo_cfg: Dict[str, Any]) -> Dict[str, Any]:
         "rss_watchdog_enabled": rss_watchdog_enabled,
         "rss_watchdog_max_worker_rss_gb": rss_watchdog_max_worker_rss_gb,
         "rss_watchdog_check_interval_seconds": rss_watchdog_check_interval_seconds,
+        "rss_watchdog_startup_grace_seconds": rss_watchdog_startup_grace_seconds,
+        "rss_watchdog_require_trial_start": rss_watchdog_require_trial_start,
+        "rss_watchdog_startup_timeout_seconds": rss_watchdog_startup_timeout_seconds,
+        "rss_watchdog_single_worker_fallback_enabled": rss_watchdog_single_worker_fallback_enabled,
+        "rss_watchdog_max_restarts_before_single_worker": rss_watchdog_max_restarts_before_single_worker,
     }
 
 
@@ -1307,6 +1404,15 @@ def run_hyperparameter_search(
         rss_watchdog_enabled = bool(parallel_settings["rss_watchdog_enabled"])
         rss_watchdog_max_worker_rss_bytes = int(float(parallel_settings["rss_watchdog_max_worker_rss_gb"]) * (1024**3))
         rss_watchdog_check_interval_seconds = float(parallel_settings["rss_watchdog_check_interval_seconds"])
+        rss_watchdog_startup_grace_seconds = float(parallel_settings["rss_watchdog_startup_grace_seconds"])
+        rss_watchdog_require_trial_start = bool(parallel_settings["rss_watchdog_require_trial_start"])
+        rss_watchdog_startup_timeout_seconds = float(parallel_settings["rss_watchdog_startup_timeout_seconds"])
+        rss_watchdog_single_worker_fallback_enabled = bool(
+            parallel_settings["rss_watchdog_single_worker_fallback_enabled"]
+        )
+        rss_watchdog_max_restarts_before_single_worker = int(
+            parallel_settings["rss_watchdog_max_restarts_before_single_worker"]
+        )
         storage_uri = _build_trial_storage_uri(config, parallel_settings["storage_uri"])
         study_name = str(parallel_settings["study_name"] or "binance_hpo")
 
@@ -1385,6 +1491,8 @@ def run_hyperparameter_search(
         no_progress_cycles = 0
         max_no_progress_cycles = 8
         last_finished = -1
+        force_single_worker = False
+        watchdog_restarts_without_progress = 0
         spawn_ctx = multiprocessing.get_context("spawn")
 
         while True:
@@ -1411,6 +1519,7 @@ def run_hyperparameter_search(
                 no_progress_cycles += 1
             else:
                 no_progress_cycles = 0
+                watchdog_restarts_without_progress = 0
             last_finished = finished_trials
 
             if no_progress_cycles > max_no_progress_cycles:
@@ -1419,7 +1528,17 @@ def run_hyperparameter_search(
                     "worker processes may be repeatedly terminating."
                 )
 
-            wave_resources = resources[: min(len(resources), remaining_trials)]
+            wave_resources = _select_wave_resources(
+                resources,
+                remaining_trials,
+                force_single_worker=force_single_worker,
+            )
+            if not wave_resources:
+                raise RuntimeError(
+                    "Parallel HPO could not select any worker resources for the current wave. "
+                    "Check hyperparameter_optimization.parallel.resources."
+                )
+
             wave_trial_budget = min(
                 remaining_trials,
                 max_trials_per_worker_process * len(wave_resources),
@@ -1427,16 +1546,19 @@ def run_hyperparameter_search(
             allocations = _allocate_trials_to_workers(wave_trial_budget, len(wave_resources))
 
             logger.info(
-                "Launching parallel HPO wave: remaining_trials=%s wave_budget=%s max_trials_per_worker_process=%s allocations=%s resources=%s",
+                "Launching parallel HPO wave: remaining_trials=%s wave_budget=%s max_trials_per_worker_process=%s allocations=%s resources=%s force_single_worker=%s",
                 remaining_trials,
                 wave_trial_budget,
                 max_trials_per_worker_process,
                 allocations,
                 wave_resources,
+                force_single_worker,
             )
 
             worker_errors: list[str] = []
             watchdog_triggered = False
+            wave_started_monotonic = time.monotonic()
+            wave_finished_baseline = finished_trials
             with ProcessPoolExecutor(max_workers=len(wave_resources), mp_context=spawn_ctx) as executor:
                 futures = []
                 for resource, worker_trials in zip(wave_resources, allocations):
@@ -1466,17 +1588,19 @@ def run_hyperparameter_search(
                         return_when=FIRST_COMPLETED,
                     )
 
-                    if writer is not None:
+                    counts: Optional[Dict[str, int]] = None
+                    if writer is not None or rss_watchdog_require_trial_start:
                         try:
                             refreshed = optuna.load_study(study_name=study_name, storage=storage_uri)
                             counts = _summarize_trial_states(refreshed)
-                            writer.update_hpo_progress(
-                                completed=int(counts["completed"]),
-                                total=n_trials,
-                                pruned=int(counts["pruned"]),
-                                failed=int(counts["failed"]),
-                            )
-                            writer.update_hpo_trial_results(_extract_trial_details(refreshed))
+                            if writer is not None:
+                                writer.update_hpo_progress(
+                                    completed=int(counts["completed"]),
+                                    total=n_trials,
+                                    pruned=int(counts["pruned"]),
+                                    failed=int(counts["failed"]),
+                                )
+                                writer.update_hpo_trial_results(_extract_trial_details(refreshed))
                         except Exception as exc:  # noqa: BLE001
                             logger.warning("Failed to update HPO run-state progress: %s", exc)
 
@@ -1499,38 +1623,57 @@ def run_hyperparameter_search(
                         except Exception as exc:  # noqa: BLE001
                             logger.warning("Failed to publish HPO wave RSS to run-state: %s", exc)
 
-                    if rss_watchdog_enabled and rss_by_pid:
-                        hottest_pid, hottest_rss = max(rss_by_pid.items(), key=lambda item: item[1])
-                        if hottest_rss >= rss_watchdog_max_worker_rss_bytes:
-                            rss_gb = hottest_rss / float(1024**3)
-                            limit_gb = rss_watchdog_max_worker_rss_bytes / float(1024**3)
-                            logger.warning(
-                                "Parallel HPO RSS watchdog triggered: pid=%s rss=%.2fGiB >= limit=%.2fGiB. "
-                                "Terminating current wave and relaunching remaining trials.",
-                                hottest_pid,
-                                rss_gb,
-                                limit_gb,
-                            )
-                            if writer is not None:
-                                try:
-                                    writer.mark_hpo_rss_watchdog_trigger(
-                                        pid=int(hottest_pid),
-                                        rss_bytes=int(hottest_rss),
-                                        limit_bytes=int(rss_watchdog_max_worker_rss_bytes),
-                                    )
-                                except Exception as exc:  # noqa: BLE001
-                                    logger.warning("Failed to publish HPO RSS watchdog event: %s", exc)
-                            for process in getattr(executor, "_processes", {}).values():
-                                try:
-                                    if process is not None and process.is_alive():
-                                        process.terminate()
-                                except Exception:  # noqa: BLE001
-                                    continue
-                            for fut in pending:
-                                fut.cancel()
-                            pending.clear()
-                            watchdog_triggered = True
-                            break
+                    trial_started_in_wave = False
+                    if counts is not None:
+                        current_finished = (
+                            int(counts["completed"])
+                            + int(counts["pruned"])
+                            + int(counts["failed"])
+                        )
+                        current_running = int(counts.get("running", 0))
+                        trial_started_in_wave = current_running > 0 or current_finished > wave_finished_baseline
+
+                    should_terminate, hottest_pid, hottest_rss = _should_trigger_rss_watchdog(
+                        rss_watchdog_enabled=rss_watchdog_enabled,
+                        rss_by_pid=rss_by_pid,
+                        rss_watchdog_limit_bytes=rss_watchdog_max_worker_rss_bytes,
+                        wave_started_monotonic=wave_started_monotonic,
+                        now_monotonic=time.monotonic(),
+                        startup_grace_seconds=rss_watchdog_startup_grace_seconds,
+                        require_trial_start=rss_watchdog_require_trial_start,
+                        trial_started_in_wave=trial_started_in_wave,
+                        startup_timeout_seconds=rss_watchdog_startup_timeout_seconds,
+                    )
+                    if should_terminate and hottest_pid is not None and hottest_rss is not None:
+                        rss_gb = hottest_rss / float(1024**3)
+                        limit_gb = rss_watchdog_max_worker_rss_bytes / float(1024**3)
+                        logger.warning(
+                            "Parallel HPO RSS watchdog triggered: pid=%s rss=%.2fGiB >= limit=%.2fGiB. "
+                            "Terminating current wave and relaunching remaining trials.",
+                            hottest_pid,
+                            rss_gb,
+                            limit_gb,
+                        )
+                        if writer is not None:
+                            try:
+                                writer.mark_hpo_rss_watchdog_trigger(
+                                    pid=int(hottest_pid),
+                                    rss_bytes=int(hottest_rss),
+                                    limit_bytes=int(rss_watchdog_max_worker_rss_bytes),
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                logger.warning("Failed to publish HPO RSS watchdog event: %s", exc)
+                        for process in getattr(executor, "_processes", {}).values():
+                            try:
+                                if process is not None and process.is_alive():
+                                    process.terminate()
+                            except Exception:  # noqa: BLE001
+                                continue
+                        for fut in pending:
+                            fut.cancel()
+                        pending.clear()
+                        watchdog_triggered = True
+                        break
 
             if worker_errors:
                 logger.warning(
@@ -1538,6 +1681,19 @@ def run_hyperparameter_search(
                     len(worker_errors),
                 )
             if watchdog_triggered:
+                watchdog_restarts_without_progress += 1
+                if (
+                    rss_watchdog_single_worker_fallback_enabled
+                    and not force_single_worker
+                    and len(resources) > 1
+                    and watchdog_restarts_without_progress >= rss_watchdog_max_restarts_before_single_worker
+                ):
+                    force_single_worker = True
+                    logger.warning(
+                        "Parallel HPO RSS watchdog triggered %s time(s) without progress; "
+                        "falling back to single-worker recovery waves.",
+                        watchdog_restarts_without_progress,
+                    )
                 logger.info("Parallel HPO wave restarted after RSS watchdog trigger.")
 
         study = optuna.load_study(study_name=study_name, storage=storage_uri)

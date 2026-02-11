@@ -358,6 +358,16 @@ sections:
         type: any
       parallel.study_name:
         type: any
+      parallel.rss_watchdog_startup_grace_seconds:
+        type: number
+      parallel.rss_watchdog_require_trial_start:
+        type: boolean
+      parallel.rss_watchdog_startup_timeout_seconds:
+        type: number
+      parallel.rss_watchdog_single_worker_fallback_enabled:
+        type: boolean
+      parallel.rss_watchdog_max_restarts_before_single_worker:
+        type: integer
       regime.enabled:
         type: boolean
       regime.retry_on_oom:

@@ -19,7 +19,13 @@ except ImportError:
     settings = None  # type: ignore[assignment]
     st = None  # type: ignore[assignment]
 
-from models.hyperparameter_tuning import _allocate_trials_to_workers, _apply_worker_resource, _compute_next_batch_size
+from models.hyperparameter_tuning import (
+    _allocate_trials_to_workers,
+    _apply_worker_resource,
+    _compute_next_batch_size,
+    _select_wave_resources,
+    _should_trigger_rss_watchdog,
+)
 from training.pipeline import (
     _aggregate_hpo_window_metrics,
     _cleanup_completed_window_dirs,
@@ -97,6 +103,83 @@ class TestRegimeBackoffProperties(unittest.TestCase):
         next_batch = _compute_next_batch_size(current_batch, factor, min_batch)
         self.assertGreaterEqual(next_batch, min_batch)
         self.assertLessEqual(next_batch, current_batch)
+
+
+@unittest.skipUnless(HYPOTHESIS_AVAILABLE, "hypothesis not installed")
+class TestRssWatchdogProperties(unittest.TestCase):
+    @settings(max_examples=_MAX_EXAMPLES)
+    @given(
+        rss=st.integers(min_value=1, max_value=10_000_000),
+        limit=st.integers(min_value=1, max_value=1_000_000),
+        elapsed=st.floats(min_value=0.0, max_value=59.0, allow_nan=False, allow_infinity=False),
+        grace=st.floats(min_value=60.0, max_value=120.0, allow_nan=False, allow_infinity=False),
+    )
+    def test_watchdog_never_triggers_before_grace(
+        self,
+        rss: int,
+        limit: int,
+        elapsed: float,
+        grace: float,
+    ) -> None:
+        should_trigger, _, _ = _should_trigger_rss_watchdog(
+            rss_watchdog_enabled=True,
+            rss_by_pid={111: max(rss, limit + 1)},
+            rss_watchdog_limit_bytes=limit,
+            wave_started_monotonic=100.0,
+            now_monotonic=100.0 + elapsed,
+            startup_grace_seconds=grace,
+            require_trial_start=False,
+            trial_started_in_wave=False,
+            startup_timeout_seconds=1800.0,
+        )
+        self.assertFalse(should_trigger)
+
+    @settings(max_examples=_MAX_EXAMPLES)
+    @given(
+        grace=st.floats(min_value=1.0, max_value=30.0, allow_nan=False, allow_infinity=False),
+        timeout=st.floats(min_value=31.0, max_value=300.0, allow_nan=False, allow_infinity=False),
+    )
+    def test_watchdog_respects_trial_start_gate_before_timeout(
+        self,
+        grace: float,
+        timeout: float,
+    ) -> None:
+        elapsed = (grace + timeout) / 2.0
+        should_trigger, _, _ = _should_trigger_rss_watchdog(
+            rss_watchdog_enabled=True,
+            rss_by_pid={222: 9_999_999},
+            rss_watchdog_limit_bytes=1,
+            wave_started_monotonic=200.0,
+            now_monotonic=200.0 + elapsed,
+            startup_grace_seconds=grace,
+            require_trial_start=True,
+            trial_started_in_wave=False,
+            startup_timeout_seconds=timeout,
+        )
+        self.assertFalse(should_trigger)
+
+
+@unittest.skipUnless(HYPOTHESIS_AVAILABLE, "hypothesis not installed")
+class TestWaveResourceSelectionProperties(unittest.TestCase):
+    @settings(max_examples=_MAX_EXAMPLES)
+    @given(
+        resources=st.lists(st.sampled_from(["gpu:0", "gpu:1", "cpu"]), min_size=1, max_size=5),
+        remaining_trials=st.integers(min_value=0, max_value=20),
+        force_single=st.booleans(),
+    )
+    def test_wave_resource_selection_invariants(
+        self,
+        resources: list[str],
+        remaining_trials: int,
+        force_single: bool,
+    ) -> None:
+        selected = _select_wave_resources(resources, remaining_trials, force_single)
+        self.assertLessEqual(len(selected), len(resources))
+        self.assertLessEqual(len(selected), max(0, remaining_trials))
+        if remaining_trials <= 0:
+            self.assertEqual(selected, [])
+        if force_single and remaining_trials > 0:
+            self.assertLessEqual(len(selected), 1)
 
 
 @unittest.skipUnless(HYPOTHESIS_AVAILABLE, "hypothesis not installed")

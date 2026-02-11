@@ -17,6 +17,8 @@ from models.hyperparameter_tuning import (
     _compute_safe_batch_cap_from_memory,
     _evaluate_trial_objective,
     _is_resource_exhaustion_error,
+    _select_wave_resources,
+    _should_trigger_rss_watchdog,
     _resolve_failure_objective_value,
     _resolve_parallel_settings,
     _resolve_regime_settings,
@@ -56,6 +58,11 @@ class TestHPOParallelHelpers(unittest.TestCase):
                 "resources": ["GPU:0", "cpu", "  gpu:1  "],
                 "storage_uri": "sqlite:///tmp/hpo.db",
                 "study_name": "my_study",
+                "rss_watchdog_startup_grace_seconds": 90,
+                "rss_watchdog_require_trial_start": True,
+                "rss_watchdog_startup_timeout_seconds": 2400,
+                "rss_watchdog_single_worker_fallback_enabled": True,
+                "rss_watchdog_max_restarts_before_single_worker": 3,
             }
         }
         settings = _resolve_parallel_settings(hpo_cfg)
@@ -66,6 +73,11 @@ class TestHPOParallelHelpers(unittest.TestCase):
         self.assertEqual(int(settings["max_trials_per_worker_process"]), 2)
         self.assertTrue(bool(settings["rss_watchdog_enabled"]))
         self.assertEqual(float(settings["rss_watchdog_max_worker_rss_gb"]), 28.0)
+        self.assertEqual(float(settings["rss_watchdog_startup_grace_seconds"]), 90.0)
+        self.assertTrue(bool(settings["rss_watchdog_require_trial_start"]))
+        self.assertEqual(float(settings["rss_watchdog_startup_timeout_seconds"]), 2400.0)
+        self.assertTrue(bool(settings["rss_watchdog_single_worker_fallback_enabled"]))
+        self.assertEqual(int(settings["rss_watchdog_max_restarts_before_single_worker"]), 3)
 
     def test_resolve_parallel_settings_requires_positive_worker_cap(self) -> None:
         with self.assertRaises(ValueError):
@@ -91,6 +103,109 @@ class TestHPOParallelHelpers(unittest.TestCase):
                     }
                 }
             )
+
+    def test_resolve_parallel_settings_rejects_invalid_startup_grace(self) -> None:
+        with self.assertRaises(ValueError):
+            _resolve_parallel_settings(
+                {
+                    "parallel": {
+                        "enabled": True,
+                        "max_trials_per_worker_process": 2,
+                        "rss_watchdog_startup_grace_seconds": -1,
+                        "resources": ["gpu:0"],
+                    }
+                }
+            )
+
+    def test_resolve_parallel_settings_rejects_invalid_startup_timeout(self) -> None:
+        with self.assertRaises(ValueError):
+            _resolve_parallel_settings(
+                {
+                    "parallel": {
+                        "enabled": True,
+                        "max_trials_per_worker_process": 2,
+                        "rss_watchdog_startup_timeout_seconds": 0,
+                        "resources": ["gpu:0"],
+                    }
+                }
+            )
+
+    def test_resolve_parallel_settings_rejects_invalid_fallback_restart_threshold(self) -> None:
+        with self.assertRaises(ValueError):
+            _resolve_parallel_settings(
+                {
+                    "parallel": {
+                        "enabled": True,
+                        "max_trials_per_worker_process": 2,
+                        "rss_watchdog_max_restarts_before_single_worker": 0,
+                        "resources": ["gpu:0"],
+                    }
+                }
+            )
+
+    def test_should_trigger_rss_watchdog_honors_startup_grace(self) -> None:
+        should_trigger, _, _ = _should_trigger_rss_watchdog(
+            rss_watchdog_enabled=True,
+            rss_by_pid={123: 10_000},
+            rss_watchdog_limit_bytes=1,
+            wave_started_monotonic=100.0,
+            now_monotonic=120.0,
+            startup_grace_seconds=30.0,
+            require_trial_start=False,
+            trial_started_in_wave=False,
+            startup_timeout_seconds=600.0,
+        )
+        self.assertFalse(should_trigger)
+
+    def test_should_trigger_rss_watchdog_requires_trial_start_before_timeout(self) -> None:
+        should_trigger, _, _ = _should_trigger_rss_watchdog(
+            rss_watchdog_enabled=True,
+            rss_by_pid={123: 10_000},
+            rss_watchdog_limit_bytes=1,
+            wave_started_monotonic=100.0,
+            now_monotonic=500.0,
+            startup_grace_seconds=30.0,
+            require_trial_start=True,
+            trial_started_in_wave=False,
+            startup_timeout_seconds=1_000.0,
+        )
+        self.assertFalse(should_trigger)
+
+    def test_should_trigger_rss_watchdog_allows_timeout_without_trial_start(self) -> None:
+        should_trigger, pid, rss = _should_trigger_rss_watchdog(
+            rss_watchdog_enabled=True,
+            rss_by_pid={123: 10_000},
+            rss_watchdog_limit_bytes=1,
+            wave_started_monotonic=100.0,
+            now_monotonic=1_500.0,
+            startup_grace_seconds=30.0,
+            require_trial_start=True,
+            trial_started_in_wave=False,
+            startup_timeout_seconds=1_000.0,
+        )
+        self.assertTrue(should_trigger)
+        self.assertEqual(pid, 123)
+        self.assertEqual(rss, 10_000)
+
+    def test_should_trigger_rss_watchdog_with_started_trial(self) -> None:
+        should_trigger, pid, rss = _should_trigger_rss_watchdog(
+            rss_watchdog_enabled=True,
+            rss_by_pid={123: 10_000},
+            rss_watchdog_limit_bytes=1,
+            wave_started_monotonic=100.0,
+            now_monotonic=200.0,
+            startup_grace_seconds=30.0,
+            require_trial_start=True,
+            trial_started_in_wave=True,
+            startup_timeout_seconds=1_000.0,
+        )
+        self.assertTrue(should_trigger)
+        self.assertEqual(pid, 123)
+        self.assertEqual(rss, 10_000)
+
+    def test_select_wave_resources_respects_single_worker_override(self) -> None:
+        selected = _select_wave_resources(["gpu:0", "gpu:1"], remaining_trials=5, force_single_worker=True)
+        self.assertEqual(selected, ["gpu:0"])
 
     def test_resolve_worker_runtime_options_parses_explicit_values(self) -> None:
         runtime_cfg = {
