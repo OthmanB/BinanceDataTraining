@@ -76,7 +76,7 @@ data:  # Controls where raw data come from and over which time windows.
     cadence_seconds: 10        # Desired temporal spacing between logical samples; influences visible window length in steps.
 
   ingestion:
-    chunk_hours: 12  # Physical time span per query chunk; trade-off between request size and number of round trips.
+    chunk_hours: 6  # Physical time span per query chunk; trade-off between request size and number of round trips.
     chunk_delay_seconds: 0.5  # Sleep between chunk fetches to reduce pressure on live writes.
     max_concurrent_chunk_fetches: 1  # Concurrency cap for chunk fetches; keep at 1 for low DB load.
 
@@ -453,6 +453,7 @@ evaluation:  # Post-training evaluation and calibration settings.
 # Data Diagnostics Configuration
 diagnostics:  # Controls pre-training data quality checks and their logging.
   enabled: true  # When true, run diagnostics on snapshot-level data before training.
+  execution_mode: "standalone"  # Diagnostics execution: "standalone" (single full-range pass) or "per_snapshot" (run after each prepared snapshot/window).
 
   sampling:
     method: "uniform"   # How to sample indices for diagnostics: "uniform" grid or "random" subset of training indices.

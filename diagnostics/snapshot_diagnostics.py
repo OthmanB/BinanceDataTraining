@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, cast
 import logging
 from pathlib import Path
+import re
 import tempfile
 
 import numpy as np
@@ -15,6 +16,71 @@ from training.snapshot_dataset import iter_snapshot_batches, prepare_snapshot_da
 
 
 logger = logging.getLogger(__name__)
+
+
+DIAGNOSTICS_MODE_STANDALONE = "standalone"
+DIAGNOSTICS_MODE_PER_SNAPSHOT = "per_snapshot"
+
+
+def resolve_diagnostics_execution_mode(config: Dict[str, Any]) -> str:
+    """Resolve diagnostics execution mode from configuration.
+
+    Supported modes:
+    - "standalone": current behavior, run one full-range diagnostics pass.
+    - "per_snapshot": run diagnostics when each snapshot is prepared.
+    """
+    diagnostics_cfg = config.get("diagnostics")
+    if not isinstance(diagnostics_cfg, dict):
+        return DIAGNOSTICS_MODE_STANDALONE
+
+    raw_mode = diagnostics_cfg.get("execution_mode", DIAGNOSTICS_MODE_STANDALONE)
+    mode = str(raw_mode).strip().lower()
+    if mode in {DIAGNOSTICS_MODE_STANDALONE, DIAGNOSTICS_MODE_PER_SNAPSHOT}:
+        return mode
+
+    raise ValueError(
+        "diagnostics.execution_mode must be 'standalone' or 'per_snapshot'; "
+        f"got {raw_mode!r}",
+    )
+
+
+def _format_bytes(value: float) -> str:
+    size = float(max(value, 0.0))
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    idx = 0
+    while size >= 1024.0 and idx < len(units) - 1:
+        size /= 1024.0
+        idx += 1
+    return f"{size:.2f}{units[idx]}"
+
+
+def _compute_directory_size_bytes(path: Path) -> int:
+    total = 0
+    if not path.exists() or not path.is_dir():
+        return total
+    for item in path.rglob("*"):
+        if not item.is_file():
+            continue
+        try:
+            total += int(item.stat().st_size)
+        except OSError:
+            continue
+    return total
+
+
+def _resolve_diagnostics_artifact_path(scope_label: Optional[str]) -> str:
+    base_path = "snapshot_diagnostics"
+    if scope_label is None:
+        return base_path
+
+    raw_scope = str(scope_label).strip().lower()
+    if not raw_scope:
+        return base_path
+
+    normalized_scope = re.sub(r"[^a-z0-9]+", "_", raw_scope).strip("_")
+    if not normalized_scope:
+        normalized_scope = "scope"
+    return f"{base_path}/{normalized_scope}"
 
 
 def _compute_split_boundaries(n_samples: int, train_ratio: float, validation_ratio: float, test_ratio: float) -> Tuple[int, int, int]:
@@ -84,9 +150,14 @@ def _extract_top_of_book(sample: np.ndarray) -> Optional[Tuple[float, float, flo
     else:
         return None
 
-    if None in {bid_price, bid_qty, ask_price, ask_qty}:
+    if bid_price is None or bid_qty is None or ask_price is None or ask_qty is None:
         return None
-    return float(bid_price), float(bid_qty), float(ask_price), float(ask_qty)
+    return (
+        float(cast(float, bid_price)),
+        float(cast(float, bid_qty)),
+        float(cast(float, ask_price)),
+        float(cast(float, ask_qty)),
+    )
 
 
 def run_snapshot_diagnostics(config: Dict[str, Any]) -> None:
@@ -106,10 +177,49 @@ def run_snapshot_diagnostics(config: Dict[str, Any]) -> None:
         return
 
     snapshot_dataset = prepare_snapshot_dataset(config)
+    run_snapshot_diagnostics_for_dataset(config, snapshot_dataset, scope_label="standalone")
+
+
+def run_snapshot_diagnostics_for_dataset(
+    config: Dict[str, Any],
+    snapshot_dataset: Any,
+    *,
+    scope_label: Optional[str] = None,
+) -> None:
+    """Run diagnostics for an already prepared snapshot dataset.
+
+    Parameters
+    ----------
+    config:
+        Full configuration dictionary.
+    snapshot_dataset:
+        Prepared dataset returned by ``prepare_snapshot_dataset``.
+    scope_label:
+        Optional label (for example, sequential window index) included in logs.
+    """
+
+    diagnostics_cfg = config["diagnostics"]
+    if not bool(diagnostics_cfg["enabled"]):
+        logger.info("Snapshot diagnostics disabled via configuration; skipping.")
+        return
+
     n_samples = int(snapshot_dataset.total_samples)
     if n_samples <= 0:
         logger.info("Snapshot diagnostics skipped: snapshot dataset has no samples.")
         return
+
+    snapshot_dir = Path(str(snapshot_dataset.snapshot_dir))
+    scope_suffix = f" ({scope_label})" if scope_label else ""
+    artifact_path = _resolve_diagnostics_artifact_path(scope_label)
+    logger.info(
+        "Running snapshot diagnostics%s: snapshot_dir=%s samples=%s chunks=%s size=%s artifact_path=%s",
+        scope_suffix,
+        snapshot_dir,
+        n_samples,
+        int(len(getattr(snapshot_dataset, "chunks", []) or [])),
+        _format_bytes(float(_compute_directory_size_bytes(snapshot_dir))),
+        artifact_path,
+    )
 
     split_cfg = config["preprocessing"]["train_test_split"]
     train_end, _, _ = _compute_split_boundaries(
@@ -178,7 +288,8 @@ def run_snapshot_diagnostics(config: Dict[str, Any]) -> None:
     if duty_cycle_sampled:
         duty_arr = np.asarray(duty_cycle_sampled, dtype="float64")
         logger.info(
-            "Snapshot diagnostics duty-cycle stats (sampled): min=%.6f max=%.6f mean=%.6f std=%.6f",
+            "Snapshot diagnostics duty-cycle stats (sampled%s): min=%.6f max=%.6f mean=%.6f std=%.6f",
+            scope_suffix,
             float(np.min(duty_arr)),
             float(np.max(duty_arr)),
             float(np.mean(duty_arr)),
@@ -188,7 +299,8 @@ def run_snapshot_diagnostics(config: Dict[str, Any]) -> None:
     if spread_pct_sampled:
         spread_arr = np.asarray(spread_pct_sampled, dtype="float64")
         logger.info(
-            "Snapshot diagnostics spread stats (sampled): mean=%.6f std=%.6f max=%.6f",
+            "Snapshot diagnostics spread stats (sampled%s): mean=%.6f std=%.6f max=%.6f",
+            scope_suffix,
             float(np.mean(spread_arr)),
             float(np.std(spread_arr)),
             float(np.max(spread_arr)),
@@ -204,7 +316,8 @@ def run_snapshot_diagnostics(config: Dict[str, Any]) -> None:
         large_count = int(np.sum(delta_seconds > large_gap))
         very_large_count = int(np.sum(delta_seconds > very_large_gap))
         logger.info(
-            "Snapshot diagnostics gap stats (train): large_gaps=%s very_large_gaps=%s max_gap_seconds=%s",
+            "Snapshot diagnostics gap stats (train%s): large_gaps=%s very_large_gaps=%s max_gap_seconds=%s",
+            scope_suffix,
             large_count,
             very_large_count,
             int(np.max(delta_seconds)) if delta_seconds.size > 0 else 0,
@@ -343,17 +456,49 @@ def run_snapshot_diagnostics(config: Dict[str, Any]) -> None:
         if not artifact_paths:
             return
 
+        artifact_sizes: List[int] = []
+        for artifact in artifact_paths:
+            try:
+                artifact_sizes.append(int(artifact.stat().st_size))
+            except OSError:
+                artifact_sizes.append(0)
+
+        logger.info(
+            "Snapshot diagnostics produced %s artifact(s)%s, total_size=%s",
+            len(artifact_paths),
+            scope_suffix,
+            _format_bytes(float(sum(artifact_sizes))),
+        )
+        for artifact, size in zip(artifact_paths, artifact_sizes):
+            logger.debug(
+                "Snapshot diagnostics artifact ready: path=%s size=%s",
+                artifact,
+                _format_bytes(float(size)),
+            )
+
         try:
             import mlflow  # type: ignore[import]
         except Exception as exc:  # noqa: BLE001
             logger.warning("Snapshot diagnostics skipped MLflow logging: %s", exc)
             return
 
-        for artifact in artifact_paths:
+        for artifact, size in zip(artifact_paths, artifact_sizes):
             try:
-                mlflow.log_artifact(str(artifact), artifact_path="snapshot_diagnostics")
+                mlflow.log_artifact(str(artifact), artifact_path=artifact_path)
+                logger.debug(
+                    "Logged snapshot diagnostics artifact: path=%s size=%s artifact_path=%s",
+                    artifact,
+                    _format_bytes(float(size)),
+                    artifact_path,
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to log snapshot diagnostics artifact %s: %s", artifact, exc)
 
 
-__all__ = ["run_snapshot_diagnostics"]
+__all__ = [
+    "DIAGNOSTICS_MODE_PER_SNAPSHOT",
+    "DIAGNOSTICS_MODE_STANDALONE",
+    "resolve_diagnostics_execution_mode",
+    "run_snapshot_diagnostics",
+    "run_snapshot_diagnostics_for_dataset",
+]

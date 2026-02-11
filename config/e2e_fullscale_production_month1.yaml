@@ -39,7 +39,7 @@ training:
       resources: ["gpu:0", "gpu:1"]
   sequential_training:
     enabled: true
-    window_days: 7
+    window_days: 2
     cleanup_completed_windows: false
     cleanup_keep_last_windows: 0
     resume_enabled: true
@@ -87,7 +87,7 @@ hyperparameter_optimization:
 
 snapshot:
   enabled: true
-  root_name: "e2e_trials_v2"
+  root_name: "e2e_prod"
   name: "fullscale_production_month1"
 
 evaluation:

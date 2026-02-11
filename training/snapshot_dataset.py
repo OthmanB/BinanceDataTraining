@@ -37,6 +37,33 @@ CHUNK_STORAGE_NPZ = "npz"
 CHUNK_STORAGE_NPY_SHARDS_V1 = "npy_shards_v1"
 
 
+def _format_bytes(value: int) -> str:
+    size = float(max(int(value), 0))
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    idx = 0
+    while size >= 1024.0 and idx < len(units) - 1:
+        size /= 1024.0
+        idx += 1
+    return f"{size:.2f}{units[idx]}"
+
+
+def _safe_file_size(path: str) -> int:
+    try:
+        return int(os.path.getsize(path))
+    except OSError:
+        return 0
+
+
+def _snapshot_directory_size_bytes(snapshot_dir: str) -> int:
+    total = 0
+    if not os.path.isdir(snapshot_dir):
+        return total
+    for root, _, files in os.walk(snapshot_dir):
+        for name in files:
+            total += _safe_file_size(os.path.join(root, name))
+    return total
+
+
 @dataclass(frozen=True)
 class SnapshotChunk:
     """Chunk metadata for a snapshot dataset."""
@@ -1934,6 +1961,30 @@ def _build_snapshot_chunks(
         np.save(os.path.join(context.snapshot_dir, files_rel["anchor_ts"]), anchor_ts, allow_pickle=False)
         np.save(os.path.join(context.snapshot_dir, files_rel["duty_cycle"]), duty_cycle, allow_pickle=False)
 
+        files_abs = {key: os.path.join(context.snapshot_dir, rel_path) for key, rel_path in files_rel.items()}
+        file_sizes = {key: _safe_file_size(path) for key, path in files_abs.items()}
+        chunk_size_bytes = int(sum(file_sizes.values()))
+        logger.info(
+            "Snapshot chunk materialized %s/%s: %s -> %s samples=%s size=%s format=%s",
+            index + 1,
+            chunks_total,
+            chunk_start,
+            chunk_end,
+            int(x.shape[0]),
+            _format_bytes(chunk_size_bytes),
+            CHUNK_STORAGE_NPY_SHARDS_V1,
+        )
+        logger.debug(
+            "Snapshot chunk files written: %s",
+            {
+                key: {
+                    "path": files_abs[key],
+                    "size_bytes": file_sizes[key],
+                }
+                for key in files_abs
+            },
+        )
+
         entry = {
             "start": chunk_start,
             "end": chunk_end,
@@ -2056,6 +2107,12 @@ def _build_snapshot_chunks(
                 mid_prices=series_mid_arr,
                 volumes=series_vol_arr,
             )
+            logger.debug(
+                "Snapshot series file written: path=%s size=%s snapshots=%s",
+                series_path,
+                _format_bytes(_safe_file_size(series_path)),
+                int(series_ts_arr.shape[0]),
+            )
 
         series_entry = {
             "start": chunk_key[0],
@@ -2092,6 +2149,15 @@ def _build_snapshot_chunks(
 
     manifest["complete"] = True
     save_manifest(context, manifest)
+    cached_chunks = int(sum(1 for boundary in output_boundaries if bool(boundary.get("cached"))))
+    snapshot_size_bytes = _snapshot_directory_size_bytes(context.snapshot_dir)
+    logger.info(
+        "Snapshot build complete: snapshot_dir=%s chunks_total=%s cached_chunks=%s size=%s",
+        context.snapshot_dir,
+        int(len(output_boundaries)),
+        cached_chunks,
+        _format_bytes(snapshot_size_bytes),
+    )
     return manifest
 
 

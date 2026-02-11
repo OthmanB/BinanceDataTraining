@@ -430,6 +430,7 @@ evaluation:  # Post-training evaluation and calibration settings.
 # Data Diagnostics Configuration
 diagnostics:  # Controls pre-training data quality checks and their logging.
   enabled: true  # When true, run diagnostics on snapshot-level data before training.
+  execution_mode: "standalone"  # Diagnostics execution: "standalone" (single full-range pass) or "per_snapshot" (run after each prepared snapshot/window).
 
   sampling:
     method: "uniform"   # How to sample indices for diagnostics: "uniform" grid or "random" subset of training indices.

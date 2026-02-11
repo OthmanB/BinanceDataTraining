@@ -528,6 +528,8 @@ sections:
     required_keys:
       enabled:
         type: boolean
+      execution_mode:
+        type: string
       sampling.method:
         type: string
       sampling.num_samples:

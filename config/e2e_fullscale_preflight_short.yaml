@@ -23,6 +23,9 @@ training:
     cleanup_keep_last_windows: 0
     resume_enabled: true
 
+diagnostics:
+  execution_mode: "per_snapshot"
+
 hyperparameter_optimization:
   n_trials: 2
   parallel:

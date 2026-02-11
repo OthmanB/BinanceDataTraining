@@ -8,7 +8,13 @@ from unittest import mock
 
 import numpy as np
 
-from diagnostics.snapshot_diagnostics import run_snapshot_diagnostics
+from diagnostics.snapshot_diagnostics import (
+    DIAGNOSTICS_MODE_PER_SNAPSHOT,
+    DIAGNOSTICS_MODE_STANDALONE,
+    _resolve_diagnostics_artifact_path,
+    resolve_diagnostics_execution_mode,
+    run_snapshot_diagnostics,
+)
 
 
 class _FakeSnapshotDataset:
@@ -18,10 +24,35 @@ class _FakeSnapshotDataset:
 
 
 class TestSnapshotDiagnostics(unittest.TestCase):
+    def test_resolve_diagnostics_artifact_path_scopes(self) -> None:
+        self.assertEqual(_resolve_diagnostics_artifact_path(None), "snapshot_diagnostics")
+        self.assertEqual(_resolve_diagnostics_artifact_path(""), "snapshot_diagnostics")
+        self.assertEqual(
+            _resolve_diagnostics_artifact_path("window 1/2"),
+            "snapshot_diagnostics/window_1_2",
+        )
+        self.assertEqual(
+            _resolve_diagnostics_artifact_path("Window-2"),
+            "snapshot_diagnostics/window_2",
+        )
+
+    def test_resolve_diagnostics_execution_mode_defaults_to_standalone(self) -> None:
+        self.assertEqual(resolve_diagnostics_execution_mode({}), DIAGNOSTICS_MODE_STANDALONE)
+
+    def test_resolve_diagnostics_execution_mode_accepts_per_snapshot(self) -> None:
+        config = {"diagnostics": {"execution_mode": "per_snapshot"}}
+        self.assertEqual(resolve_diagnostics_execution_mode(config), DIAGNOSTICS_MODE_PER_SNAPSHOT)
+
+    def test_resolve_diagnostics_execution_mode_rejects_invalid_value(self) -> None:
+        config = {"diagnostics": {"execution_mode": "invalid"}}
+        with self.assertRaises(ValueError):
+            resolve_diagnostics_execution_mode(config)
+
     def test_run_snapshot_diagnostics_with_snapshot_inputs(self) -> None:
         config = {
             "diagnostics": {
                 "enabled": True,
+                "execution_mode": "standalone",
                 "sampling": {"method": "uniform", "num_samples": 2, "random_seed": 42},
                 "gap_checks": {"large_gap_multiplier": 2.0, "very_large_gap_multiplier": 6.0},
                 "visualization": {"enabled": False, "time_series": False, "histograms": False, "histogram_bins": 10},

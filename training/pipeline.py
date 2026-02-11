@@ -1689,7 +1689,7 @@ def pre_build_snapshots(config: Dict[str, Any]) -> None:
     """Pre-build all snapshot datasets required by the current config.
 
     When sequential training is enabled, this iterates over every time window
-    and calls :func:`prepare_snapshot_dataset` for each so the ``.npz`` chunk
+    and calls :func:`prepare_snapshot_dataset` for each so chunk artifacts
     files exist on disk before any parallel HPO worker is spawned. It also
     precomputes trial-invariant artifacts (normalization stats, class-weight
     label stats, long-term features) once per snapshot so HPO workers reuse
@@ -1703,6 +1703,17 @@ def pre_build_snapshots(config: Dict[str, Any]) -> None:
 
     if not bool(config.get("snapshot", {}).get("enabled", False)):
         return
+
+    from diagnostics.snapshot_diagnostics import (
+        DIAGNOSTICS_MODE_PER_SNAPSHOT,
+        resolve_diagnostics_execution_mode,
+        run_snapshot_diagnostics_for_dataset,
+    )
+
+    diagnostics_cfg = config.get("diagnostics")
+    diagnostics_enabled = bool(diagnostics_cfg.get("enabled", False)) if isinstance(diagnostics_cfg, dict) else False
+    diagnostics_mode = resolve_diagnostics_execution_mode(config)
+    run_per_snapshot_diagnostics = diagnostics_enabled and diagnostics_mode == DIAGNOSTICS_MODE_PER_SNAPSHOT
 
     windows = _resolve_sequential_windows(config)
     if windows is not None and len(windows) > 1:
@@ -1718,10 +1729,22 @@ def pre_build_snapshots(config: Dict[str, Any]) -> None:
                 window_end,
             )
             snapshot_dataset = prepare_snapshot_dataset(window_config)
+            if run_per_snapshot_diagnostics:
+                run_snapshot_diagnostics_for_dataset(
+                    window_config,
+                    snapshot_dataset,
+                    scope_label=f"window {idx + 1}/{len(windows)}",
+                )
             _precompute_trial_invariant_snapshot_artifacts(window_config, snapshot_dataset)
     else:
         logger.info("Pre-building snapshot for single training window.")
         snapshot_dataset = prepare_snapshot_dataset(config)
+        if run_per_snapshot_diagnostics:
+            run_snapshot_diagnostics_for_dataset(
+                config,
+                snapshot_dataset,
+                scope_label="single_window",
+            )
         _precompute_trial_invariant_snapshot_artifacts(config, snapshot_dataset)
 
     logger.info("Snapshot pre-build complete; all chunks cached on disk.")

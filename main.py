@@ -23,7 +23,11 @@ import traceback
 from utils.config_loader import ConfigError, load_config
 from utils.env_validator import validate_environment
 from utils.colored_logging import setup_colored_logging
-from diagnostics import run_snapshot_diagnostics
+from diagnostics import (
+    DIAGNOSTICS_MODE_PER_SNAPSHOT,
+    resolve_diagnostics_execution_mode,
+    run_snapshot_diagnostics,
+)
 from training import run_training_pipeline
 from training.pipeline import _resolve_sequential_windows
 from training.snapshot_store import resolve_snapshot_context
@@ -392,12 +396,30 @@ def main() -> int:
 
         data_object = None
         logger.info("Snapshot mode enabled; using snapshot-native diagnostics and training pipeline.")
-        run_snapshot_diagnostics(config)
 
         config_for_training = config
-
         hpo_cfg = config["hyperparameter_optimization"]  # Required by schema
-        if bool(hpo_cfg["enabled"]):
+        hpo_enabled = bool(hpo_cfg["enabled"])
+
+        diagnostics_cfg = config["diagnostics"]
+        diagnostics_mode = resolve_diagnostics_execution_mode(config)
+        if bool(diagnostics_cfg["enabled"]):
+            if diagnostics_mode == DIAGNOSTICS_MODE_PER_SNAPSHOT:
+                logger.info(
+                    "Diagnostics execution_mode='per_snapshot'; deferring diagnostics to snapshot pre-build/training windows.",
+                )
+                if not hpo_enabled:
+                    from training.pipeline import pre_build_snapshots
+
+                    logger.info(
+                        "Running snapshot pre-build now to execute per-snapshot diagnostics before training.",
+                    )
+                    pre_build_snapshots(config_for_training)
+                    config_for_training["_snapshot_prebuild_complete"] = True
+            else:
+                run_snapshot_diagnostics(config_for_training)
+
+        if hpo_enabled:
             if mode == "trial":
                 windows = _resolve_sequential_windows(config_for_training)
                 if windows is None or len(windows) <= 1:

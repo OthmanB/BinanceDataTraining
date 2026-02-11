@@ -32,6 +32,7 @@ def _base_config(mode: str) -> dict:
         "model": {"architecture": "cnn_lstm"},
         "mlflow": {"run_naming": {"pattern": "{asset}_{model}_{timestamp}"}},
         "snapshot": {"enabled": True},
+        "diagnostics": {"enabled": True, "execution_mode": "standalone"},
         "hyperparameter_optimization": {"enabled": True},
     }
 
@@ -75,6 +76,7 @@ class TestMainSnapshotHPOFlows(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         mock_validate_env.assert_called_once()
+        mock_run_diagnostics.assert_called_once_with(config)
         mock_run_hpo.assert_called_once_with(config, None)
         mock_run_training.assert_not_called()
         mock_eval_seq.assert_not_called()
@@ -122,6 +124,7 @@ class TestMainSnapshotHPOFlows(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         mock_validate_env.assert_called_once()
+        mock_run_diagnostics.assert_called_once_with(config)
         mock_run_hpo.assert_called_once_with(config, None)
         mock_run_training.assert_called_once_with(best_config, None)
         mock_eval_seq.assert_called_once()
@@ -130,6 +133,50 @@ class TestMainSnapshotHPOFlows(unittest.TestCase):
         self.assertIs(eval_args[0], best_config)
         self.assertIs(eval_args[1], model)
         self.assertIsInstance(eval_args[2], logging.Logger)
+        mock_end_run.assert_called_once()
+
+    @mock.patch("main.end_run")
+    @mock.patch("main.run_training_pipeline")
+    @mock.patch("main._evaluate_snapshot_sequential")
+    @mock.patch("main.run_hyperparameter_search")
+    @mock.patch("main.start_run")
+    @mock.patch("main.validate_environment")
+    @mock.patch("main.run_snapshot_diagnostics")
+    @mock.patch("main.setup_colored_logging")
+    @mock.patch("main.load_config")
+    @mock.patch("main._parse_args")
+    def test_per_snapshot_mode_skips_standalone_diagnostics(
+        self,
+        mock_parse_args: mock.MagicMock,
+        mock_load_config: mock.MagicMock,
+        mock_setup_logger: mock.MagicMock,
+        mock_run_diagnostics: mock.MagicMock,
+        mock_validate_env: mock.MagicMock,
+        mock_start_run: mock.MagicMock,
+        mock_run_hpo: mock.MagicMock,
+        mock_eval_seq: mock.MagicMock,
+        mock_run_training: mock.MagicMock,
+        mock_end_run: mock.MagicMock,
+    ) -> None:
+        config = _base_config("trial")
+        config["diagnostics"]["execution_mode"] = "per_snapshot"
+
+        mock_parse_args.return_value = argparse.Namespace(
+            config="config/e2e_trial_13_snapshot_hpo_trial.yaml",
+            schema="config/validation_schema.yaml",
+        )
+        mock_load_config.return_value = config
+        mock_setup_logger.return_value = logging.getLogger("tests.main_trial_per_snapshot")
+        mock_start_run.return_value = types.SimpleNamespace(info=types.SimpleNamespace(run_id="run-3"))
+        mock_run_hpo.return_value = config
+
+        exit_code = main.main()
+
+        self.assertEqual(exit_code, 0)
+        mock_run_diagnostics.assert_not_called()
+        mock_run_hpo.assert_called_once_with(config, None)
+        mock_run_training.assert_not_called()
+        mock_eval_seq.assert_not_called()
         mock_end_run.assert_called_once()
 
 

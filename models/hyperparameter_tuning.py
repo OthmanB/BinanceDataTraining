@@ -1635,6 +1635,22 @@ def run_hyperparameter_search(
 
     use_parallel = bool(parallel_settings["enabled"]) and n_trials > 1 and len(parallel_settings["resources"]) > 0
 
+    if bool(config.get("snapshot", {}).get("enabled", False)):
+        if bool(config.get("_snapshot_prebuild_complete", False)):
+            logger.info("Snapshot pre-build already completed in current process; skipping duplicate pre-build.")
+        else:
+            try:
+                from training.pipeline import pre_build_snapshots
+
+                logger.info("Pre-building snapshots before hyperparameter search.")
+                pre_build_snapshots(config)
+                config["_snapshot_prebuild_complete"] = True
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Snapshot pre-build failed; workers/trials will build on demand: %s",
+                    exc,
+                )
+
     study: Any
     if use_parallel:
         if isinstance(data_object, dict):
@@ -1714,22 +1730,6 @@ def run_hyperparameter_search(
                     storage=storage_uri,
                 )
                 pre_existing_finished = 0
-
-        # Pre-build all snapshot datasets in the supervisor process so that
-        # parallel workers find them already cached on disk.  This prevents
-        # multiple workers from simultaneously fetching raw data from the
-        # database and building the same snapshot, which would double (or
-        # more) system RAM usage and trigger the RSS watchdog.
-        try:
-            from training.pipeline import pre_build_snapshots
-
-            logger.info("Pre-building snapshots before launching parallel HPO workers.")
-            pre_build_snapshots(config)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "Snapshot pre-build failed; workers will attempt to build on demand: %s",
-                exc,
-            )
 
         logger.info(
             "Starting parallel HPO with %s workers over %s trials. resources=%s storage=%s study=%s",

@@ -5,6 +5,7 @@ from __future__ import annotations
 import types
 import unittest
 from unittest import mock
+from typing import Any, cast
 
 try:
     from hypothesis import given, settings
@@ -13,9 +14,9 @@ try:
     HYPOTHESIS_AVAILABLE = True
 except ImportError:
     HYPOTHESIS_AVAILABLE = False
-    given = None  # type: ignore[assignment]
-    settings = None  # type: ignore[assignment]
-    st = None  # type: ignore[assignment]
+    given = cast(Any, None)
+    settings = cast(Any, None)
+    st = cast(Any, None)
 
 from training.snapshot_dataset import LabelDistribution, NormalizationStats
 from training.pipeline import (
@@ -174,6 +175,34 @@ class TestSnapshotPrebuildArtifacts(unittest.TestCase):
         self.assertEqual(precompute_mock.call_count, 2)
         self.assertEqual(precompute_mock.call_args_list[0].args[1], fake_dataset_a)
         self.assertEqual(precompute_mock.call_args_list[1].args[1], fake_dataset_b)
+
+    def test_pre_build_snapshots_runs_per_snapshot_diagnostics_when_configured(self) -> None:
+        config = self._base_config()
+        config["diagnostics"] = {
+            "enabled": True,
+            "execution_mode": "per_snapshot",
+        }
+
+        fake_dataset_a = types.SimpleNamespace(total_samples=10, chunks=[types.SimpleNamespace(file_path="a.npz")])
+        fake_dataset_b = types.SimpleNamespace(total_samples=20, chunks=[types.SimpleNamespace(file_path="b.npz")])
+        windows = [("2024-01-01", "2024-01-01"), ("2024-01-02", "2024-01-02")]
+
+        with mock.patch("training.pipeline._resolve_sequential_windows", return_value=windows):
+            with mock.patch(
+                "training.pipeline.prepare_snapshot_dataset",
+                side_effect=[fake_dataset_a, fake_dataset_b],
+            ):
+                with mock.patch("training.pipeline._precompute_trial_invariant_snapshot_artifacts"):
+                    with mock.patch(
+                        "diagnostics.snapshot_diagnostics.run_snapshot_diagnostics_for_dataset",
+                    ) as diagnostics_mock:
+                        pre_build_snapshots(config)
+
+        self.assertEqual(diagnostics_mock.call_count, 2)
+        first_scope = diagnostics_mock.call_args_list[0].kwargs.get("scope_label")
+        second_scope = diagnostics_mock.call_args_list[1].kwargs.get("scope_label")
+        self.assertEqual(first_scope, "window 1/2")
+        self.assertEqual(second_scope, "window 2/2")
 
 
 @unittest.skipUnless(HYPOTHESIS_AVAILABLE, "hypothesis not installed")
