@@ -72,6 +72,124 @@ def _compute_split_boundaries(
     return train_end, val_end, test_end
 
 
+def _resolve_snapshot_training_indices(
+    config: Dict[str, Any],
+    n_samples: int,
+) -> Optional[Tuple[int, int, int]]:
+    """Resolve train/validation index boundaries for snapshot training."""
+    training_cfg = config["training"]
+    split_cfg = config["preprocessing"]["train_test_split"]
+    train_ratio = float(split_cfg["train_ratio"])
+    validation_ratio = float(split_cfg["validation_ratio"])
+    test_ratio = float(split_cfg["test_ratio"])
+
+    configured_val_split = float(training_cfg["validation_split"])
+    if abs(configured_val_split - validation_ratio) > 1e-6:
+        raise ValueError(
+            "training.validation_split must match preprocessing.train_test_split.validation_ratio",
+        )
+
+    train_end, val_end, _ = _compute_split_boundaries(
+        n_samples,
+        train_ratio,
+        validation_ratio,
+        test_ratio,
+    )
+    if train_end <= 0:
+        return None
+
+    debug_max_samples = int(training_cfg["debug_max_samples"])
+    effective_train_n = min(train_end, debug_max_samples)
+    if effective_train_n <= 0:
+        return None
+
+    val_start = train_end
+    val_end = min(val_end, n_samples)
+    return effective_train_n, val_start, val_end
+
+
+def _precompute_trial_invariant_snapshot_artifacts(config: Dict[str, Any], snapshot_dataset: Any) -> None:
+    """Warm trial-invariant snapshot artifacts used by HPO trials.
+
+    This computes and caches data artifacts that do not depend on sampled
+    hyperparameters (normalization stats, label stats for class weighting, and
+    long-term features) so parallel HPO workers can focus on model training.
+    """
+    n_samples = int(snapshot_dataset.total_samples)
+    if n_samples <= 0:
+        logger.info("Skipping precompute: snapshot dataset has no samples.")
+        return
+    if not getattr(snapshot_dataset, "chunks", None):
+        logger.info("Skipping precompute: snapshot dataset has no chunk files.")
+        return
+
+    _enforce_production_sample_cap_snapshot(config, n_samples)
+
+    split_indices = _resolve_snapshot_training_indices(config, n_samples)
+    if split_indices is None:
+        logger.info("Skipping precompute: no effective training samples available.")
+        return
+    effective_train_n, val_start, val_end = split_indices
+    val_count = max(0, val_end - val_start)
+
+    context = resolve_snapshot_context(config)
+    manifest = load_or_create_manifest(context, config)
+
+    normalization_cfg = config["preprocessing"]["normalization"]
+    fit_on_train_only = bool(normalization_cfg["fit_on_train_only"])
+
+    _get_normalization_stats(
+        config,
+        context,
+        manifest,
+        snapshot_dataset,
+        0,
+        effective_train_n,
+        "train",
+    )
+    if not fit_on_train_only and val_count > 0:
+        _get_normalization_stats(
+            config,
+            context,
+            manifest,
+            snapshot_dataset,
+            val_start,
+            val_end,
+            "val",
+        )
+
+    training_cfg = config["training"]
+    output_cfg = config["model"]["output"]
+    use_class_weights = bool(training_cfg["class_weights"]["compute_from_train"])
+    if use_class_weights:
+        num_classes = int(output_cfg["num_classes"])
+        train_label_dist = load_label_stats_from_manifest(manifest, "train")
+        if train_label_dist is None:
+            train_label_dist = compute_label_distribution(
+                snapshot_dataset,
+                start_index=0,
+                end_index=effective_train_n,
+                num_classes=num_classes,
+            )
+            save_label_stats_to_manifest(context, manifest, train_label_dist, "train")
+
+    if is_long_term_enabled(config):
+        cadence_seconds = int(config["data"]["time_range"]["cadence_seconds"])
+        compute_long_term_features_for_dataset(
+            config,
+            snapshot_dataset,
+            cadence_seconds=cadence_seconds,
+        )
+
+    logger.info(
+        "Precomputed trial-invariant snapshot artifacts: train_samples=%s, val_samples=%s, class_weights=%s, long_term=%s",
+        effective_train_n,
+        val_count,
+        use_class_weights,
+        is_long_term_enabled(config),
+    )
+
+
 def _enforce_production_sample_cap_snapshot(config: Dict[str, Any], n_samples: int) -> None:
     run_mode_cfg = config["run_mode"]
     mode = str(run_mode_cfg["mode"])
@@ -323,7 +441,6 @@ def _fit_snapshot_model_once(
     dist_ctx: Optional[DistributedContext] = None,
 ) -> Tuple[Optional[Any], int, Optional[float], float]:
     training_cfg = config["training"]
-    debug_max_samples = int(training_cfg["debug_max_samples"])
     epochs = int(training_cfg["epochs"])
     batch_size = int(training_cfg["batch_size"])
     # MirroredStrategy splits each dataset element across replicas, so the
@@ -332,17 +449,6 @@ def _fit_snapshot_model_once(
         dist_ctx.global_batch_size(batch_size) if dist_ctx is not None
         else batch_size
     )
-
-    split_cfg = config["preprocessing"]["train_test_split"]
-    train_ratio = float(split_cfg["train_ratio"])
-    validation_ratio = float(split_cfg["validation_ratio"])
-    test_ratio = float(split_cfg["test_ratio"])
-
-    configured_val_split = float(training_cfg["validation_split"])
-    if abs(configured_val_split - validation_ratio) > 1e-6:
-        raise ValueError(
-            "training.validation_split must match preprocessing.train_test_split.validation_ratio",
-        )
 
     model_cfg = config["model"]
     output_cfg = model_cfg["output"]
@@ -362,24 +468,12 @@ def _fit_snapshot_model_once(
 
     _enforce_production_sample_cap_snapshot(config, n_samples)
 
-    train_end, val_end, _ = _compute_split_boundaries(
-        n_samples,
-        train_ratio,
-        validation_ratio,
-        test_ratio,
-    )
-
-    if train_end <= 0:
-        logger.info("Snapshot training window skipped: no training samples available after split.")
+    split_indices = _resolve_snapshot_training_indices(config, n_samples)
+    if split_indices is None:
+        logger.info("Snapshot training window skipped: no effective training samples available.")
         return model, 0, None, 0.0
+    effective_train_n, val_start, val_end = split_indices
 
-    effective_train_n = min(train_end, debug_max_samples)
-    if effective_train_n <= 0:
-        logger.info("Snapshot training window skipped: debug_max_samples=%s", debug_max_samples)
-        return model, 0, None, 0.0
-
-    val_start = train_end
-    val_end = min(val_end, n_samples)
     val_count = max(0, val_end - val_start)
 
     if not snapshot_dataset.chunks:
@@ -429,7 +523,7 @@ def _fit_snapshot_model_once(
 
     mask_start, mask_count = get_mask_channel_info(config)
 
-    if fit_on_train_only:
+    if fit_on_train_only or val_count <= 0:
         val_stats = train_stats
     else:
         val_stats = _get_normalization_stats(
@@ -865,7 +959,6 @@ def _run_snapshot_training_pipeline_sequential(
 
 def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
     training_cfg = config["training"]
-    debug_max_samples = int(training_cfg["debug_max_samples"])
     epochs = int(training_cfg["epochs"])
     batch_size = int(training_cfg["batch_size"])  # per-replica batch size
 
@@ -878,17 +971,6 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
         dist_ctx.global_batch_size(batch_size) if dist_ctx is not None
         else batch_size
     )
-
-    split_cfg = config["preprocessing"]["train_test_split"]
-    train_ratio = float(split_cfg["train_ratio"])
-    validation_ratio = float(split_cfg["validation_ratio"])
-    test_ratio = float(split_cfg["test_ratio"])
-
-    configured_val_split = float(training_cfg["validation_split"])
-    if abs(configured_val_split - validation_ratio) > 1e-6:
-        raise ValueError(
-            "training.validation_split must match preprocessing.train_test_split.validation_ratio",
-        )
 
     model_cfg = config["model"]
     output_cfg = model_cfg["output"]
@@ -913,24 +995,12 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
 
     _enforce_production_sample_cap_snapshot(config, n_samples)
 
-    train_end, val_end, _ = _compute_split_boundaries(
-        n_samples,
-        train_ratio,
-        validation_ratio,
-        test_ratio,
-    )
-
-    if train_end <= 0:
-        logger.info("Snapshot training skipped: no training samples available after split.")
+    split_indices = _resolve_snapshot_training_indices(config, n_samples)
+    if split_indices is None:
+        logger.info("Snapshot training skipped: no effective training samples available.")
         return None
+    effective_train_n, val_start, val_end = split_indices
 
-    effective_train_n = min(train_end, debug_max_samples)
-    if effective_train_n <= 0:
-        logger.info("Snapshot training skipped: debug_max_samples=%s", debug_max_samples)
-        return None
-
-    val_start = train_end
-    val_end = min(val_end, n_samples)
     val_count = max(0, val_end - val_start)
 
     if not snapshot_dataset.chunks:
@@ -980,7 +1050,7 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
 
     mask_start, mask_count = get_mask_channel_info(config)
 
-    if fit_on_train_only:
+    if fit_on_train_only or val_count <= 0:
         val_stats = train_stats
     else:
         val_stats = _get_normalization_stats(
@@ -1484,7 +1554,10 @@ def pre_build_snapshots(config: Dict[str, Any]) -> None:
 
     When sequential training is enabled, this iterates over every time window
     and calls :func:`prepare_snapshot_dataset` for each so the ``.npz`` chunk
-    files exist on disk before any parallel HPO worker is spawned.  For
+    files exist on disk before any parallel HPO worker is spawned. It also
+    precomputes trial-invariant artifacts (normalization stats, class-weight
+    label stats, long-term features) once per snapshot so HPO workers reuse
+    cached data artifacts instead of recomputing them per trial. For
     non-sequential configs a single snapshot is built.
 
     This is intentionally a **no-op** for already-cached snapshots (the
@@ -1508,10 +1581,12 @@ def pre_build_snapshots(config: Dict[str, Any]) -> None:
                 window_start,
                 window_end,
             )
-            prepare_snapshot_dataset(window_config)
+            snapshot_dataset = prepare_snapshot_dataset(window_config)
+            _precompute_trial_invariant_snapshot_artifacts(window_config, snapshot_dataset)
     else:
         logger.info("Pre-building snapshot for single training window.")
-        prepare_snapshot_dataset(config)
+        snapshot_dataset = prepare_snapshot_dataset(config)
+        _precompute_trial_invariant_snapshot_artifacts(config, snapshot_dataset)
 
     logger.info("Snapshot pre-build complete; all chunks cached on disk.")
 
