@@ -799,6 +799,41 @@ def _apply_worker_mixed_precision(runtime_cfg: Dict[str, Any], resource: str) ->
     )
 
 
+def _apply_hpo_resume_namespace(
+    trial_config: Dict[str, Any],
+    *,
+    study_name: str,
+    trial_number: int,
+    resource: Optional[str],
+    attempt: int,
+) -> Optional[str]:
+    training_cfg = trial_config.get("training")
+    if not isinstance(training_cfg, dict):
+        return None
+
+    sequential_cfg = training_cfg.get("sequential_training")
+    if not isinstance(sequential_cfg, dict):
+        return None
+
+    if not bool(sequential_cfg.get("enabled", False)):
+        return None
+    if not bool(sequential_cfg.get("resume_enabled", False)):
+        return None
+
+    resource_label = str(resource).strip() if resource is not None else "default"
+    namespace = (
+        f"hpo__study={study_name}"
+        f"__trial={trial_number}"
+        f"__attempt={attempt}"
+        f"__resource={resource_label}"
+    )
+
+    sequential_cfg["resume_namespace"] = namespace
+    training_cfg["sequential_training"] = sequential_cfg
+    trial_config["training"] = training_cfg
+    return namespace
+
+
 def _build_trial_storage_uri(base_config: Dict[str, Any], storage_uri: Optional[str]) -> str:
     if storage_uri:
         return storage_uri
@@ -864,6 +899,16 @@ def _evaluate_trial_objective(
         trial_config = _apply_hyperparameters(base_config, params_for_attempt)
         if resource is not None:
             trial_config = _apply_worker_resource(trial_config, resource)
+
+        resume_namespace = _apply_hpo_resume_namespace(
+            trial_config,
+            study_name=study_name,
+            trial_number=int(trial.number),
+            resource=resource,
+            attempt=attempt,
+        )
+        if resume_namespace is not None:
+            trial.set_user_attr("sequential_resume_namespace", resume_namespace)
 
         mlflow_cfg = trial_config["mlflow"]
         if not trial_log_models:

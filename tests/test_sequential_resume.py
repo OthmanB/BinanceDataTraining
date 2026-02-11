@@ -63,6 +63,22 @@ class TestSequentialResume(unittest.TestCase):
             self.assertTrue(state_a.endswith(".json"))
             self.assertTrue(model_a.endswith(".keras"))
 
+    def test_resume_paths_change_when_namespace_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = self._base_config(tmpdir)
+            windows = [
+                ("2024-01-01", "2024-01-01"),
+                ("2024-01-02", "2024-01-02"),
+            ]
+
+            state_default, model_default = _resolve_sequential_resume_paths(config, windows)
+
+            config["training"]["sequential_training"]["resume_namespace"] = "hpo__trial=17__resource=gpu:1"
+            state_namespaced, model_namespaced = _resolve_sequential_resume_paths(config, windows)
+
+            self.assertNotEqual(state_default, state_namespaced)
+            self.assertNotEqual(model_default, model_namespaced)
+
     def test_cleanup_retains_only_last_n_directories(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             d1 = os.path.join(tmpdir, "w1")

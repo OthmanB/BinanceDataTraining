@@ -9,6 +9,7 @@ import types
 import unittest
 from unittest import mock
 
+from observability import run_state as run_state_module
 from observability.run_state import RunStateWriter, _resolve_sqlite_path, load_run_state
 from observability.server import (
     ServerConfig,
@@ -24,6 +25,15 @@ class TestObservabilitySqliteRunState(unittest.TestCase):
     def test_resolve_sqlite_path_rejects_non_sqlite_uri(self) -> None:
         with self.assertRaises(ValueError):
             _resolve_sqlite_path("tmp/observability/run_state.json")
+
+    def test_get_run_state_writer_invalid_env_path_returns_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            invalid_path = str(Path(tmp_dir) / "run_state.json")
+            with mock.patch.dict(os.environ, {"RUN_STATE_PATH": invalid_path}, clear=False):
+                with mock.patch("observability.run_state._WRITER", None):
+                    writer = run_state_module.get_run_state_writer()
+
+        self.assertIsNone(writer)
 
     def test_writer_persists_and_loads_state_from_sqlite(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

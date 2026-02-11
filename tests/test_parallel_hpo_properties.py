@@ -149,6 +149,81 @@ class TestSequentialResumePathProperties(unittest.TestCase):
             self.assertNotEqual(path_a_state, changed_state)
             self.assertNotEqual(path_a_model, changed_model)
 
+    @settings(max_examples=_MAX_EXAMPLES)
+    @given(
+        namespace_a=st.from_regex(r"[A-Za-z0-9_-]{1,30}", fullmatch=True),
+        namespace_b=st.from_regex(r"[A-Za-z0-9_-]{1,30}", fullmatch=True),
+    )
+    def test_resume_paths_change_with_namespace(self, namespace_a: str, namespace_b: str) -> None:
+        if namespace_a == namespace_b:
+            namespace_b = namespace_b + "-alt"
+
+        windows = [("2024-01-01", "2024-01-02")]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = {
+                "snapshot": {
+                    "enabled": True,
+                    "directory": tmpdir,
+                    "root_name": "root",
+                    "name": "snap",
+                },
+                "data": {
+                    "asset_pairs": {"target_asset": "BTCUSDT"},
+                    "time_range": {
+                        "start_date": "2024-01-01",
+                        "end_date": "2024-01-02",
+                    },
+                },
+                "training": {
+                    "sequential_training": {
+                        "enabled": True,
+                        "resume_enabled": True,
+                        "resume_namespace": namespace_a,
+                    }
+                },
+            }
+
+            state_a, model_a = _resolve_sequential_resume_paths(config, windows)
+            config["training"]["sequential_training"]["resume_namespace"] = namespace_b
+            state_b, model_b = _resolve_sequential_resume_paths(config, windows)
+
+            self.assertNotEqual(state_a, state_b)
+            self.assertNotEqual(model_a, model_b)
+
+    @settings(max_examples=_MAX_EXAMPLES)
+    @given(namespace=st.from_regex(r"[A-Za-z0-9_-]{1,30}", fullmatch=True))
+    def test_resume_paths_deterministic_for_same_namespace(self, namespace: str) -> None:
+        windows = [("2024-01-01", "2024-01-03")]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = {
+                "snapshot": {
+                    "enabled": True,
+                    "directory": tmpdir,
+                    "root_name": "root",
+                    "name": "snap",
+                },
+                "data": {
+                    "asset_pairs": {"target_asset": "BTCUSDT"},
+                    "time_range": {
+                        "start_date": "2024-01-01",
+                        "end_date": "2024-01-03",
+                    },
+                },
+                "training": {
+                    "sequential_training": {
+                        "enabled": True,
+                        "resume_enabled": True,
+                        "resume_namespace": namespace,
+                    }
+                },
+            }
+
+            state_a, model_a = _resolve_sequential_resume_paths(config, windows)
+            state_b, model_b = _resolve_sequential_resume_paths(config, windows)
+
+            self.assertEqual(state_a, state_b)
+            self.assertEqual(model_a, model_b)
+
 
 @unittest.skipUnless(HYPOTHESIS_AVAILABLE, "hypothesis not installed")
 class TestSequentialWindowGenerationProperties(unittest.TestCase):

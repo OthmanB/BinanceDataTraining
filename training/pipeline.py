@@ -185,6 +185,7 @@ def _resolve_sequential_resume_paths(config: Dict[str, Any], windows: List[Tuple
     snapshot_cfg = config["snapshot"]
     data_cfg = config["data"]
     target_asset = str(data_cfg["asset_pairs"]["target_asset"])
+    training_cfg = config.get("training")
 
     root_dir = str(snapshot_cfg["directory"])
     root_name = str(snapshot_cfg["root_name"])
@@ -192,19 +193,27 @@ def _resolve_sequential_resume_paths(config: Dict[str, Any], windows: List[Tuple
     start_date = str(data_cfg["time_range"]["start_date"])
     end_date = str(data_cfg["time_range"]["end_date"])
 
+    resume_namespace = ""
+    if isinstance(training_cfg, dict):
+        sequential_cfg = training_cfg.get("sequential_training")
+        if isinstance(sequential_cfg, dict):
+            resume_namespace = str(sequential_cfg.get("resume_namespace", "")).strip()
+
     windows_payload = json.dumps(windows, sort_keys=True, separators=(",", ":"))
     windows_hash = hashlib.sha256(windows_payload.encode("utf-8")).hexdigest()[:12]
 
-    run_key = "__".join(
-        [
-            _sanitize_resume_component(root_name),
-            _sanitize_resume_component(snapshot_name),
-            _sanitize_resume_component(target_asset),
-            _sanitize_resume_component(start_date),
-            _sanitize_resume_component(end_date),
-            windows_hash,
-        ]
-    )
+    run_key_components = [
+        _sanitize_resume_component(root_name),
+        _sanitize_resume_component(snapshot_name),
+        _sanitize_resume_component(target_asset),
+        _sanitize_resume_component(start_date),
+        _sanitize_resume_component(end_date),
+        windows_hash,
+    ]
+    if resume_namespace:
+        run_key_components.append(_sanitize_resume_component(resume_namespace))
+
+    run_key = "__".join(run_key_components)
     state_dir = os.path.join(root_dir, "_sequential_resume")
     os.makedirs(state_dir, exist_ok=True)
     state_path = os.path.join(state_dir, f"{run_key}.json")

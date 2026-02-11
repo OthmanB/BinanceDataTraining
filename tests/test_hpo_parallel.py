@@ -5,10 +5,12 @@ from __future__ import annotations
 import os
 import types
 import unittest
+import copy
 from unittest import mock
 
 from models.hyperparameter_tuning import (
     _allocate_trials_to_workers,
+    _apply_hpo_resume_namespace,
     _apply_worker_resource,
     _apply_worker_runtime_environment,
     _compute_next_batch_size,
@@ -231,6 +233,116 @@ class TestHPOParallelHelpers(unittest.TestCase):
                 self.assertEqual(os.environ.get("CUDA_VISIBLE_DEVICES"), "0")
                 self.assertEqual(os.environ.get("TF_GPU_ALLOCATOR"), "cuda_malloc_async")
         self.assertEqual(fake_tf_config.calls, [(fake_tf_config.device, True)])
+
+    def test_apply_hpo_resume_namespace_sets_namespace_when_enabled(self) -> None:
+        config = {
+            "training": {
+                "sequential_training": {
+                    "enabled": True,
+                    "resume_enabled": True,
+                    "window_days": 1,
+                }
+            }
+        }
+
+        namespace = _apply_hpo_resume_namespace(
+            config,
+            study_name="demo_study",
+            trial_number=12,
+            resource="gpu:1",
+            attempt=2,
+        )
+
+        assert namespace is not None
+        self.assertIn("study=demo_study", namespace)
+        self.assertIn("trial=12", namespace)
+        self.assertIn("attempt=2", namespace)
+        self.assertIn("resource=gpu:1", namespace)
+        seq_cfg = config["training"]["sequential_training"]
+        self.assertEqual(seq_cfg["resume_namespace"], namespace)
+
+    def test_apply_hpo_resume_namespace_skips_when_resume_disabled(self) -> None:
+        config = {
+            "training": {
+                "sequential_training": {
+                    "enabled": True,
+                    "resume_enabled": False,
+                    "window_days": 1,
+                }
+            }
+        }
+
+        namespace = _apply_hpo_resume_namespace(
+            config,
+            study_name="demo_study",
+            trial_number=7,
+            resource="gpu:0",
+            attempt=0,
+        )
+
+        self.assertIsNone(namespace)
+        seq_cfg = config["training"]["sequential_training"]
+        self.assertNotIn("resume_namespace", seq_cfg)
+
+    def test_evaluate_trial_objective_sets_resume_namespace_for_training_pipeline(self) -> None:
+        trial = types.SimpleNamespace(number=9, user_attrs={})
+
+        def _set_user_attr(key: str, value: object) -> None:
+            trial.user_attrs[key] = value
+
+        trial.set_user_attr = _set_user_attr
+
+        captured: dict = {}
+
+        base_config = {
+            "mlflow": {
+                "local_tmp_dir": "/tmp",
+                "artifact_logging": {"trained_model": True},
+                "model_registry": {"register_model": True},
+            },
+            "training": {
+                "runtime": {"device": "gpu", "gpu_visible_devices": "0"},
+                "sequential_training": {
+                    "enabled": True,
+                    "window_days": 1,
+                    "resume_enabled": True,
+                },
+            },
+            "model": {"cnn_lstm": {"filters": [64, 128], "lstm_units": 64}},
+        }
+
+        def _run_training_pipeline(cfg: dict, _data_obj: object) -> None:
+            captured["trial_config"] = copy.deepcopy(cfg)
+            cfg["_hpo_last_metric"] = 0.321
+
+        fake_pipeline = types.SimpleNamespace(run_training_pipeline=_run_training_pipeline)
+
+        with mock.patch.dict("sys.modules", {"training.pipeline": fake_pipeline}):
+            with mock.patch("models.hyperparameter_tuning._sample_hyperparameters", return_value={"batch_size": 16}):
+                with mock.patch("models.hyperparameter_tuning._apply_hyperparameters", side_effect=lambda cfg, _p: copy.deepcopy(cfg)):
+                    with mock.patch("models.hyperparameter_tuning._cleanup_trial_runtime"):
+                        value = _evaluate_trial_objective(
+                            base_config,
+                            None,
+                            {"search_space": {}},
+                            "loss",
+                            "minimize",
+                            False,
+                            trial,
+                            resource="gpu:0",
+                            study_name="parallel_hpo",
+                        )
+
+        self.assertEqual(value, 0.321)
+        trial_config = captured["trial_config"]
+        seq_cfg = trial_config["training"]["sequential_training"]
+        namespace = str(seq_cfg.get("resume_namespace", ""))
+        self.assertTrue(namespace)
+        self.assertIn("study=parallel_hpo", namespace)
+        self.assertIn("trial=9", namespace)
+        self.assertIn("attempt=0", namespace)
+        self.assertIn("resource=gpu:0", namespace)
+        self.assertEqual(trial.user_attrs.get("sequential_resume_namespace"), namespace)
 
     def test_evaluate_trial_objective_calls_cleanup_on_success(self) -> None:
         trial = types.SimpleNamespace(number=1, user_attrs={})

@@ -446,7 +446,14 @@ def get_run_state_writer() -> Optional[RunStateWriter]:
     if not path:
         return None
     if _WRITER is None:
-        _WRITER = RunStateWriter(path)
+        try:
+            _WRITER = RunStateWriter(path)
+        except ValueError as exc:
+            logger.warning("Run-state writer disabled due to invalid RUN_STATE_PATH %r: %s", path, exc)
+            return None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Run-state writer failed to initialize for %r: %s", path, exc)
+            return None
     return _WRITER
 
 
