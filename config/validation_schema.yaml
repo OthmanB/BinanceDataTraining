@@ -368,6 +368,14 @@ sections:
         type: boolean
       parallel.rss_watchdog_max_restarts_before_single_worker:
         type: integer
+      parallel.adaptive_scheduler_enabled:
+        type: boolean
+      parallel.adaptive_scheduler_min_workers:
+        type: integer
+      parallel.adaptive_scheduler_recovery_waves:
+        type: integer
+      parallel.adaptive_scheduler_min_trials_per_worker_process:
+        type: integer
       regime.enabled:
         type: boolean
       regime.retry_on_oom:

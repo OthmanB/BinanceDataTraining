@@ -25,6 +25,7 @@ from models.hyperparameter_tuning import (
     _compute_next_batch_size,
     _select_wave_resources,
     _should_trigger_rss_watchdog,
+    _update_adaptive_scheduler_state,
 )
 from training.pipeline import (
     _aggregate_hpo_window_metrics,
@@ -180,6 +181,62 @@ class TestWaveResourceSelectionProperties(unittest.TestCase):
             self.assertEqual(selected, [])
         if force_single and remaining_trials > 0:
             self.assertLessEqual(len(selected), 1)
+
+
+@unittest.skipUnless(HYPOTHESIS_AVAILABLE, "hypothesis not installed")
+class TestAdaptiveSchedulerProperties(unittest.TestCase):
+    @settings(max_examples=_MAX_EXAMPLES)
+    @given(
+        current_worker_cap=st.integers(min_value=1, max_value=8),
+        current_trials_cap=st.integers(min_value=1, max_value=8),
+        max_worker_cap=st.integers(min_value=1, max_value=8),
+        max_trials_cap=st.integers(min_value=1, max_value=8),
+        min_worker_cap=st.integers(min_value=1, max_value=8),
+        min_trials_cap=st.integers(min_value=1, max_value=8),
+        stable_waves=st.integers(min_value=0, max_value=10),
+        recovery_waves=st.integers(min_value=1, max_value=5),
+        wave_had_progress=st.booleans(),
+        worker_error_count=st.integers(min_value=0, max_value=5),
+        watchdog_triggered=st.booleans(),
+    )
+    def test_adaptive_scheduler_caps_stay_within_bounds(
+        self,
+        current_worker_cap: int,
+        current_trials_cap: int,
+        max_worker_cap: int,
+        max_trials_cap: int,
+        min_worker_cap: int,
+        min_trials_cap: int,
+        stable_waves: int,
+        recovery_waves: int,
+        wave_had_progress: bool,
+        worker_error_count: int,
+        watchdog_triggered: bool,
+    ) -> None:
+        max_worker_cap = max(max_worker_cap, min_worker_cap)
+        max_trials_cap = max(max_trials_cap, min_trials_cap)
+        current_worker_cap = min(max(current_worker_cap, min_worker_cap), max_worker_cap)
+        current_trials_cap = min(max(current_trials_cap, min_trials_cap), max_trials_cap)
+
+        next_worker_cap, next_trials_cap, next_stable_waves = _update_adaptive_scheduler_state(
+            current_worker_cap=current_worker_cap,
+            current_trials_per_worker_cap=current_trials_cap,
+            max_worker_cap=max_worker_cap,
+            max_trials_per_worker_cap=max_trials_cap,
+            min_worker_cap=min_worker_cap,
+            min_trials_per_worker_cap=min_trials_cap,
+            stable_waves=stable_waves,
+            recovery_waves=recovery_waves,
+            wave_had_progress=wave_had_progress,
+            worker_error_count=worker_error_count,
+            watchdog_triggered=watchdog_triggered,
+        )
+
+        self.assertGreaterEqual(next_worker_cap, min_worker_cap)
+        self.assertLessEqual(next_worker_cap, max_worker_cap)
+        self.assertGreaterEqual(next_trials_cap, min_trials_cap)
+        self.assertLessEqual(next_trials_cap, max_trials_cap)
+        self.assertGreaterEqual(next_stable_waves, 0)
 
 
 @unittest.skipUnless(HYPOTHESIS_AVAILABLE, "hypothesis not installed")

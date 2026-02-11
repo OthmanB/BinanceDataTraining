@@ -578,6 +578,54 @@ def _select_wave_resources(resources: List[str], remaining_trials: int, force_si
     return resources[:limit]
 
 
+def _update_adaptive_scheduler_state(
+    *,
+    current_worker_cap: int,
+    current_trials_per_worker_cap: int,
+    max_worker_cap: int,
+    max_trials_per_worker_cap: int,
+    min_worker_cap: int,
+    min_trials_per_worker_cap: int,
+    stable_waves: int,
+    recovery_waves: int,
+    wave_had_progress: bool,
+    worker_error_count: int,
+    watchdog_triggered: bool,
+) -> Tuple[int, int, int]:
+    """Update adaptive parallel HPO scheduler state after a wave.
+
+    The scheduler scales down worker parallelism and wave trial budgets after
+    instability (watchdog trigger, worker errors, or no progress), and scales
+    back up after enough stable waves.
+    """
+    next_worker_cap = int(current_worker_cap)
+    next_trials_per_worker_cap = int(current_trials_per_worker_cap)
+    next_stable_waves = int(stable_waves)
+
+    unstable_wave = bool(watchdog_triggered) or int(worker_error_count) > 0 or not bool(wave_had_progress)
+
+    if unstable_wave:
+        next_stable_waves = 0
+        next_worker_cap = max(int(min_worker_cap), int(current_worker_cap) - 1)
+        next_trials_per_worker_cap = max(
+            int(min_trials_per_worker_cap),
+            int(current_trials_per_worker_cap) - 1,
+        )
+        return next_worker_cap, next_trials_per_worker_cap, next_stable_waves
+
+    next_stable_waves = int(stable_waves) + 1
+    if next_stable_waves >= int(recovery_waves):
+        next_worker_cap = min(int(max_worker_cap), int(current_worker_cap) + 1)
+        next_trials_per_worker_cap = min(
+            int(max_trials_per_worker_cap),
+            int(current_trials_per_worker_cap) + 1,
+        )
+        if next_worker_cap != int(current_worker_cap) or next_trials_per_worker_cap != int(current_trials_per_worker_cap):
+            next_stable_waves = 0
+
+    return next_worker_cap, next_trials_per_worker_cap, next_stable_waves
+
+
 def _allocate_trials_to_workers(n_trials: int, n_workers: int) -> list[int]:
     if n_trials <= 0:
         return []
@@ -739,6 +787,53 @@ def _resolve_parallel_settings(hpo_cfg: Dict[str, Any]) -> Dict[str, Any]:
             "hyperparameter_optimization.parallel.rss_watchdog_max_restarts_before_single_worker must be >= 1"
         )
 
+    adaptive_scheduler_enabled = bool(parallel_cfg.get("adaptive_scheduler_enabled", True))
+
+    adaptive_scheduler_min_workers_raw = parallel_cfg.get("adaptive_scheduler_min_workers", 1)
+    try:
+        adaptive_scheduler_min_workers = int(adaptive_scheduler_min_workers_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "hyperparameter_optimization.parallel.adaptive_scheduler_min_workers must be an integer >= 1"
+        ) from exc
+    if adaptive_scheduler_min_workers < 1:
+        raise ValueError(
+            "hyperparameter_optimization.parallel.adaptive_scheduler_min_workers must be >= 1"
+        )
+
+    adaptive_scheduler_recovery_waves_raw = parallel_cfg.get("adaptive_scheduler_recovery_waves", 2)
+    try:
+        adaptive_scheduler_recovery_waves = int(adaptive_scheduler_recovery_waves_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "hyperparameter_optimization.parallel.adaptive_scheduler_recovery_waves must be an integer >= 1"
+        ) from exc
+    if adaptive_scheduler_recovery_waves < 1:
+        raise ValueError(
+            "hyperparameter_optimization.parallel.adaptive_scheduler_recovery_waves must be >= 1"
+        )
+
+    adaptive_scheduler_min_trials_per_worker_process_raw = parallel_cfg.get(
+        "adaptive_scheduler_min_trials_per_worker_process",
+        1,
+    )
+    try:
+        adaptive_scheduler_min_trials_per_worker_process = int(
+            adaptive_scheduler_min_trials_per_worker_process_raw
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "hyperparameter_optimization.parallel.adaptive_scheduler_min_trials_per_worker_process must be an integer >= 1"
+        ) from exc
+    if adaptive_scheduler_min_trials_per_worker_process < 1:
+        raise ValueError(
+            "hyperparameter_optimization.parallel.adaptive_scheduler_min_trials_per_worker_process must be >= 1"
+        )
+    if adaptive_scheduler_min_trials_per_worker_process > max_trials_per_worker_process:
+        raise ValueError(
+            "hyperparameter_optimization.parallel.adaptive_scheduler_min_trials_per_worker_process must be <= parallel.max_trials_per_worker_process"
+        )
+
     return {
         "enabled": enabled,
         "resources": resources,
@@ -754,6 +849,10 @@ def _resolve_parallel_settings(hpo_cfg: Dict[str, Any]) -> Dict[str, Any]:
         "rss_watchdog_startup_timeout_seconds": rss_watchdog_startup_timeout_seconds,
         "rss_watchdog_single_worker_fallback_enabled": rss_watchdog_single_worker_fallback_enabled,
         "rss_watchdog_max_restarts_before_single_worker": rss_watchdog_max_restarts_before_single_worker,
+        "adaptive_scheduler_enabled": adaptive_scheduler_enabled,
+        "adaptive_scheduler_min_workers": adaptive_scheduler_min_workers,
+        "adaptive_scheduler_recovery_waves": adaptive_scheduler_recovery_waves,
+        "adaptive_scheduler_min_trials_per_worker_process": adaptive_scheduler_min_trials_per_worker_process,
     }
 
 
@@ -1401,6 +1500,12 @@ def run_hyperparameter_search(
         resources = list(parallel_settings["resources"])[:n_trials]
         n_workers = len(resources)
         max_trials_per_worker_process = int(parallel_settings["max_trials_per_worker_process"])
+        adaptive_scheduler_enabled = bool(parallel_settings["adaptive_scheduler_enabled"])
+        adaptive_scheduler_min_workers = int(parallel_settings["adaptive_scheduler_min_workers"])
+        adaptive_scheduler_recovery_waves = int(parallel_settings["adaptive_scheduler_recovery_waves"])
+        adaptive_scheduler_min_trials_per_worker_process = int(
+            parallel_settings["adaptive_scheduler_min_trials_per_worker_process"]
+        )
         rss_watchdog_enabled = bool(parallel_settings["rss_watchdog_enabled"])
         rss_watchdog_max_worker_rss_bytes = int(float(parallel_settings["rss_watchdog_max_worker_rss_gb"]) * (1024**3))
         rss_watchdog_check_interval_seconds = float(parallel_settings["rss_watchdog_check_interval_seconds"])
@@ -1488,6 +1593,15 @@ def run_hyperparameter_search(
             study_name,
         )
 
+        adaptive_scheduler_min_workers = min(max(1, adaptive_scheduler_min_workers), max(1, len(resources)))
+        adaptive_scheduler_min_trials_per_worker_process = min(
+            max(1, adaptive_scheduler_min_trials_per_worker_process),
+            max_trials_per_worker_process,
+        )
+        adaptive_worker_cap = len(resources)
+        adaptive_trials_per_worker_cap = max_trials_per_worker_process
+        adaptive_stable_waves = 0
+
         no_progress_cycles = 0
         max_no_progress_cycles = 8
         last_finished = -1
@@ -1528,8 +1642,12 @@ def run_hyperparameter_search(
                     "worker processes may be repeatedly terminating."
                 )
 
+            active_resources = resources[:adaptive_worker_cap]
+            if force_single_worker:
+                active_resources = resources[:1]
+
             wave_resources = _select_wave_resources(
-                resources,
+                active_resources,
                 remaining_trials,
                 force_single_worker=force_single_worker,
             )
@@ -1541,18 +1659,20 @@ def run_hyperparameter_search(
 
             wave_trial_budget = min(
                 remaining_trials,
-                max_trials_per_worker_process * len(wave_resources),
+                adaptive_trials_per_worker_cap * len(wave_resources),
             )
             allocations = _allocate_trials_to_workers(wave_trial_budget, len(wave_resources))
 
             logger.info(
-                "Launching parallel HPO wave: remaining_trials=%s wave_budget=%s max_trials_per_worker_process=%s allocations=%s resources=%s force_single_worker=%s",
+                "Launching parallel HPO wave: remaining_trials=%s wave_budget=%s max_trials_per_worker_process=%s allocations=%s resources=%s force_single_worker=%s adaptive_worker_cap=%s adaptive_trial_cap=%s",
                 remaining_trials,
                 wave_trial_budget,
-                max_trials_per_worker_process,
+                adaptive_trials_per_worker_cap,
                 allocations,
                 wave_resources,
                 force_single_worker,
+                adaptive_worker_cap,
+                adaptive_trials_per_worker_cap,
             )
 
             worker_errors: list[str] = []
@@ -1680,6 +1800,66 @@ def run_hyperparameter_search(
                     "Parallel HPO wave completed with %s worker failure(s). The supervisor will continue remaining trials.",
                     len(worker_errors),
                 )
+
+            wave_had_progress = False
+            try:
+                post_wave = optuna.load_study(study_name=study_name, storage=storage_uri)
+                post_counts = _summarize_trial_states(post_wave)
+                post_finished = (
+                    int(post_counts["completed"])
+                    + int(post_counts["pruned"])
+                    + int(post_counts["failed"])
+                )
+                wave_had_progress = post_finished > wave_finished_baseline
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to evaluate post-wave progress for adaptive scheduler: %s", exc)
+
+            if adaptive_scheduler_enabled and not force_single_worker:
+                prev_worker_cap = adaptive_worker_cap
+                prev_trial_cap = adaptive_trials_per_worker_cap
+                prev_stable_waves = adaptive_stable_waves
+                adaptive_worker_cap, adaptive_trials_per_worker_cap, adaptive_stable_waves = _update_adaptive_scheduler_state(
+                    current_worker_cap=adaptive_worker_cap,
+                    current_trials_per_worker_cap=adaptive_trials_per_worker_cap,
+                    max_worker_cap=len(resources),
+                    max_trials_per_worker_cap=max_trials_per_worker_process,
+                    min_worker_cap=adaptive_scheduler_min_workers,
+                    min_trials_per_worker_cap=adaptive_scheduler_min_trials_per_worker_process,
+                    stable_waves=adaptive_stable_waves,
+                    recovery_waves=adaptive_scheduler_recovery_waves,
+                    wave_had_progress=wave_had_progress,
+                    worker_error_count=len(worker_errors),
+                    watchdog_triggered=watchdog_triggered,
+                )
+
+                if adaptive_worker_cap != prev_worker_cap or adaptive_trials_per_worker_cap != prev_trial_cap:
+                    instability_reasons: List[str] = []
+                    if watchdog_triggered:
+                        instability_reasons.append("watchdog")
+                    if worker_errors:
+                        instability_reasons.append("worker_errors")
+                    if not wave_had_progress:
+                        instability_reasons.append("no_progress")
+
+                    if instability_reasons:
+                        logger.warning(
+                            "Adaptive HPO scheduler scaled down after unstable wave: reasons=%s workers=%s->%s trials_per_worker=%s->%s",
+                            instability_reasons,
+                            prev_worker_cap,
+                            adaptive_worker_cap,
+                            prev_trial_cap,
+                            adaptive_trials_per_worker_cap,
+                        )
+                    else:
+                        logger.info(
+                            "Adaptive HPO scheduler scaled up after stable waves=%s: workers=%s->%s trials_per_worker=%s->%s",
+                            prev_stable_waves + 1,
+                            prev_worker_cap,
+                            adaptive_worker_cap,
+                            prev_trial_cap,
+                            adaptive_trials_per_worker_cap,
+                        )
+
             if watchdog_triggered:
                 watchdog_restarts_without_progress += 1
                 if (

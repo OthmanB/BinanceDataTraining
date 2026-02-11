@@ -325,6 +325,10 @@ hyperparameter_optimization:  # Controls Optuna-based search over selected hyper
   parallel:
     enabled: false  # When true, distribute HPO trials across multiple worker processes/resources.
     max_trials_per_worker_process: 1  # Hard cap of trials per worker process before respawn; must be >= 1.
+    adaptive_scheduler_enabled: true  # Dynamically reduce/recover worker count and per-worker wave budget based on stability.
+    adaptive_scheduler_min_workers: 1  # Lower bound on adaptive worker count during instability.
+    adaptive_scheduler_recovery_waves: 2  # Stable waves required before adaptive scale-up.
+    adaptive_scheduler_min_trials_per_worker_process: 1  # Floor for adaptive per-worker trial cap.
     rss_watchdog_enabled: true  # When true, monitor worker RSS and restart the current wave if memory exceeds threshold.
     rss_watchdog_max_worker_rss_gb: 28.0  # Per-worker RSS soft limit in GiB; exceeding it triggers wave restart.
     rss_watchdog_check_interval_seconds: 5.0  # Watchdog polling cadence in seconds while workers are running.

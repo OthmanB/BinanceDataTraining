@@ -23,6 +23,7 @@ from models.hyperparameter_tuning import (
     _resolve_parallel_settings,
     _resolve_regime_settings,
     _resolve_worker_runtime_options,
+    _update_adaptive_scheduler_state,
 )
 
 
@@ -63,6 +64,10 @@ class TestHPOParallelHelpers(unittest.TestCase):
                 "rss_watchdog_startup_timeout_seconds": 2400,
                 "rss_watchdog_single_worker_fallback_enabled": True,
                 "rss_watchdog_max_restarts_before_single_worker": 3,
+                "adaptive_scheduler_enabled": True,
+                "adaptive_scheduler_min_workers": 1,
+                "adaptive_scheduler_recovery_waves": 3,
+                "adaptive_scheduler_min_trials_per_worker_process": 1,
             }
         }
         settings = _resolve_parallel_settings(hpo_cfg)
@@ -78,6 +83,10 @@ class TestHPOParallelHelpers(unittest.TestCase):
         self.assertEqual(float(settings["rss_watchdog_startup_timeout_seconds"]), 2400.0)
         self.assertTrue(bool(settings["rss_watchdog_single_worker_fallback_enabled"]))
         self.assertEqual(int(settings["rss_watchdog_max_restarts_before_single_worker"]), 3)
+        self.assertTrue(bool(settings["adaptive_scheduler_enabled"]))
+        self.assertEqual(int(settings["adaptive_scheduler_min_workers"]), 1)
+        self.assertEqual(int(settings["adaptive_scheduler_recovery_waves"]), 3)
+        self.assertEqual(int(settings["adaptive_scheduler_min_trials_per_worker_process"]), 1)
 
     def test_resolve_parallel_settings_requires_positive_worker_cap(self) -> None:
         with self.assertRaises(ValueError):
@@ -138,6 +147,45 @@ class TestHPOParallelHelpers(unittest.TestCase):
                         "enabled": True,
                         "max_trials_per_worker_process": 2,
                         "rss_watchdog_max_restarts_before_single_worker": 0,
+                        "resources": ["gpu:0"],
+                    }
+                }
+            )
+
+    def test_resolve_parallel_settings_rejects_invalid_adaptive_min_workers(self) -> None:
+        with self.assertRaises(ValueError):
+            _resolve_parallel_settings(
+                {
+                    "parallel": {
+                        "enabled": True,
+                        "max_trials_per_worker_process": 2,
+                        "adaptive_scheduler_min_workers": 0,
+                        "resources": ["gpu:0"],
+                    }
+                }
+            )
+
+    def test_resolve_parallel_settings_rejects_invalid_adaptive_recovery_waves(self) -> None:
+        with self.assertRaises(ValueError):
+            _resolve_parallel_settings(
+                {
+                    "parallel": {
+                        "enabled": True,
+                        "max_trials_per_worker_process": 2,
+                        "adaptive_scheduler_recovery_waves": 0,
+                        "resources": ["gpu:0"],
+                    }
+                }
+            )
+
+    def test_resolve_parallel_settings_rejects_invalid_adaptive_min_trials_cap(self) -> None:
+        with self.assertRaises(ValueError):
+            _resolve_parallel_settings(
+                {
+                    "parallel": {
+                        "enabled": True,
+                        "max_trials_per_worker_process": 2,
+                        "adaptive_scheduler_min_trials_per_worker_process": 3,
                         "resources": ["gpu:0"],
                     }
                 }
@@ -206,6 +254,60 @@ class TestHPOParallelHelpers(unittest.TestCase):
     def test_select_wave_resources_respects_single_worker_override(self) -> None:
         selected = _select_wave_resources(["gpu:0", "gpu:1"], remaining_trials=5, force_single_worker=True)
         self.assertEqual(selected, ["gpu:0"])
+
+    def test_update_adaptive_scheduler_state_scales_down_on_watchdog(self) -> None:
+        worker_cap, trial_cap, stable_waves = _update_adaptive_scheduler_state(
+            current_worker_cap=3,
+            current_trials_per_worker_cap=4,
+            max_worker_cap=3,
+            max_trials_per_worker_cap=4,
+            min_worker_cap=1,
+            min_trials_per_worker_cap=1,
+            stable_waves=2,
+            recovery_waves=2,
+            wave_had_progress=True,
+            worker_error_count=0,
+            watchdog_triggered=True,
+        )
+        self.assertEqual(worker_cap, 2)
+        self.assertEqual(trial_cap, 3)
+        self.assertEqual(stable_waves, 0)
+
+    def test_update_adaptive_scheduler_state_scales_down_on_no_progress(self) -> None:
+        worker_cap, trial_cap, stable_waves = _update_adaptive_scheduler_state(
+            current_worker_cap=2,
+            current_trials_per_worker_cap=2,
+            max_worker_cap=3,
+            max_trials_per_worker_cap=4,
+            min_worker_cap=1,
+            min_trials_per_worker_cap=1,
+            stable_waves=1,
+            recovery_waves=3,
+            wave_had_progress=False,
+            worker_error_count=0,
+            watchdog_triggered=False,
+        )
+        self.assertEqual(worker_cap, 1)
+        self.assertEqual(trial_cap, 1)
+        self.assertEqual(stable_waves, 0)
+
+    def test_update_adaptive_scheduler_state_scales_up_after_stable_waves(self) -> None:
+        worker_cap, trial_cap, stable_waves = _update_adaptive_scheduler_state(
+            current_worker_cap=1,
+            current_trials_per_worker_cap=1,
+            max_worker_cap=3,
+            max_trials_per_worker_cap=4,
+            min_worker_cap=1,
+            min_trials_per_worker_cap=1,
+            stable_waves=1,
+            recovery_waves=2,
+            wave_had_progress=True,
+            worker_error_count=0,
+            watchdog_triggered=False,
+        )
+        self.assertEqual(worker_cap, 2)
+        self.assertEqual(trial_cap, 2)
+        self.assertEqual(stable_waves, 0)
 
     def test_resolve_worker_runtime_options_parses_explicit_values(self) -> None:
         runtime_cfg = {
