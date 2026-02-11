@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 CHUNK_STORAGE_NPZ = "npz"
 CHUNK_STORAGE_NPY_SHARDS_V1 = "npy_shards_v1"
+CHUNK_STORAGE_FRAME_STORE_V1 = "frame_store_v1"
 
 
 def _format_bytes(value: int) -> str:
@@ -75,6 +76,11 @@ class SnapshotChunk:
     start_index: int
     storage_format: str = CHUNK_STORAGE_NPZ
     array_paths: Optional[Dict[str, str]] = None
+    x_shape: Optional[Tuple[int, ...]] = None
+    window_steps: Optional[int] = None
+    include_mask_channel: bool = False
+    num_assets: Optional[int] = None
+    aux_dim: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -115,11 +121,11 @@ class MultiAssetSnapshotRecord:
 class SampleRecord:
     """Derived sample record for model training."""
 
-    x: np.ndarray
     y_up: int
     y_down: int
     anchor_ts_seconds: int
     duty_cycle: float
+    aux_features: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -425,12 +431,10 @@ class StreamingSampleBuilder:
 
         y_up, y_down = _compute_intensity_bins(self._boundaries, max_up, max_down)
 
-        x_seq = self._build_input_sequence(window_records)
-        if x_seq is None:
-            return None
+        target_record = window_records[anchor_pos - window_start].asset_snapshots[self._target_asset]
+        aux_parts: List[np.ndarray] = []
 
         if self._feature_engineer is not None:
-            target_record = window_records[anchor_pos - window_start].asset_snapshots[self._target_asset]
             fe_vector = _compute_feature_vector(
                 self._feature_engineer,
                 target_record,
@@ -440,11 +444,11 @@ class StreamingSampleBuilder:
                 self._config,
             )
             if fe_vector is not None and fe_vector.size > 0:
-                x_seq = _concat_broadcast_features(x_seq, fe_vector)
+                aux_parts.append(np.asarray(fe_vector, dtype="float32"))
 
         if self._temporal_mode == "concat_channels":
             temporal_vector = _compute_temporal_vector(
-                anchor_ts=window_records[anchor_pos - window_start].timestamp,
+                anchor_ts=target_record.timestamp,
                 local_cfg=self._local_features if self._use_local else [],
                 global_cfg=self._global_features if self._use_global else [],
                 market_session_cfg=self._market_session_cfg,
@@ -453,16 +457,17 @@ class StreamingSampleBuilder:
             if temporal_vector is not None and temporal_vector.size > 0:
                 if self._dataset_start_day is None:
                     self._dataset_start_day = int(
-                        window_records[anchor_pos - window_start]
-                        .timestamp.astype("datetime64[D]")
-                        .astype("int64")
+                        target_record.timestamp.astype("datetime64[D]").astype("int64")
                     )
-                x_seq = _concat_broadcast_features(x_seq, temporal_vector)
+                aux_parts.append(np.asarray(temporal_vector, dtype="float32"))
+
+        if aux_parts:
+            aux_features = np.concatenate(aux_parts).astype("float32")
+        else:
+            aux_features = np.zeros((0,), dtype="float32")
 
         anchor_ts_seconds = int(
-            window_records[anchor_pos - window_start]
-            .timestamp.astype("datetime64[s]")
-            .astype("int64")
+            target_record.timestamp.astype("datetime64[s]").astype("int64")
         )
 
         observed_count = sum(
@@ -473,11 +478,11 @@ class StreamingSampleBuilder:
         duty_cycle = float(observed_count) / float(self._window_steps)
 
         return SampleRecord(
-            x=x_seq.astype("float32"),
             y_up=int(y_up),
             y_down=int(y_down),
             anchor_ts_seconds=anchor_ts_seconds,
             duty_cycle=duty_cycle,
+            aux_features=aux_features,
         )
 
     def _build_input_sequence(self, window_records: List[MultiAssetSnapshotRecord]) -> Optional[np.ndarray]:
@@ -593,6 +598,38 @@ def load_snapshot_dataset(context: SnapshotContext, config: Dict[str, Any]) -> S
         if resolved is None:
             continue
         file_path, array_paths, storage_format = resolved
+        x_shape_raw = entry.get("x_shape")
+        x_shape: Optional[Tuple[int, ...]] = None
+        if isinstance(x_shape_raw, (list, tuple)) and x_shape_raw:
+            try:
+                x_shape = tuple(int(v) for v in x_shape_raw)
+            except (TypeError, ValueError):
+                x_shape = None
+
+        window_steps_raw = entry.get("window_steps")
+        window_steps: Optional[int] = None
+        if window_steps_raw is not None:
+            try:
+                window_steps = int(window_steps_raw)
+            except (TypeError, ValueError):
+                window_steps = None
+
+        num_assets_raw = entry.get("num_assets")
+        num_assets: Optional[int] = None
+        if num_assets_raw is not None:
+            try:
+                num_assets = int(num_assets_raw)
+            except (TypeError, ValueError):
+                num_assets = None
+
+        aux_dim_raw = entry.get("aux_dim")
+        aux_dim: Optional[int] = None
+        if aux_dim_raw is not None:
+            try:
+                aux_dim = int(aux_dim_raw)
+            except (TypeError, ValueError):
+                aux_dim = None
+
         chunks_meta.append(
             {
                 "start": entry["start"],
@@ -601,6 +638,11 @@ def load_snapshot_dataset(context: SnapshotContext, config: Dict[str, Any]) -> S
                 "num_samples": int(entry["num_samples"]),
                 "format": storage_format,
                 "array_paths": array_paths,
+                "x_shape": x_shape,
+                "window_steps": window_steps,
+                "include_mask_channel": bool(entry.get("include_mask_channel", False)),
+                "num_assets": num_assets,
+                "aux_dim": aux_dim,
             }
         )
 
@@ -617,6 +659,11 @@ def load_snapshot_dataset(context: SnapshotContext, config: Dict[str, Any]) -> S
                 start_index=start_idx,
                 storage_format=str(entry.get("format") or CHUNK_STORAGE_NPZ),
                 array_paths=entry.get("array_paths"),
+                x_shape=entry.get("x_shape"),
+                window_steps=entry.get("window_steps"),
+                include_mask_channel=bool(entry.get("include_mask_channel", False)),
+                num_assets=entry.get("num_assets"),
+                aux_dim=entry.get("aux_dim"),
             )
         )
         start_idx += entry["num_samples"]
@@ -664,6 +711,36 @@ def _resolve_chunk_paths_from_entry(
         file_path = resolved_paths["x"]
         return file_path, resolved_paths, storage_format
 
+    if storage_format == CHUNK_STORAGE_FRAME_STORE_V1:
+        files_meta = entry.get("files")
+        if not isinstance(files_meta, dict):
+            return None
+
+        required = [
+            "frames_base",
+            "frames_confidence",
+            "frames_observed",
+            "frames_ts",
+            "anchor_local_idx",
+            "aux",
+            "y_up",
+            "y_down",
+            "anchor_ts",
+            "duty_cycle",
+        ]
+        resolved_paths: Dict[str, str] = {}
+        for key in required:
+            rel = files_meta.get(key)
+            if not isinstance(rel, str) or not rel:
+                return None
+            abs_path = os.path.join(context.snapshot_dir, rel)
+            if not os.path.exists(abs_path):
+                return None
+            resolved_paths[key] = abs_path
+
+        file_path = resolved_paths["frames_base"]
+        return file_path, resolved_paths, storage_format
+
     logger.warning("Unsupported snapshot chunk storage format in manifest: %s", storage_format)
     return None
 
@@ -673,6 +750,9 @@ def _slice_chunk_arrays(
     local_start: int,
     local_end: int,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if chunk.storage_format == CHUNK_STORAGE_FRAME_STORE_V1:
+        return _slice_chunk_arrays_frame_store(chunk, local_start, local_end)
+
     if chunk.storage_format == CHUNK_STORAGE_NPY_SHARDS_V1:
         if chunk.array_paths is None:
             raise ConfigError("Snapshot chunk array_paths are required for npy_shards_v1 format")
@@ -702,11 +782,138 @@ def _slice_chunk_arrays(
     return x, y_up, y_down, anchor_ts, duty_cycle
 
 
+def _slice_chunk_arrays_frame_store(
+    chunk: SnapshotChunk,
+    local_start: int,
+    local_end: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if chunk.array_paths is None:
+        raise ConfigError("Snapshot chunk array_paths are required for frame_store_v1 format")
+
+    if chunk.window_steps is None or int(chunk.window_steps) <= 0:
+        raise ConfigError("Snapshot chunk window_steps must be present for frame_store_v1 format")
+
+    window_steps = int(chunk.window_steps)
+
+    frames_base = np.load(chunk.array_paths["frames_base"], mmap_mode="r")
+    frames_confidence = np.load(chunk.array_paths["frames_confidence"], mmap_mode="r")
+    frames_observed = np.load(chunk.array_paths["frames_observed"], mmap_mode="r")
+    frames_ts = np.load(chunk.array_paths["frames_ts"], mmap_mode="r")
+
+    anchor_local_idx = np.asarray(
+        np.load(chunk.array_paths["anchor_local_idx"], mmap_mode="r")[local_start:local_end],
+        dtype="int64",
+    )
+    y_up = np.asarray(np.load(chunk.array_paths["y_up"], mmap_mode="r")[local_start:local_end], dtype="int64")
+    y_down = np.asarray(
+        np.load(chunk.array_paths["y_down"], mmap_mode="r")[local_start:local_end],
+        dtype="int64",
+    )
+    anchor_ts = np.asarray(
+        np.load(chunk.array_paths["anchor_ts"], mmap_mode="r")[local_start:local_end],
+        dtype="int64",
+    )
+    duty_cycle = np.asarray(
+        np.load(chunk.array_paths["duty_cycle"], mmap_mode="r")[local_start:local_end],
+        dtype="float32",
+    )
+    aux = np.asarray(np.load(chunk.array_paths["aux"], mmap_mode="r")[local_start:local_end], dtype="float32")
+
+    if aux.ndim == 1:
+        aux = aux.reshape(aux.shape[0], 1)
+    if aux.ndim != 2:
+        raise ConfigError("Snapshot frame_store_v1 aux array must be rank 2")
+
+    if frames_base.ndim != 4:
+        raise ConfigError("Snapshot frame_store_v1 frames_base array must be rank 4")
+
+    if frames_confidence.ndim != 2 or frames_observed.ndim != 2:
+        raise ConfigError("Snapshot frame_store_v1 confidence/observed arrays must be rank 2")
+
+    if frames_ts.ndim != 1:
+        raise ConfigError("Snapshot frame_store_v1 frames_ts array must be rank 1")
+
+    n_frames = int(frames_base.shape[0])
+    if n_frames != int(frames_confidence.shape[0]) or n_frames != int(frames_observed.shape[0]) or n_frames != int(
+        frames_ts.shape[0]
+    ):
+        raise ConfigError("Snapshot frame_store_v1 frame arrays have inconsistent first dimension")
+
+    sample_count = int(anchor_local_idx.shape[0])
+    h_dim = int(frames_base.shape[1])
+    w_dim = int(frames_base.shape[2])
+    base_channels = int(frames_base.shape[3])
+
+    starts = anchor_local_idx - (window_steps - 1)
+    if sample_count > 0:
+        if int(starts.min()) < 0:
+            raise ConfigError("Snapshot frame_store_v1 has invalid anchor index below window start")
+        if int(anchor_local_idx.max()) >= n_frames:
+            raise ConfigError("Snapshot frame_store_v1 has invalid anchor index beyond frame count")
+
+    x_base = np.empty((sample_count, window_steps, h_dim, w_dim, base_channels), dtype="float32")
+    for idx, start_idx in enumerate(starts):
+        end_idx = int(start_idx) + window_steps
+        x_base[idx] = np.asarray(frames_base[int(start_idx):end_idx], dtype="float32")
+
+    x_out = x_base
+
+    if chunk.include_mask_channel:
+        if chunk.num_assets is not None:
+            num_assets = int(chunk.num_assets)
+        else:
+            num_assets = int(frames_confidence.shape[1])
+
+        if int(frames_confidence.shape[1]) != num_assets:
+            raise ConfigError("Snapshot frame_store_v1 confidence width does not match num_assets")
+
+        mask = np.empty((sample_count, window_steps, h_dim, w_dim, num_assets), dtype="float32")
+        for idx, start_idx in enumerate(starts):
+            end_idx = int(start_idx) + window_steps
+            conf_window = np.asarray(frames_confidence[int(start_idx):end_idx], dtype="float32")
+            mask[idx] = conf_window[:, None, None, :]
+        x_out = np.concatenate([x_out, mask], axis=-1)
+
+    aux_dim = int(aux.shape[1])
+    if aux_dim > 0:
+        aux_view = np.broadcast_to(
+            aux[:, None, None, None, :],
+            (sample_count, window_steps, h_dim, w_dim, aux_dim),
+        )
+        x_out = np.concatenate([x_out, np.asarray(aux_view, dtype="float32")], axis=-1)
+
+    return x_out, y_up, y_down, anchor_ts, duty_cycle
+
+
+def _load_chunk_duty_cycle(chunk: SnapshotChunk) -> np.ndarray:
+    if chunk.storage_format == CHUNK_STORAGE_NPY_SHARDS_V1:
+        if chunk.array_paths is None:
+            raise ConfigError("Snapshot chunk array_paths are required for npy_shards_v1 format")
+        return np.asarray(np.load(chunk.array_paths["duty_cycle"], mmap_mode="r"), dtype="float32")
+
+    if chunk.storage_format == CHUNK_STORAGE_FRAME_STORE_V1:
+        if chunk.array_paths is None:
+            raise ConfigError("Snapshot chunk array_paths are required for frame_store_v1 format")
+        return np.asarray(np.load(chunk.array_paths["duty_cycle"], mmap_mode="r"), dtype="float32")
+
+    with np.load(chunk.file_path) as npz:
+        if "duty_cycle" not in npz:
+            raise ConfigError(
+                "Snapshot chunk missing duty_cycle. Rebuild snapshot dataset to enable duty-cycle weighting."
+            )
+        return np.asarray(npz["duty_cycle"], dtype="float32")
+
+
 def load_chunk_anchor_timestamps(chunk: SnapshotChunk) -> np.ndarray:
     """Load anchor timestamps for a chunk across storage formats."""
     if chunk.storage_format == CHUNK_STORAGE_NPY_SHARDS_V1:
         if chunk.array_paths is None:
             raise ConfigError("Snapshot chunk array_paths are required for npy_shards_v1 format")
+        return np.asarray(np.load(chunk.array_paths["anchor_ts"], mmap_mode="r"), dtype="int64")
+
+    if chunk.storage_format == CHUNK_STORAGE_FRAME_STORE_V1:
+        if chunk.array_paths is None:
+            raise ConfigError("Snapshot chunk array_paths are required for frame_store_v1 format")
         return np.asarray(np.load(chunk.array_paths["anchor_ts"], mmap_mode="r"), dtype="int64")
 
     with np.load(chunk.file_path) as npz:
@@ -715,6 +922,53 @@ def load_chunk_anchor_timestamps(chunk: SnapshotChunk) -> np.ndarray:
 
 def get_chunk_x_shape(chunk: SnapshotChunk) -> Tuple[int, ...]:
     """Return chunk x tensor shape without loading all chunk data."""
+    if chunk.storage_format == CHUNK_STORAGE_FRAME_STORE_V1:
+        if chunk.x_shape is not None:
+            return tuple(int(v) for v in chunk.x_shape)
+
+        if chunk.array_paths is None:
+            raise ConfigError("Snapshot chunk array_paths are required for frame_store_v1 format")
+
+        if chunk.window_steps is None or int(chunk.window_steps) <= 0:
+            raise ConfigError("Snapshot chunk window_steps must be present for frame_store_v1 format")
+
+        frames_base = np.load(chunk.array_paths["frames_base"], mmap_mode="r")
+        if frames_base.ndim != 4:
+            raise ConfigError("Snapshot frame_store_v1 frames_base array must be rank 4")
+
+        h_dim = int(frames_base.shape[1])
+        w_dim = int(frames_base.shape[2])
+        base_channels = int(frames_base.shape[3])
+
+        if chunk.num_assets is not None:
+            num_assets = int(chunk.num_assets)
+        else:
+            frames_confidence = np.load(chunk.array_paths["frames_confidence"], mmap_mode="r")
+            if frames_confidence.ndim != 2:
+                raise ConfigError("Snapshot frame_store_v1 frames_confidence array must be rank 2")
+            num_assets = int(frames_confidence.shape[1])
+
+        if chunk.aux_dim is not None:
+            aux_dim = int(chunk.aux_dim)
+        else:
+            aux_arr = np.load(chunk.array_paths["aux"], mmap_mode="r")
+            if aux_arr.ndim == 1:
+                aux_dim = 1
+            elif aux_arr.ndim == 2:
+                aux_dim = int(aux_arr.shape[1])
+            else:
+                raise ConfigError("Snapshot frame_store_v1 aux array must be rank 1 or 2")
+
+        mask_channels = num_assets if chunk.include_mask_channel else 0
+        total_channels = base_channels + mask_channels + aux_dim
+        return (
+            int(chunk.num_samples),
+            int(chunk.window_steps),
+            h_dim,
+            w_dim,
+            total_channels,
+        )
+
     if chunk.storage_format == CHUNK_STORAGE_NPY_SHARDS_V1:
         if chunk.array_paths is None:
             raise ConfigError("Snapshot chunk array_paths are required for npy_shards_v1 format")
@@ -1798,6 +2052,97 @@ class _DutyCycleAccumulator:
         return idx / float(self._bins - 1)
 
 
+@dataclass
+class _FrameStoreChunkPayload:
+    frames_base: np.ndarray
+    frames_confidence: np.ndarray
+    frames_observed: np.ndarray
+    frames_ts: np.ndarray
+    anchor_local_idx_by_ts: Dict[int, int]
+    num_core_frames: int
+    overlap_frames: int
+
+
+def _materialize_frame_store_core_arrays(
+    records: List[MultiAssetSnapshotRecord],
+    assets: List[str],
+    sample_builder: StreamingSampleBuilder,
+    config: Dict[str, Any],
+    *,
+    fail_on_invalid: bool,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    num_records = len(records)
+    num_assets = len(assets)
+    representation = str(sample_builder._representation)
+
+    if representation == "hybrid":
+        effective_levels = get_hybrid_output_shape(config)
+        frames_base = np.zeros((num_records, effective_levels, 4, num_assets), dtype="float32")
+    elif representation == "top_of_book":
+        frames_base = np.zeros((num_records, sample_builder._height, sample_builder._width, num_assets), dtype="float32")
+    else:
+        raise ValueError(f"Unsupported representation for frame_store_v1: {representation!r}")
+
+    frames_confidence = np.zeros((num_records, num_assets), dtype="float32")
+    frames_observed = np.zeros((num_records, num_assets), dtype="uint8")
+    frames_ts = np.zeros((num_records,), dtype="int64")
+
+    for t_idx, rec in enumerate(records):
+        frames_ts[t_idx] = int(rec.timestamp.astype("datetime64[s]").astype("int64"))
+        for asset_idx, asset in enumerate(assets):
+            asset_rec = rec.asset_snapshots.get(asset)
+            if asset_rec is None:
+                message = f"Missing aligned asset snapshot for asset={asset} at timestamp={rec.timestamp}"
+                if fail_on_invalid:
+                    raise ValueError(message)
+                logger.warning(message)
+                continue
+
+            frames_confidence[t_idx, asset_idx] = float(asset_rec.confidence)
+            frames_observed[t_idx, asset_idx] = np.uint8(1 if bool(asset_rec.observed) else 0)
+
+            if representation == "hybrid":
+                hybrid = asset_rec.hybrid_snapshot
+                if hybrid is None:
+                    if asset_rec.depth is not None:
+                        hybrid = aggregate_snapshot_to_hybrid(
+                            bid_prices=asset_rec.depth["bid_prices"],
+                            bid_quantities=asset_rec.depth["bid_quantities"],
+                            ask_prices=asset_rec.depth["ask_prices"],
+                            ask_quantities=asset_rec.depth["ask_quantities"],
+                            config=config,
+                        ).astype("float32")
+                    else:
+                        message = (
+                            f"Missing hybrid/depth data for asset={asset} at timestamp={rec.timestamp} "
+                            "while building frame_store_v1 chunk"
+                        )
+                        if fail_on_invalid:
+                            raise ValueError(message)
+                        logger.warning(message)
+                        hybrid = np.zeros((frames_base.shape[1], 4), dtype="float32")
+                        feats = asset_rec.snapshot_features
+                        if len(feats) >= 4:
+                            hybrid[0, 0] = float(feats[0])
+                            hybrid[0, 1] = float(feats[1])
+                            hybrid[0, 2] = float(feats[2])
+                            hybrid[0, 3] = float(feats[3])
+                frames_base[t_idx, :, :, asset_idx] = np.asarray(hybrid, dtype="float32")
+            else:
+                features = asset_rec.snapshot_features
+                if len(features) >= 4:
+                    bid_price, bid_qty, ask_price, ask_qty = features[:4]
+                    frames_base[t_idx, 0, 0, asset_idx] = float(bid_price)
+                    if sample_builder._width > 1:
+                        frames_base[t_idx, 0, 1, asset_idx] = float(bid_qty)
+                    if sample_builder._height > 1:
+                        frames_base[t_idx, 1, 0, asset_idx] = float(ask_price)
+                    if sample_builder._height > 1 and sample_builder._width > 1:
+                        frames_base[t_idx, 1, 1, asset_idx] = float(ask_qty)
+
+    return frames_base, frames_confidence, frames_observed, frames_ts
+
+
 def _build_snapshot_chunks(
     config: Dict[str, Any],
     context: SnapshotContext,
@@ -1876,9 +2221,86 @@ def _build_snapshot_chunks(
     gap_handlers = {asset: _create_gap_handler(config) for asset in assets}
     validation_cfg = data_cfg["validation"]
     fail_on_invalid = bool(validation_cfg["fail_on_invalid"])
+    window_steps = int(sample_builder._window_steps)
+    prefix_overlap_frames = max(0, window_steps - 1)
+    num_assets = len(sample_builder._assets)
+    if num_assets != len(assets):
+        raise ValueError("Sample builder assets are inconsistent with configured asset list")
+
+    boundary_index_by_key: Dict[Tuple[str, str], int] = {
+        (boundary["start_str"], boundary["end_str"]): idx
+        for idx, boundary in enumerate(output_boundaries)
+    }
 
     current_chunk_idx = 0
     chunk_samples: List[SampleRecord] = []
+    pending_frame_payloads: Dict[int, _FrameStoreChunkPayload] = {}
+
+    prev_tail_base: Optional[np.ndarray] = None
+    prev_tail_confidence: Optional[np.ndarray] = None
+    prev_tail_observed: Optional[np.ndarray] = None
+    prev_tail_ts: Optional[np.ndarray] = None
+
+    def _build_frame_payload(multi_records: List[MultiAssetSnapshotRecord]) -> _FrameStoreChunkPayload:
+        nonlocal prev_tail_base
+        nonlocal prev_tail_confidence
+        nonlocal prev_tail_observed
+        nonlocal prev_tail_ts
+
+        core_base, core_confidence, core_observed, core_ts = _materialize_frame_store_core_arrays(
+            multi_records,
+            assets,
+            sample_builder,
+            config,
+            fail_on_invalid=fail_on_invalid,
+        )
+
+        overlap_frames = 0
+        if (
+            prefix_overlap_frames > 0
+            and prev_tail_base is not None
+            and prev_tail_confidence is not None
+            and prev_tail_observed is not None
+            and prev_tail_ts is not None
+            and prev_tail_base.shape[0] > 0
+        ):
+            overlap_frames = int(min(prefix_overlap_frames, prev_tail_base.shape[0]))
+            prefix_base = np.asarray(prev_tail_base[-overlap_frames:], dtype="float32")
+            prefix_confidence = np.asarray(prev_tail_confidence[-overlap_frames:], dtype="float32")
+            prefix_observed = np.asarray(prev_tail_observed[-overlap_frames:], dtype="uint8")
+            prefix_ts = np.asarray(prev_tail_ts[-overlap_frames:], dtype="int64")
+        else:
+            shape_base = (0,) + tuple(core_base.shape[1:])
+            prefix_base = np.zeros(shape_base, dtype="float32")
+            prefix_confidence = np.zeros((0, num_assets), dtype="float32")
+            prefix_observed = np.zeros((0, num_assets), dtype="uint8")
+            prefix_ts = np.zeros((0,), dtype="int64")
+
+        frames_base = np.concatenate([prefix_base, core_base], axis=0).astype("float32", copy=False)
+        frames_confidence = np.concatenate([prefix_confidence, core_confidence], axis=0).astype("float32", copy=False)
+        frames_observed = np.concatenate([prefix_observed, core_observed], axis=0).astype("uint8", copy=False)
+        frames_ts = np.concatenate([prefix_ts, core_ts], axis=0).astype("int64", copy=False)
+
+        anchor_local_idx_by_ts: Dict[int, int] = {}
+        for core_idx, ts_value in enumerate(core_ts):
+            anchor_local_idx_by_ts[int(ts_value)] = int(overlap_frames + core_idx)
+
+        if core_base.shape[0] > 0:
+            tail_len = int(min(prefix_overlap_frames, core_base.shape[0]))
+            prev_tail_base = np.asarray(core_base[-tail_len:], dtype="float32")
+            prev_tail_confidence = np.asarray(core_confidence[-tail_len:], dtype="float32")
+            prev_tail_observed = np.asarray(core_observed[-tail_len:], dtype="uint8")
+            prev_tail_ts = np.asarray(core_ts[-tail_len:], dtype="int64")
+
+        return _FrameStoreChunkPayload(
+            frames_base=frames_base,
+            frames_confidence=frames_confidence,
+            frames_observed=frames_observed,
+            frames_ts=frames_ts,
+            anchor_local_idx_by_ts=anchor_local_idx_by_ts,
+            num_core_frames=int(core_base.shape[0]),
+            overlap_frames=int(overlap_frames),
+        )
 
     def flush_chunk(index: int) -> None:
         nonlocal chunk_samples
@@ -1903,16 +2325,18 @@ def _build_snapshot_chunks(
                         start_index=0,
                         storage_format=storage_format,
                         array_paths=array_paths,
+                        x_shape=tuple(int(v) for v in (entry.get("x_shape") or [])) if entry.get("x_shape") else None,
+                        window_steps=(int(entry["window_steps"]) if entry.get("window_steps") is not None else None),
+                        include_mask_channel=bool(entry.get("include_mask_channel", False)),
+                        num_assets=(int(entry["num_assets"]) if entry.get("num_assets") is not None else None),
+                        aux_dim=(int(entry["aux_dim"]) if entry.get("aux_dim") is not None else None),
                     )
-                    _, _, _, _, duty_cycle = _slice_chunk_arrays(
-                        chunk_for_stats,
-                        0,
-                        max(0, chunk_for_stats.num_samples),
-                    )
+                    duty_cycle = _load_chunk_duty_cycle(chunk_for_stats)
                     duty_cycle_stats.add_values(duty_cycle)
                     _update_duty_cycle_writer()
             except Exception:  # noqa: BLE001
                 logger.warning("Failed to load duty_cycle from cached chunk for %s", key, exc_info=True)
+            pending_frame_payloads.pop(index, None)
             chunk_samples = []
             chunks_processed += 1
             if writer is not None:
@@ -1923,6 +2347,7 @@ def _build_snapshot_chunks(
             return
 
         if not chunk_samples:
+            pending_frame_payloads.pop(index, None)
             chunk_samples = []
             chunks_processed += 1
             if writer is not None:
@@ -1939,23 +2364,80 @@ def _build_snapshot_chunks(
         chunk_dir = os.path.join(context.snapshot_dir, chunk_dir_rel)
         os.makedirs(chunk_dir, exist_ok=True)
 
-        x = np.stack([s.x for s in chunk_samples]).astype("float32")
+        payload = pending_frame_payloads.pop(index, None)
+        if payload is None:
+            raise ConfigError(
+                "Missing frame_store payload for chunk while materializing sample metadata. "
+                f"chunk_start={chunk_start}, chunk_end={chunk_end}"
+            )
+
+        sample_count = int(len(chunk_samples))
         y_up = np.asarray([s.y_up for s in chunk_samples], dtype="int64")
         y_down = np.asarray([s.y_down for s in chunk_samples], dtype="int64")
         anchor_ts = np.asarray([s.anchor_ts_seconds for s in chunk_samples], dtype="int64")
         duty_cycle = np.asarray([s.duty_cycle for s in chunk_samples], dtype="float32")
 
+        aux_dim = int(chunk_samples[0].aux_features.shape[0]) if chunk_samples else 0
+        aux = np.zeros((sample_count, aux_dim), dtype="float32")
+        anchor_local_idx = np.zeros((sample_count,), dtype="int32")
+
+        for sample_idx, sample in enumerate(chunk_samples):
+            if int(sample.aux_features.shape[0]) != aux_dim:
+                raise ConfigError(
+                    "Inconsistent aux feature dimensionality within chunk during frame_store_v1 materialization"
+                )
+            if aux_dim > 0:
+                aux[sample_idx] = np.asarray(sample.aux_features, dtype="float32")
+
+            local_idx = payload.anchor_local_idx_by_ts.get(int(sample.anchor_ts_seconds))
+            if local_idx is None:
+                raise ConfigError(
+                    "Failed to map anchor timestamp to frame index in frame_store_v1 chunk: "
+                    f"anchor_ts={sample.anchor_ts_seconds}, chunk_start={chunk_start}, chunk_end={chunk_end}"
+                )
+            anchor_local_idx[sample_idx] = int(local_idx)
+
         duty_cycle_stats.add_values(duty_cycle)
         _update_duty_cycle_writer()
 
         files_rel = {
-            "x": os.path.join(chunk_dir_rel, "x.npy"),
+            "frames_base": os.path.join(chunk_dir_rel, "frames_base.npy"),
+            "frames_confidence": os.path.join(chunk_dir_rel, "frames_confidence.npy"),
+            "frames_observed": os.path.join(chunk_dir_rel, "frames_observed.npy"),
+            "frames_ts": os.path.join(chunk_dir_rel, "frames_ts.npy"),
+            "anchor_local_idx": os.path.join(chunk_dir_rel, "anchor_local_idx.npy"),
+            "aux": os.path.join(chunk_dir_rel, "aux.npy"),
             "y_up": os.path.join(chunk_dir_rel, "y_up.npy"),
             "y_down": os.path.join(chunk_dir_rel, "y_down.npy"),
             "anchor_ts": os.path.join(chunk_dir_rel, "anchor_ts.npy"),
             "duty_cycle": os.path.join(chunk_dir_rel, "duty_cycle.npy"),
         }
-        np.save(os.path.join(context.snapshot_dir, files_rel["x"]), x, allow_pickle=False)
+        np.save(
+            os.path.join(context.snapshot_dir, files_rel["frames_base"]),
+            payload.frames_base,
+            allow_pickle=False,
+        )
+        np.save(
+            os.path.join(context.snapshot_dir, files_rel["frames_confidence"]),
+            payload.frames_confidence,
+            allow_pickle=False,
+        )
+        np.save(
+            os.path.join(context.snapshot_dir, files_rel["frames_observed"]),
+            payload.frames_observed,
+            allow_pickle=False,
+        )
+        np.save(
+            os.path.join(context.snapshot_dir, files_rel["frames_ts"]),
+            payload.frames_ts,
+            allow_pickle=False,
+        )
+        np.save(
+            os.path.join(context.snapshot_dir, files_rel["anchor_local_idx"]),
+            anchor_local_idx,
+            allow_pickle=False,
+        )
+        np.save(os.path.join(context.snapshot_dir, files_rel["aux"]), aux, allow_pickle=False)
         np.save(os.path.join(context.snapshot_dir, files_rel["y_up"]), y_up, allow_pickle=False)
         np.save(os.path.join(context.snapshot_dir, files_rel["y_down"]), y_down, allow_pickle=False)
         np.save(os.path.join(context.snapshot_dir, files_rel["anchor_ts"]), anchor_ts, allow_pickle=False)
@@ -1964,15 +2446,23 @@ def _build_snapshot_chunks(
         files_abs = {key: os.path.join(context.snapshot_dir, rel_path) for key, rel_path in files_rel.items()}
         file_sizes = {key: _safe_file_size(path) for key, path in files_abs.items()}
         chunk_size_bytes = int(sum(file_sizes.values()))
+
+        x_height = int(payload.frames_base.shape[1])
+        x_width = int(payload.frames_base.shape[2])
+        base_channels = int(payload.frames_base.shape[3])
+        mask_channels = num_assets if bool(sample_builder._include_mask_channel) else 0
+        total_channels = int(base_channels + mask_channels + aux_dim)
+        x_shape = [sample_count, window_steps, x_height, x_width, total_channels]
+
         logger.info(
             "Snapshot chunk materialized %s/%s: %s -> %s samples=%s size=%s format=%s",
             index + 1,
             chunks_total,
             chunk_start,
             chunk_end,
-            int(x.shape[0]),
+            sample_count,
             _format_bytes(chunk_size_bytes),
-            CHUNK_STORAGE_NPY_SHARDS_V1,
+            CHUNK_STORAGE_FRAME_STORE_V1,
         )
         logger.debug(
             "Snapshot chunk files written: %s",
@@ -1988,10 +2478,18 @@ def _build_snapshot_chunks(
         entry = {
             "start": chunk_start,
             "end": chunk_end,
-            "format": CHUNK_STORAGE_NPY_SHARDS_V1,
-            "file": files_rel["x"],
+            "format": CHUNK_STORAGE_FRAME_STORE_V1,
+            "file": files_rel["frames_base"],
             "files": files_rel,
-            "num_samples": int(x.shape[0]),
+            "num_samples": sample_count,
+            "num_frames_core": int(payload.num_core_frames),
+            "num_frames_ext": int(payload.frames_base.shape[0]),
+            "overlap_frames": int(payload.overlap_frames),
+            "window_steps": int(window_steps),
+            "include_mask_channel": bool(sample_builder._include_mask_channel),
+            "num_assets": int(num_assets),
+            "aux_dim": int(aux_dim),
+            "x_shape": x_shape,
             "created_at": datetime.utcnow().isoformat() + "Z",
         }
         _upsert_chunk_entry(manifest, entry)
@@ -2057,6 +2555,13 @@ def _build_snapshot_chunks(
             hybrid_levels=hybrid_levels,
             fail_on_invalid=fail_on_invalid,
         )
+
+        boundary_idx = boundary_index_by_key.get(chunk_key)
+        if boundary_idx is not None:
+            frame_payload = _build_frame_payload(multi_records)
+            if not output_boundaries[boundary_idx]["cached"]:
+                pending_frame_payloads[boundary_idx] = frame_payload
+
         series_timestamps: List[int] = []
         series_mid_prices: List[float] = []
         series_volumes: List[float] = []
@@ -2675,6 +3180,7 @@ def _interpolate_depth(
 
 
 __all__ = [
+    "CHUNK_STORAGE_FRAME_STORE_V1",
     "CHUNK_STORAGE_NPY_SHARDS_V1",
     "CHUNK_STORAGE_NPZ",
     "LabelDistribution",
