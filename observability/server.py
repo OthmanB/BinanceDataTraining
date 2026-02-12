@@ -580,7 +580,17 @@ _SELECT_OPTIONS: Dict[str, List[str]] = {
     "preprocessing.feature_engineering.volume_proxy_method": ["top_of_book", "total_depth"],
     "preprocessing.feature_engineering.edge_decay.method": ["linear", "exponential"],
     "preprocessing.train_test_split.method": ["chronological"],
-    "preprocessing.class_balancing.method": ["class_weights", "oversampling", "undersampling"],
+    "preprocessing.class_balancing.method": ["undersampling"],
+    "preprocessing.class_balancing.undersampling.labeling_criteria": [
+        "max_intensity",
+        "up_intensity",
+        "down_intensity",
+    ],
+    "preprocessing.class_balancing.undersampling.selection_policy": [
+        "uniform_time",
+        "kmeans",
+        "random",
+    ],
     "model.framework": ["keras"],
     "model.backend": ["tensorflow"],
     "model.architecture": ["CNN_LSTM_MultiClass"],
@@ -3490,6 +3500,8 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
                         if mode == "simple":
                             defaults = _load_default_simple_config()
                             merged_cfg = _deep_merge(defaults, config_data)
+                        if merged_cfg is None:
+                            raise ValueError("Failed to resolve merged config")
                         values = _build_render_values_from_config(merged_cfg, schema_fields)
                         missing = _missing_fields(merged_cfg, schema_fields)
                         for field_key in missing:

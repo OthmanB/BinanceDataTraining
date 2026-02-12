@@ -77,6 +77,147 @@ _TYPE_MAP = {
 }
 
 
+def _validate_class_balancing_config(config: Dict[str, Any]) -> None:
+    """Validate preprocessing.class_balancing semantic constraints.
+
+    The YAML schema validates types but cannot express conditional requirements.
+    This function enforces those rules so misconfigured balancing fails fast.
+    """
+
+    preprocessing_cfg = config.get("preprocessing")
+    if not isinstance(preprocessing_cfg, dict):
+        raise ConfigError("preprocessing must be a dict")
+
+    cb_cfg = preprocessing_cfg.get("class_balancing")
+    if not isinstance(cb_cfg, dict):
+        raise ConfigError("preprocessing.class_balancing must be a dict")
+
+    method = str(cb_cfg.get("method") or "")
+    if method != "undersampling":
+        raise ConfigError(
+            "preprocessing.class_balancing.method must be 'undersampling' (legacy methods removed)"
+        )
+
+    enabled = bool(cb_cfg.get("enabled", False))
+    if not enabled:
+        return
+
+    undersampling_cfg = cb_cfg.get("undersampling")
+    if not isinstance(undersampling_cfg, dict):
+        raise ConfigError(
+            "preprocessing.class_balancing.undersampling must be provided when class_balancing.enabled is true"
+        )
+
+    criteria = str(undersampling_cfg.get("labeling_criteria") or "")
+    if criteria not in {"max_intensity", "up_intensity", "down_intensity"}:
+        raise ConfigError(
+            "preprocessing.class_balancing.undersampling.labeling_criteria must be one of: "
+            "'max_intensity', 'up_intensity', 'down_intensity'"
+        )
+
+    selection_policy = str(undersampling_cfg.get("selection_policy") or "")
+    if selection_policy not in {"uniform_time", "kmeans", "random"}:
+        raise ConfigError(
+            "preprocessing.class_balancing.undersampling.selection_policy must be one of: "
+            "'uniform_time', 'kmeans', 'random'"
+        )
+
+    target_dist_raw = undersampling_cfg.get("target_distribution")
+    if not isinstance(target_dist_raw, list) or not target_dist_raw:
+        raise ConfigError(
+            "preprocessing.class_balancing.undersampling.target_distribution must be a non-empty list"
+        )
+
+    try:
+        target_dist = [float(v) for v in target_dist_raw]
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(
+            "preprocessing.class_balancing.undersampling.target_distribution must contain only numbers"
+        ) from exc
+
+    if any(v < 0.0 for v in target_dist):
+        raise ConfigError(
+            "preprocessing.class_balancing.undersampling.target_distribution values must be >= 0"
+        )
+
+    total_weight = float(sum(target_dist))
+    if total_weight <= 0.0:
+        raise ConfigError(
+            "preprocessing.class_balancing.undersampling.target_distribution must have a positive sum"
+        )
+
+    model_cfg = config.get("model")
+    if not isinstance(model_cfg, dict):
+        raise ConfigError("model must be a dict")
+    output_cfg = model_cfg.get("output")
+    if not isinstance(output_cfg, dict):
+        raise ConfigError("model.output must be a dict")
+
+    try:
+        num_classes_raw = output_cfg["num_classes"]
+    except KeyError as exc:
+        raise ConfigError("model.output.num_classes is required") from exc
+    try:
+        num_classes = int(num_classes_raw)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("model.output.num_classes must be an integer") from exc
+    if num_classes < 2:
+        raise ConfigError("model.output.num_classes must be >= 2")
+
+    if len(target_dist) != num_classes:
+        raise ConfigError(
+            "preprocessing.class_balancing.undersampling.target_distribution length must equal model.output.num_classes: "
+            f"len(target_distribution)={len(target_dist)}, num_classes={num_classes}"
+        )
+
+    try:
+        min_samples_raw = undersampling_cfg["min_samples_after_balance"]
+    except KeyError as exc:
+        raise ConfigError(
+            "preprocessing.class_balancing.undersampling.min_samples_after_balance is required when enabled"
+        ) from exc
+    try:
+        min_samples = int(min_samples_raw)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(
+            "preprocessing.class_balancing.undersampling.min_samples_after_balance must be an integer"
+        ) from exc
+    if min_samples <= 0:
+        raise ConfigError(
+            "preprocessing.class_balancing.undersampling.min_samples_after_balance must be positive"
+        )
+
+    try:
+        min_fraction_raw = undersampling_cfg["min_fraction_after_balance"]
+    except KeyError as exc:
+        raise ConfigError(
+            "preprocessing.class_balancing.undersampling.min_fraction_after_balance is required when enabled"
+        ) from exc
+    try:
+        min_fraction = float(min_fraction_raw)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(
+            "preprocessing.class_balancing.undersampling.min_fraction_after_balance must be a number"
+        ) from exc
+    if not (0.0 < min_fraction <= 1.0):
+        raise ConfigError(
+            "preprocessing.class_balancing.undersampling.min_fraction_after_balance must be in (0, 1]"
+        )
+
+    random_seed = undersampling_cfg.get("random_seed")
+    if random_seed is not None:
+        try:
+            seed_int = int(random_seed)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(
+                "preprocessing.class_balancing.undersampling.random_seed must be an integer"
+            ) from exc
+        if seed_int < 0:
+            raise ConfigError(
+                "preprocessing.class_balancing.undersampling.random_seed must be >= 0"
+            )
+
+
 def _get_nested(config: Dict[str, Any], dotted_key: str) -> Any:
     parts = dotted_key.split(".")
     current: Any = config
@@ -210,6 +351,8 @@ def load_config(
     resolved_config = _resolve_env_placeholders(copy.deepcopy(raw_config))
 
     _validate_config_schema(resolved_config, schema)
+
+    _validate_class_balancing_config(resolved_config)
 
     # Return a deep copy so callers cannot accidentally mutate internal state
     return copy.deepcopy(resolved_config)

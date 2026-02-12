@@ -168,8 +168,20 @@ preprocessing:  # Controls normalization, feature engineering, and dataset split
     test_ratio: 0.15           # Fraction of samples used for final testing.
 
   class_balancing:
-    enabled: true              # When true, enable strategies to mitigate label imbalance.
-    method: "class_weights"   # Balancing strategy: "class_weights", "oversampling", or "undersampling" (not all fully implemented yet).
+    enabled: false             # When true, evict samples from overrepresented label classes before training.
+    method: "undersampling"   # Currently supported: "undersampling" only.
+
+    # Undersampling is a coarse pre-training filter. It is independent from
+    # training.class_weights and can be combined with it.
+    undersampling:
+      labeling_criteria: "max_intensity"  # One of: "max_intensity" | "up_intensity" | "down_intensity".
+      # Relative class weights; length must equal model.output.num_classes.
+      # Values do not need to sum to 1.0 (e.g. [70, 15, 10, 5]).
+      target_distribution: [70, 15, 10, 5]
+      selection_policy: "uniform_time"  # One of: "uniform_time" | "kmeans" | "random".
+      min_samples_after_balance: 1000  # Fail fast if undersampling keeps fewer samples.
+      min_fraction_after_balance: 0.01  # Fail fast if undersampling keeps a smaller fraction of the train split.
+      random_seed: 42
 
 # Model Architecture Configuration
 model:  # Defines the neural network architecture and its compilation settings.

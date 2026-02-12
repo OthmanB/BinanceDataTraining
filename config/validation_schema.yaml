@@ -161,6 +161,20 @@ sections:
       class_balancing.method:
         type: string
 
+    optional_keys:
+      class_balancing.undersampling.labeling_criteria:
+        type: string
+      class_balancing.undersampling.target_distribution:
+        type: list
+      class_balancing.undersampling.selection_policy:
+        type: string
+      class_balancing.undersampling.min_samples_after_balance:
+        type: integer
+      class_balancing.undersampling.min_fraction_after_balance:
+        type: number
+      class_balancing.undersampling.random_seed:
+        type: integer
+
   model:
     type: dict
     required_keys:

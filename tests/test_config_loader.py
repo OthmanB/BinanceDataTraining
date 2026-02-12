@@ -90,6 +90,62 @@ training:
                         schema_path="config/validation_schema.yaml",
                     )
 
+    def test_class_balancing_rejects_legacy_methods(self) -> None:
+        base_config_path = os.path.abspath("config/training_config.yaml")
+        override_yaml = f"""
+base_config: "{base_config_path}"
+preprocessing:
+  class_balancing:
+    enabled: false
+    method: "class_weights"
+"""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            override_path = Path(tmpdir) / "override_bad_class_balancing.yaml"
+            override_path.write_text(override_yaml, encoding="utf-8")
+
+            env = {
+                "DATABASE_URI": "http://example-db",
+                "DATABASE_URI_HIST": "http://example-db-hist",
+                "DATABASE_URI_LIVE": "http://example-db-live",
+                "MLFLOW_TRACKING_URI": "http://mlflow",
+            }
+            with mock.patch.dict(os.environ, env, clear=False):
+                with self.assertRaises(ConfigError):
+                    load_config(
+                        config_path=str(override_path),
+                        schema_path="config/validation_schema.yaml",
+                    )
+
+    def test_class_balancing_validates_target_distribution_shape_when_enabled(self) -> None:
+        base_config_path = os.path.abspath("config/training_config.yaml")
+        override_yaml = f"""
+base_config: "{base_config_path}"
+preprocessing:
+  class_balancing:
+    enabled: true
+    method: "undersampling"
+    undersampling:
+      target_distribution: [1, 1, 1]
+"""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            override_path = Path(tmpdir) / "override_bad_target_distribution.yaml"
+            override_path.write_text(override_yaml, encoding="utf-8")
+
+            env = {
+                "DATABASE_URI": "http://example-db",
+                "DATABASE_URI_HIST": "http://example-db-hist",
+                "DATABASE_URI_LIVE": "http://example-db-live",
+                "MLFLOW_TRACKING_URI": "http://mlflow",
+            }
+            with mock.patch.dict(os.environ, env, clear=False):
+                with self.assertRaises(ConfigError):
+                    load_config(
+                        config_path=str(override_path),
+                        schema_path="config/validation_schema.yaml",
+                    )
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
