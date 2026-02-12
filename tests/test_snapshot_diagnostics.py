@@ -11,6 +11,7 @@ import numpy as np
 from diagnostics.snapshot_diagnostics import (
     DIAGNOSTICS_MODE_PER_SNAPSHOT,
     DIAGNOSTICS_MODE_STANDALONE,
+    _extract_top_of_book,
     _resolve_diagnostics_artifact_path,
     resolve_diagnostics_execution_mode,
     run_snapshot_diagnostics,
@@ -24,6 +25,42 @@ class _FakeSnapshotDataset:
 
 
 class TestSnapshotDiagnostics(unittest.TestCase):
+    def test_extract_top_of_book_uses_field_axis_for_hybrid_shape(self) -> None:
+        # sample shape: (T, levels, fields, channels)
+        # fields order: [bid_price, bid_qty, ask_price, ask_qty]
+        sample = np.zeros((2, 40, 4, 3), dtype=np.float32)
+        sample[-1, 0, 0, 0] = 100.0
+        sample[-1, 0, 1, 0] = 5.0
+        sample[-1, 0, 2, 0] = 101.0
+        sample[-1, 0, 3, 0] = 6.0
+        # Different values on level 1 ensure we are not reading wrong indices
+        sample[-1, 1, 0, 0] = 90.0
+        sample[-1, 1, 1, 0] = 7.0
+        sample[-1, 1, 2, 0] = 91.0
+        sample[-1, 1, 3, 0] = 8.0
+
+        extracted = _extract_top_of_book(sample)
+        self.assertIsNotNone(extracted)
+        assert extracted is not None
+        bid_price, bid_qty, ask_price, ask_qty = extracted
+        self.assertEqual(bid_price, 100.0)
+        self.assertEqual(bid_qty, 5.0)
+        self.assertEqual(ask_price, 101.0)
+        self.assertEqual(ask_qty, 6.0)
+        self.assertGreater(ask_price - bid_price, 0.0)
+
+    def test_extract_top_of_book_supports_2x2_layout(self) -> None:
+        sample = np.zeros((3, 2, 2, 1), dtype=np.float32)
+        sample[-1, 0, 0, 0] = 100.0
+        sample[-1, 0, 1, 0] = 4.0
+        sample[-1, 1, 0, 0] = 101.0
+        sample[-1, 1, 1, 0] = 5.0
+
+        extracted = _extract_top_of_book(sample)
+        self.assertIsNotNone(extracted)
+        assert extracted is not None
+        self.assertEqual(extracted, (100.0, 4.0, 101.0, 5.0))
+
     def test_resolve_diagnostics_artifact_path_scopes(self) -> None:
         self.assertEqual(_resolve_diagnostics_artifact_path(None), "snapshot_diagnostics")
         self.assertEqual(_resolve_diagnostics_artifact_path(""), "snapshot_diagnostics")

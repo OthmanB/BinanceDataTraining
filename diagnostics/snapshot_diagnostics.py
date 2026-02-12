@@ -121,32 +121,44 @@ def _coerce_scalar(value: Any) -> Optional[float]:
 def _extract_top_of_book(sample: np.ndarray) -> Optional[Tuple[float, float, float, float]]:
     if sample.ndim == 4:
         last_step = sample[-1]
-        if last_step.shape[2] == 4:
+        if last_step.shape[1] >= 4:
             bid_price = _coerce_scalar(last_step[0, 0, 0])
             bid_qty = _coerce_scalar(last_step[0, 1, 0])
             ask_price = _coerce_scalar(last_step[0, 2, 0])
             ask_qty = _coerce_scalar(last_step[0, 3, 0])
-        else:
+        elif last_step.shape[0] >= 2 and last_step.shape[1] >= 2:
             bid_price = _coerce_scalar(last_step[0, 0, 0])
             bid_qty = _coerce_scalar(last_step[0, 1, 0])
             ask_price = _coerce_scalar(last_step[1, 0, 0])
             ask_qty = _coerce_scalar(last_step[1, 1, 0])
+        else:
+            return None
     elif sample.ndim == 3:
-        if sample.shape[1] == 4:
+        if sample.shape[1] >= 4:
             bid_price = _coerce_scalar(sample[0, 0, 0])
             bid_qty = _coerce_scalar(sample[0, 1, 0])
             ask_price = _coerce_scalar(sample[0, 2, 0])
             ask_qty = _coerce_scalar(sample[0, 3, 0])
-        else:
+        elif sample.shape[0] >= 2 and sample.shape[1] >= 2:
             bid_price = _coerce_scalar(sample[0, 0, 0])
             bid_qty = _coerce_scalar(sample[0, 1, 0])
             ask_price = _coerce_scalar(sample[1, 0, 0])
             ask_qty = _coerce_scalar(sample[1, 1, 0])
+        else:
+            return None
     elif sample.ndim == 2:
-        bid_price = _coerce_scalar(sample[0, 0])
-        bid_qty = _coerce_scalar(sample[0, 1])
-        ask_price = _coerce_scalar(sample[0, 2])
-        ask_qty = _coerce_scalar(sample[0, 3])
+        if sample.shape[1] >= 4:
+            bid_price = _coerce_scalar(sample[0, 0])
+            bid_qty = _coerce_scalar(sample[0, 1])
+            ask_price = _coerce_scalar(sample[0, 2])
+            ask_qty = _coerce_scalar(sample[0, 3])
+        elif sample.shape[0] >= 2 and sample.shape[1] >= 2:
+            bid_price = _coerce_scalar(sample[0, 0])
+            bid_qty = _coerce_scalar(sample[0, 1])
+            ask_price = _coerce_scalar(sample[1, 0])
+            ask_qty = _coerce_scalar(sample[1, 1])
+        else:
+            return None
     else:
         return None
 
