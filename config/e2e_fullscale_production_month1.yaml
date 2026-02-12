@@ -38,11 +38,11 @@ model:
         pool_size: [2, 1]
         normalization: null
         dropout: 0.3
-      - filters: 256
-        kernel_size: [3, 3]
-        pool_size: [2, 1]
-        normalization: null
-        dropout: 0.25
+#      - filters: 256
+#        kernel_size: [3, 3]
+#        pool_size: [2, 1]
+#        normalization: null
+#        dropout: 0.25
   long_term:
     enabled: true
     windows_days: [3, 7]
