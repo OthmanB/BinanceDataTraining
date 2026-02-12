@@ -96,7 +96,7 @@ hyperparameter_optimization:
     retry_on_oom: true
     max_retry_attempts: 2
     batch_backoff_factor: 0.6
-    min_batch_size: 4
+    min_batch_size: 8
     failure_policy: "prune"
     failure_penalty_value: 1000000.0
     max_vram_fraction: 0.93
