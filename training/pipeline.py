@@ -27,7 +27,9 @@ from mlflow_integration.model_registry import register_model
 from .snapshot_dataset import (
     NormalizationStats,
     build_training_generator,
+    build_training_generator_for_indices,
     compute_label_distribution,
+    compute_label_distribution_for_indices,
     compute_normalization_stats,
     get_chunk_x_shape,
     get_mask_channel_info,
@@ -49,6 +51,7 @@ from .long_term_context import (
     compute_long_term_features_for_dataset,
     is_long_term_enabled,
     wrap_generator_with_long_term,
+    wrap_generator_with_long_term_for_indices,
 )
 
 
@@ -164,6 +167,97 @@ def _resolve_snapshot_training_indices(
     val_start = train_end
     val_end = min(val_end, n_samples)
     return effective_train_n, val_start, val_end
+
+
+def _resolve_undersampled_train_indices(
+    config: Dict[str, Any],
+    snapshot_dataset: Any,
+    *,
+    train_end: int,
+    batch_size: int,
+    num_classes: int,
+) -> Optional[np.ndarray]:
+    """Resolve undersampled training indices for the train split.
+
+    Returns None when preprocessing.class_balancing.enabled is false.
+    """
+    cb_cfg = config.get("preprocessing", {}).get("class_balancing")
+    if not isinstance(cb_cfg, dict) or not bool(cb_cfg.get("enabled", False)):
+        return None
+
+    from training.sample_balancing import (
+        compute_available_class_counts,
+        compute_undersample_counts,
+        resolve_undersampling_config,
+        select_undersampled_indices,
+    )
+
+    undersampling_cfg = resolve_undersampling_config(config)
+    if undersampling_cfg is None:
+        return None
+
+    available = compute_available_class_counts(
+        dataset=snapshot_dataset,
+        start_index=0,
+        end_index=int(train_end),
+        num_classes=int(num_classes),
+        labeling_criteria=str(undersampling_cfg.labeling_criteria),
+    )
+    keep_counts = compute_undersample_counts(
+        available_counts=available,
+        target_distribution=list(undersampling_cfg.target_distribution),
+    )
+    selected = select_undersampled_indices(
+        dataset=snapshot_dataset,
+        start_index=0,
+        end_index=int(train_end),
+        num_classes=int(num_classes),
+        labeling_criteria=str(undersampling_cfg.labeling_criteria),
+        keep_counts=keep_counts,
+        selection_policy=str(undersampling_cfg.selection_policy),
+        random_seed=int(undersampling_cfg.random_seed),
+    )
+
+    selected = np.asarray(selected, dtype="int64")
+    if selected.ndim != 1:
+        raise ConfigError("Undersampled indices must be rank 1")
+
+    steps = int(selected.shape[0]) // int(batch_size)
+    usable = int(steps * int(batch_size))
+    if usable <= 0:
+        raise ConfigError(
+            "Undersampling produced too few samples to form a full batch: "
+            f"kept={int(selected.shape[0])}, batch_size={int(batch_size)}"
+        )
+
+    selected = np.asarray(selected[:usable], dtype="int64")
+
+    min_samples = int(undersampling_cfg.min_samples_after_balance)
+    if int(selected.shape[0]) < min_samples:
+        raise ConfigError(
+            "Undersampling kept too few samples for training: "
+            f"kept={int(selected.shape[0])} < min_samples_after_balance={min_samples}"
+        )
+
+    min_fraction = float(undersampling_cfg.min_fraction_after_balance)
+    if train_end > 0 and float(selected.shape[0]) < float(train_end) * min_fraction:
+        raise ConfigError(
+            "Undersampling kept too small a fraction of training samples: "
+            f"kept={int(selected.shape[0])}, train_end={int(train_end)}, "
+            f"min_fraction_after_balance={min_fraction}"
+        )
+
+    logger.info(
+        "Preprocessing undersampling enabled: criteria=%s policy=%s train_end=%s available=%s keep=%s kept=%s",
+        undersampling_cfg.labeling_criteria,
+        undersampling_cfg.selection_policy,
+        int(train_end),
+        available,
+        keep_counts,
+        int(selected.shape[0]),
+    )
+
+    return selected
 
 
 def _precompute_trial_invariant_snapshot_artifacts(config: Dict[str, Any], snapshot_dataset: Any) -> None:
@@ -620,19 +714,37 @@ def _fit_snapshot_model_once(
         },
     )
 
+    num_classes = int(output_cfg["num_classes"])
+    balanced_train_indices = _resolve_undersampled_train_indices(
+        config,
+        snapshot_dataset,
+        train_end=effective_train_n,
+        batch_size=generator_batch_size,
+        num_classes=num_classes,
+    )
+    effective_train_used_n = int(balanced_train_indices.shape[0]) if balanced_train_indices is not None else int(
+        effective_train_n
+    )
+
     class_weights_up: Optional[Dict[int, float]] = None
     class_weights_down: Optional[Dict[int, float]] = None
     if use_class_weights:
-        num_classes = int(output_cfg["num_classes"])
-        train_label_dist = load_label_stats_from_manifest(manifest, "train")
-        if train_label_dist is None:
-            train_label_dist = compute_label_distribution(
+        if balanced_train_indices is not None:
+            train_label_dist = compute_label_distribution_for_indices(
                 snapshot_dataset,
-                start_index=0,
-                end_index=effective_train_n,
+                indices=balanced_train_indices,
                 num_classes=num_classes,
             )
-            save_label_stats_to_manifest(context, manifest, train_label_dist, "train")
+        else:
+            train_label_dist = load_label_stats_from_manifest(manifest, "train")
+            if train_label_dist is None:
+                train_label_dist = compute_label_distribution(
+                    snapshot_dataset,
+                    start_index=0,
+                    end_index=effective_train_n,
+                    num_classes=num_classes,
+                )
+                save_label_stats_to_manifest(context, manifest, train_label_dist, "train")
 
         class_weights_up = compute_class_weights_from_counts(train_label_dist.up_counts, num_classes)
         class_weights_down = compute_class_weights_from_counts(train_label_dist.down_counts, num_classes)
@@ -694,10 +806,54 @@ def _fit_snapshot_model_once(
                     long_term_input_dim=long_term_input_dim,
                 )
 
-    num_classes = int(output_cfg["num_classes"])
-
     def _make_train_gen() -> Iterator[Tuple[Any, ...]]:
-        gen, _ = build_training_generator(
+        if balanced_train_indices is not None:
+            gen, _ = build_training_generator_for_indices(
+                dataset=snapshot_dataset,
+                indices=balanced_train_indices,
+                batch_size=generator_batch_size,
+                num_classes=num_classes,
+                normalization=train_stats,
+                sample_weight_cfg=training_cfg["sample_weighting"],
+                mask_start=mask_start,
+                mask_count=mask_count,
+                class_weights_up=class_weights_up,
+                class_weights_down=class_weights_down,
+            )
+        else:
+            gen, _ = build_training_generator(
+                dataset=snapshot_dataset,
+                start_index=0,
+                end_index=effective_train_n,
+                batch_size=generator_batch_size,
+                num_classes=num_classes,
+                normalization=train_stats,
+                sample_weight_cfg=training_cfg["sample_weighting"],
+                mask_start=mask_start,
+                mask_count=mask_count,
+                class_weights_up=class_weights_up,
+                class_weights_down=class_weights_down,
+            )
+        if long_term_features is not None:
+            if balanced_train_indices is not None:
+                gen = wrap_generator_with_long_term_for_indices(
+                    gen,
+                    long_term_features,
+                    indices=balanced_train_indices,
+                )
+            else:
+                gen = wrap_generator_with_long_term(
+                    gen,
+                    long_term_features,
+                    start_index=0,
+                    end_index=effective_train_n,
+                )
+        return gen
+
+    if balanced_train_indices is not None:
+        train_steps = int(effective_train_used_n) // int(generator_batch_size)
+    else:
+        _, train_steps = build_training_generator(
             dataset=snapshot_dataset,
             start_index=0,
             end_index=effective_train_n,
@@ -710,25 +866,6 @@ def _fit_snapshot_model_once(
             class_weights_up=class_weights_up,
             class_weights_down=class_weights_down,
         )
-        if long_term_features is not None:
-            gen = wrap_generator_with_long_term(
-                gen, long_term_features, start_index=0, end_index=effective_train_n,
-            )
-        return gen
-
-    _, train_steps = build_training_generator(
-        dataset=snapshot_dataset,
-        start_index=0,
-        end_index=effective_train_n,
-        batch_size=generator_batch_size,
-        num_classes=num_classes,
-        normalization=train_stats,
-        sample_weight_cfg=training_cfg["sample_weighting"],
-        mask_start=mask_start,
-        mask_count=mask_count,
-        class_weights_up=class_weights_up,
-        class_weights_down=class_weights_down,
-    )
 
     if dist_ctx is not None:
         global_batch_size = generator_batch_size
@@ -826,7 +963,7 @@ def _fit_snapshot_model_once(
     if hpo_metric_value is not None:
         config["_hpo_last_metric"] = hpo_metric_value
         metric_name = str(config["hyperparameter_optimization"]["metric"])
-        hpo_metric_weight = _resolve_hpo_metric_weight(metric_name, effective_train_n, val_count)
+        hpo_metric_weight = _resolve_hpo_metric_weight(metric_name, effective_train_used_n, val_count)
 
     try:
         import mlflow  # type: ignore[import]
@@ -1186,31 +1323,48 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
         },
     )
 
+    num_classes = int(output_cfg["num_classes"])
+    balanced_train_indices = _resolve_undersampled_train_indices(
+        config,
+        snapshot_dataset,
+        train_end=effective_train_n,
+        batch_size=generator_batch_size,
+        num_classes=num_classes,
+    )
+    effective_train_used_n = int(balanced_train_indices.shape[0]) if balanced_train_indices is not None else int(
+        effective_train_n
+    )
+
     # Compute class weights for imbalanced label handling if configured.
     # Class weights are computed from training data only to avoid data leakage.
     class_weights_up: Optional[Dict[int, float]] = None
     class_weights_down: Optional[Dict[int, float]] = None
 
     if use_class_weights:
-        num_classes = int(output_cfg["num_classes"])
-
-        # Try to load cached label stats from manifest first
-        train_label_dist = load_label_stats_from_manifest(manifest, "train")
-
-        if train_label_dist is None:
-            # Compute label distribution by streaming through training data
-            logger.info(
-                "Computing label distribution for class weights (train samples 0 to %s)...",
-                effective_train_n,
-            )
-            train_label_dist = compute_label_distribution(
+        if balanced_train_indices is not None:
+            train_label_dist = compute_label_distribution_for_indices(
                 snapshot_dataset,
-                start_index=0,
-                end_index=effective_train_n,
+                indices=balanced_train_indices,
                 num_classes=num_classes,
             )
-            # Cache in manifest for future runs
-            save_label_stats_to_manifest(context, manifest, train_label_dist, "train")
+        else:
+            # Try to load cached label stats from manifest first
+            train_label_dist = load_label_stats_from_manifest(manifest, "train")
+
+            if train_label_dist is None:
+                # Compute label distribution by streaming through training data
+                logger.info(
+                    "Computing label distribution for class weights (train samples 0 to %s)...",
+                    effective_train_n,
+                )
+                train_label_dist = compute_label_distribution(
+                    snapshot_dataset,
+                    start_index=0,
+                    end_index=effective_train_n,
+                    num_classes=num_classes,
+                )
+                # Cache in manifest for future runs
+                save_label_stats_to_manifest(context, manifest, train_label_dist, "train")
 
         # Compute class weights from label counts
         class_weights_up = compute_class_weights_from_counts(
@@ -1374,11 +1528,56 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
 
     callbacks = create_callbacks(config)
 
-    num_classes = int(output_cfg["num_classes"])
-
     # Helper to create a fresh generator (needed by tf.data.Dataset.from_generator)
     def _make_train_gen() -> Iterator[Tuple[Any, ...]]:
-        gen, _ = build_training_generator(
+        if balanced_train_indices is not None:
+            gen, _ = build_training_generator_for_indices(
+                dataset=snapshot_dataset,
+                indices=balanced_train_indices,
+                batch_size=generator_batch_size,
+                num_classes=num_classes,
+                normalization=train_stats,
+                sample_weight_cfg=training_cfg["sample_weighting"],
+                mask_start=mask_start,
+                mask_count=mask_count,
+                class_weights_up=class_weights_up,
+                class_weights_down=class_weights_down,
+            )
+        else:
+            gen, _ = build_training_generator(
+                dataset=snapshot_dataset,
+                start_index=0,
+                end_index=effective_train_n,
+                batch_size=generator_batch_size,
+                num_classes=num_classes,
+                normalization=train_stats,
+                sample_weight_cfg=training_cfg["sample_weighting"],
+                mask_start=mask_start,
+                mask_count=mask_count,
+                class_weights_up=class_weights_up,
+                class_weights_down=class_weights_down,
+            )
+        if long_term_features is not None:
+            if balanced_train_indices is not None:
+                gen = wrap_generator_with_long_term_for_indices(
+                    gen,
+                    long_term_features,
+                    indices=balanced_train_indices,
+                )
+            else:
+                gen = wrap_generator_with_long_term(
+                    gen,
+                    long_term_features,
+                    start_index=0,
+                    end_index=effective_train_n,
+                )
+        return gen
+
+    if balanced_train_indices is not None:
+        train_steps = int(effective_train_used_n) // int(generator_batch_size)
+    else:
+        # Compute steps from a throwaway call (same as build_training_generator returns)
+        _, train_steps = build_training_generator(
             dataset=snapshot_dataset,
             start_index=0,
             end_index=effective_train_n,
@@ -1391,26 +1590,6 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
             class_weights_up=class_weights_up,
             class_weights_down=class_weights_down,
         )
-        if long_term_features is not None:
-            gen = wrap_generator_with_long_term(
-                gen, long_term_features, start_index=0, end_index=effective_train_n,
-            )
-        return gen
-
-    # Compute steps from a throwaway call (same as build_training_generator returns)
-    _, train_steps = build_training_generator(
-        dataset=snapshot_dataset,
-        start_index=0,
-        end_index=effective_train_n,
-        batch_size=generator_batch_size,
-        num_classes=num_classes,
-        normalization=train_stats,
-        sample_weight_cfg=training_cfg["sample_weighting"],
-        mask_start=mask_start,
-        mask_count=mask_count,
-        class_weights_up=class_weights_up,
-        class_weights_down=class_weights_down,
-    )
 
     if dist_ctx is not None:
         global_batch_size = generator_batch_size
@@ -1535,8 +1714,9 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
             final_loss = loss_values[-1]
 
     logger.info(
-        "Snapshot training completed. effective_train_n=%s, final_loss=%s",
-        effective_train_n,
+        "Snapshot training completed. effective_train_n=%s, used_train_n=%s, final_loss=%s",
+        int(effective_train_n),
+        int(effective_train_used_n),
         final_loss,
     )
 

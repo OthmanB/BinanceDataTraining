@@ -1237,6 +1237,413 @@ def build_training_generator(
     return _generator_with_weights(), steps
 
 
+class _ChunkSampleReader:
+    def __init__(self, chunk: SnapshotChunk) -> None:
+        self.chunk = chunk
+
+    def get_samples(self, local_indices: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        return
+
+
+class _NpyShardsV1SampleReader(_ChunkSampleReader):
+    def __init__(self, chunk: SnapshotChunk) -> None:
+        super().__init__(chunk)
+        if chunk.array_paths is None:
+            raise ConfigError("Snapshot chunk array_paths are required for npy_shards_v1 format")
+        self._x = np.load(chunk.array_paths["x"], mmap_mode="r")
+        self._y_up = np.load(chunk.array_paths["y_up"], mmap_mode="r")
+        self._y_down = np.load(chunk.array_paths["y_down"], mmap_mode="r")
+        self._anchor_ts = np.load(chunk.array_paths["anchor_ts"], mmap_mode="r")
+        self._duty_cycle = np.load(chunk.array_paths["duty_cycle"], mmap_mode="r")
+
+    def get_samples(self, local_indices: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        x = np.asarray(self._x[local_indices], dtype="float32")
+        y_up = np.asarray(self._y_up[local_indices], dtype="int64")
+        y_down = np.asarray(self._y_down[local_indices], dtype="int64")
+        anchor_ts = np.asarray(self._anchor_ts[local_indices], dtype="int64")
+        duty_cycle = np.asarray(self._duty_cycle[local_indices], dtype="float32")
+        return x, y_up, y_down, anchor_ts, duty_cycle
+
+
+class _FrameStoreV1SampleReader(_ChunkSampleReader):
+    def __init__(self, chunk: SnapshotChunk) -> None:
+        super().__init__(chunk)
+        if chunk.array_paths is None:
+            raise ConfigError("Snapshot chunk array_paths are required for frame_store_v1 format")
+        if chunk.window_steps is None or int(chunk.window_steps) <= 0:
+            raise ConfigError("Snapshot chunk window_steps must be present for frame_store_v1 format")
+
+        self._window_steps = int(chunk.window_steps)
+
+        self._frames_base = np.load(chunk.array_paths["frames_base"], mmap_mode="r")
+        self._frames_confidence = np.load(chunk.array_paths["frames_confidence"], mmap_mode="r")
+        self._frames_observed = np.load(chunk.array_paths["frames_observed"], mmap_mode="r")
+        self._frames_ts = np.load(chunk.array_paths["frames_ts"], mmap_mode="r")
+
+        self._anchor_local_idx = np.load(chunk.array_paths["anchor_local_idx"], mmap_mode="r")
+        self._y_up = np.load(chunk.array_paths["y_up"], mmap_mode="r")
+        self._y_down = np.load(chunk.array_paths["y_down"], mmap_mode="r")
+        self._anchor_ts = np.load(chunk.array_paths["anchor_ts"], mmap_mode="r")
+        self._duty_cycle = np.load(chunk.array_paths["duty_cycle"], mmap_mode="r")
+        self._aux = np.load(chunk.array_paths["aux"], mmap_mode="r")
+
+        if self._frames_base.ndim != 4:
+            raise ConfigError("Snapshot frame_store_v1 frames_base array must be rank 4")
+        if self._frames_confidence.ndim != 2 or self._frames_observed.ndim != 2:
+            raise ConfigError("Snapshot frame_store_v1 confidence/observed arrays must be rank 2")
+        if self._frames_ts.ndim != 1:
+            raise ConfigError("Snapshot frame_store_v1 frames_ts array must be rank 1")
+
+        n_frames = int(self._frames_base.shape[0])
+        if (
+            n_frames != int(self._frames_confidence.shape[0])
+            or n_frames != int(self._frames_observed.shape[0])
+            or n_frames != int(self._frames_ts.shape[0])
+        ):
+            raise ConfigError("Snapshot frame_store_v1 frame arrays have inconsistent first dimension")
+
+    def get_samples(self, local_indices: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        local_indices = np.asarray(local_indices, dtype="int64")
+        if local_indices.ndim != 1:
+            raise ValueError("local_indices must be rank 1")
+
+        anchor_local_idx = np.asarray(self._anchor_local_idx[local_indices], dtype="int64")
+        y_up = np.asarray(self._y_up[local_indices], dtype="int64")
+        y_down = np.asarray(self._y_down[local_indices], dtype="int64")
+        anchor_ts = np.asarray(self._anchor_ts[local_indices], dtype="int64")
+        duty_cycle = np.asarray(self._duty_cycle[local_indices], dtype="float32")
+        aux = np.asarray(self._aux[local_indices], dtype="float32")
+
+        if aux.ndim == 1:
+            aux = aux.reshape(aux.shape[0], 1)
+        if aux.ndim != 2:
+            raise ConfigError("Snapshot frame_store_v1 aux array must be rank 2")
+
+        window_steps = int(self._window_steps)
+        starts = anchor_local_idx - (window_steps - 1)
+        sample_count = int(anchor_local_idx.shape[0])
+
+        n_frames = int(self._frames_base.shape[0])
+        if sample_count > 0:
+            if int(starts.min()) < 0:
+                raise ConfigError("Snapshot frame_store_v1 has invalid anchor index below window start")
+            if int(anchor_local_idx.max()) >= n_frames:
+                raise ConfigError("Snapshot frame_store_v1 has invalid anchor index beyond frame count")
+
+        h_dim = int(self._frames_base.shape[1])
+        w_dim = int(self._frames_base.shape[2])
+        base_channels = int(self._frames_base.shape[3])
+
+        x_base = np.empty((sample_count, window_steps, h_dim, w_dim, base_channels), dtype="float32")
+        for idx, start_idx in enumerate(starts):
+            end_idx = int(start_idx) + window_steps
+            x_base[idx] = np.asarray(self._frames_base[int(start_idx):end_idx], dtype="float32")
+
+        x_out = x_base
+
+        if bool(self.chunk.include_mask_channel):
+            if self.chunk.num_assets is not None:
+                num_assets = int(self.chunk.num_assets)
+            else:
+                num_assets = int(self._frames_confidence.shape[1])
+
+            if int(self._frames_confidence.shape[1]) != num_assets:
+                raise ConfigError("Snapshot frame_store_v1 confidence width does not match num_assets")
+
+            mask = np.empty((sample_count, window_steps, h_dim, w_dim, num_assets), dtype="float32")
+            for idx, start_idx in enumerate(starts):
+                end_idx = int(start_idx) + window_steps
+                conf_window = np.asarray(self._frames_confidence[int(start_idx):end_idx], dtype="float32")
+                mask[idx] = conf_window[:, None, None, :]
+            x_out = np.concatenate([x_out, mask], axis=-1)
+
+        aux_dim = int(aux.shape[1])
+        if aux_dim > 0:
+            aux_view = np.broadcast_to(
+                aux[:, None, None, None, :],
+                (sample_count, window_steps, h_dim, w_dim, aux_dim),
+            )
+            x_out = np.concatenate([x_out, np.asarray(aux_view, dtype="float32")], axis=-1)
+
+        return x_out, y_up, y_down, anchor_ts, duty_cycle
+
+
+class _NpzSampleReader(_ChunkSampleReader):
+    def __init__(self, chunk: SnapshotChunk) -> None:
+        super().__init__(chunk)
+        self._npz = np.load(chunk.file_path)
+
+    def close(self) -> None:
+        try:
+            self._npz.close()
+        except Exception:
+            return
+
+    def get_samples(self, local_indices: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        x = np.asarray(self._npz["x"][local_indices], dtype="float32")
+        y_up = np.asarray(self._npz["y_up"][local_indices], dtype="int64")
+        y_down = np.asarray(self._npz["y_down"][local_indices], dtype="int64")
+        anchor_ts = np.asarray(self._npz["anchor_ts"][local_indices], dtype="int64")
+        if "duty_cycle" not in self._npz:
+            raise ConfigError(
+                "Snapshot chunk missing duty_cycle. Rebuild snapshot dataset to enable duty-cycle weighting."
+            )
+        duty_cycle = np.asarray(self._npz["duty_cycle"][local_indices], dtype="float32")
+        return x, y_up, y_down, anchor_ts, duty_cycle
+
+
+def _open_chunk_sample_reader(chunk: SnapshotChunk) -> _ChunkSampleReader:
+    if chunk.storage_format == CHUNK_STORAGE_FRAME_STORE_V1:
+        return _FrameStoreV1SampleReader(chunk)
+    if chunk.storage_format == CHUNK_STORAGE_NPY_SHARDS_V1:
+        return _NpyShardsV1SampleReader(chunk)
+    return _NpzSampleReader(chunk)
+
+
+def _iter_indices_by_chunk(
+    dataset: SnapshotDataset,
+    indices: np.ndarray,
+) -> Iterator[Tuple[SnapshotChunk, np.ndarray]]:
+    indices = np.asarray(indices, dtype="int64")
+    if indices.ndim != 1:
+        raise ValueError("indices must be rank 1")
+
+    pos = 0
+    total = int(indices.shape[0])
+    for chunk in dataset.chunks:
+        if pos >= total:
+            break
+        chunk_start = int(chunk.start_index)
+        chunk_end = int(chunk.start_index + chunk.num_samples)
+
+        # Indices are expected to be sorted and within [0, dataset.total_samples).
+        if int(indices[pos]) < chunk_start:
+            raise ConfigError("Undersampling indices are not aligned with chunk boundaries")
+
+        end = pos
+        while end < total and int(indices[end]) < chunk_end:
+            end += 1
+        if end > pos:
+            local = np.asarray(indices[pos:end] - chunk_start, dtype="int64")
+            yield chunk, local
+        pos = end
+
+    if pos < total:
+        raise ConfigError("Undersampling indices exceed snapshot dataset bounds")
+
+
+def _compute_current_day_for_indices(dataset: SnapshotDataset, indices: np.ndarray) -> int:
+    max_day = None
+    for chunk, local_indices in _iter_indices_by_chunk(dataset, indices):
+        anchor_ts_all = load_chunk_anchor_timestamps(chunk)
+        anchor_ts = np.asarray(anchor_ts_all[local_indices], dtype="int64")
+        if anchor_ts.size == 0:
+            continue
+        days = (anchor_ts // 86400).astype("int64")
+        batch_max = int(days.max())
+        if max_day is None or batch_max > max_day:
+            max_day = batch_max
+    if max_day is None:
+        raise ValueError("Failed to compute current_day for sample weighting")
+    return max_day
+
+
+def build_training_generator_for_indices(
+    dataset: SnapshotDataset,
+    indices: np.ndarray,
+    batch_size: int,
+    num_classes: int,
+    normalization: Optional[NormalizationStats],
+    sample_weight_cfg: Optional[Dict[str, Any]],
+    mask_start: int = 0,
+    mask_count: int = 0,
+    class_weights_up: Optional[Dict[int, float]] = None,
+    class_weights_down: Optional[Dict[int, float]] = None,
+) -> Tuple[Iterator[Tuple[Any, ...]], int]:
+    """Create a generator for model.fit using an explicit index list."""
+    if batch_size <= 0:
+        raise ValueError("training.batch_size must be positive")
+
+    indices = np.asarray(indices, dtype="int64")
+    if indices.ndim != 1:
+        raise ValueError("indices must be rank 1")
+    if indices.size == 0:
+        raise ValueError("indices must be non-empty")
+
+    # Drop incomplete tail to preserve uniform batch shapes.
+    steps = int(indices.shape[0]) // int(batch_size)
+    if steps <= 0:
+        return iter(()), 0
+    usable = int(steps * int(batch_size))
+    indices_use = np.asarray(indices[:usable], dtype="int64")
+
+    # Determine if exponential decay weighting is enabled
+    current_day = None
+    decay_const = None
+    use_decay_weights = False
+    if sample_weight_cfg and sample_weight_cfg.get("enabled"):
+        apply_to = str(sample_weight_cfg.get("apply_to", "loss_function"))
+        if apply_to != "loss_function":
+            raise ValueError(
+                "training.sample_weighting.apply_to must be 'loss_function' when enabled; "
+                f"got {apply_to!r}"
+            )
+        method = str(sample_weight_cfg["method"])
+        if method != "exponential_decay":
+            raise ValueError("training.sample_weighting.method must be 'exponential_decay'")
+        half_life_days = int(sample_weight_cfg["half_life_days"])
+        if half_life_days <= 0:
+            raise ValueError("training.sample_weighting.half_life_days must be positive")
+        decay_const = float(np.log(2.0) / float(half_life_days))
+        current_day = _compute_current_day_for_indices(dataset, indices_use)
+        use_decay_weights = True
+
+    # Determine if class weighting is enabled
+    use_class_weights = class_weights_up is not None or class_weights_down is not None
+
+    eye = np.eye(num_classes, dtype="float32")
+
+    def _compute_class_sample_weights(
+        y_up: np.ndarray,
+        y_down: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        batch_len = y_up.shape[0]
+
+        if class_weights_up is not None:
+            weights_up = np.array(
+                [class_weights_up.get(int(label), 1.0) for label in y_up],
+                dtype="float32",
+            )
+        else:
+            weights_up = np.ones(batch_len, dtype="float32")
+
+        if class_weights_down is not None:
+            weights_down = np.array(
+                [class_weights_down.get(int(label), 1.0) for label in y_down],
+                dtype="float32",
+            )
+        else:
+            weights_down = np.ones(batch_len, dtype="float32")
+
+        return weights_up, weights_down
+
+    def _iter_minibatches() -> Iterator[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+        chunks = dataset.chunks
+        chunk_idx = 0
+        reader: Optional[_ChunkSampleReader] = None
+        current_chunk: Optional[SnapshotChunk] = None
+
+        try:
+            for pos in range(0, indices_use.shape[0], batch_size):
+                batch_indices = indices_use[pos : pos + batch_size]
+                if batch_indices.shape[0] != batch_size:
+                    break
+
+                x_parts: List[np.ndarray] = []
+                y_up_parts: List[np.ndarray] = []
+                y_down_parts: List[np.ndarray] = []
+                anchor_ts_parts: List[np.ndarray] = []
+                duty_parts: List[np.ndarray] = []
+
+                idx_pos = 0
+                while idx_pos < batch_size:
+                    idx_global = int(batch_indices[idx_pos])
+                    while chunk_idx < len(chunks):
+                        chunk = chunks[chunk_idx]
+                        chunk_start = int(chunk.start_index)
+                        chunk_end = int(chunk.start_index + chunk.num_samples)
+                        if idx_global < chunk_start:
+                            raise ConfigError("Balanced training indices are not sorted")
+                        if idx_global >= chunk_end:
+                            if reader is not None:
+                                reader.close()
+                                reader = None
+                                current_chunk = None
+                            chunk_idx += 1
+                            continue
+                        break
+
+                    if chunk_idx >= len(chunks):
+                        raise ConfigError("Balanced training indices exceed snapshot dataset bounds")
+
+                    chunk = chunks[chunk_idx]
+                    chunk_start = int(chunk.start_index)
+                    chunk_end = int(chunk.start_index + chunk.num_samples)
+
+                    if current_chunk is not chunk:
+                        if reader is not None:
+                            reader.close()
+                        reader = _open_chunk_sample_reader(chunk)
+                        current_chunk = chunk
+
+                    # Gather consecutive indices in this batch that fall within the current chunk
+                    end_pos = idx_pos
+                    while end_pos < batch_size and int(batch_indices[end_pos]) < chunk_end:
+                        end_pos += 1
+
+                    local = np.asarray(batch_indices[idx_pos:end_pos] - chunk_start, dtype="int64")
+                    assert reader is not None
+                    x_part, y_up_part, y_down_part, anchor_ts_part, duty_part = reader.get_samples(local)
+                    x_parts.append(x_part)
+                    y_up_parts.append(y_up_part)
+                    y_down_parts.append(y_down_part)
+                    anchor_ts_parts.append(anchor_ts_part)
+                    duty_parts.append(duty_part)
+
+                    idx_pos = end_pos
+
+                x_batch = np.concatenate(x_parts, axis=0)
+                y_up = np.concatenate(y_up_parts, axis=0)
+                y_down = np.concatenate(y_down_parts, axis=0)
+                anchor_ts = np.concatenate(anchor_ts_parts, axis=0)
+                duty_cycle = np.concatenate(duty_parts, axis=0)
+
+                yield x_batch, y_up, y_down, anchor_ts, duty_cycle
+        finally:
+            if reader is not None:
+                reader.close()
+
+    def _generator_with_weights() -> Iterator[Tuple[Any, ...]]:
+        while True:
+            for x_batch, y_up, y_down, anchor_ts, duty_cycle in _iter_minibatches():
+                if duty_cycle.shape[0] != x_batch.shape[0]:
+                    raise ConfigError(
+                        "Snapshot chunk duty_cycle length does not match x length. Rebuild snapshot dataset."
+                    )
+
+                x_batch = _apply_normalization(x_batch, normalization, mask_start, mask_count)
+                duty_cycle = duty_cycle.astype("float32")
+
+                y_up_oh = eye[y_up]
+                y_down_oh = eye[y_down]
+                y_batch = (y_up_oh, y_down_oh)
+
+                weights_up = duty_cycle
+                weights_down = duty_cycle.copy()
+
+                if use_decay_weights:
+                    if current_day is None or decay_const is None:
+                        raise ValueError("Sample weighting requires current_day and decay_const")
+                    anchor_days = (anchor_ts // 86400).astype("float64")
+                    age_days = float(current_day) - anchor_days
+                    decay_weights = np.exp(-age_days * float(decay_const)).astype("float32")
+                    weights_up = weights_up * decay_weights
+                    weights_down = weights_down * decay_weights
+
+                if use_class_weights:
+                    class_w_up, class_w_down = _compute_class_sample_weights(y_up, y_down)
+                    weights_up = weights_up * class_w_up
+                    weights_down = weights_down * class_w_down
+
+                sample_weight = (weights_up, weights_down)
+                yield x_batch, y_batch, sample_weight
+
+    return _generator_with_weights(), steps
+
+
 def compute_normalization_stats(
     dataset: SnapshotDataset,
     start_index: int,
@@ -1399,6 +1806,66 @@ def compute_label_distribution(
 
     logger.info(
         "Computed label distribution: total_samples=%s, up_counts=%s, down_counts=%s",
+        total_samples,
+        up_counts,
+        down_counts,
+    )
+
+    return LabelDistribution(
+        up_counts=up_counts,
+        down_counts=down_counts,
+        total_samples=total_samples,
+        num_classes=num_classes,
+    )
+
+
+def compute_label_distribution_for_indices(
+    dataset: SnapshotDataset,
+    indices: np.ndarray,
+    num_classes: int,
+) -> LabelDistribution:
+    """Compute label distribution for an explicit index list."""
+    if num_classes < 1:
+        raise ValueError(f"num_classes must be >= 1; got {num_classes}")
+
+    indices = np.asarray(indices, dtype="int64")
+    if indices.ndim != 1:
+        raise ValueError("indices must be rank 1")
+    if indices.size == 0:
+        raise ValueError("indices must be non-empty")
+
+    up_counts: Dict[int, int] = {c: 0 for c in range(num_classes)}
+    down_counts: Dict[int, int] = {c: 0 for c in range(num_classes)}
+    total_samples = int(indices.shape[0])
+
+    for chunk, local_indices in _iter_indices_by_chunk(dataset, indices):
+        if chunk.storage_format in {CHUNK_STORAGE_NPY_SHARDS_V1, CHUNK_STORAGE_FRAME_STORE_V1}:
+            if chunk.array_paths is None:
+                raise ConfigError("Snapshot chunk array_paths are required for label distribution")
+            y_up_all = np.load(chunk.array_paths["y_up"], mmap_mode="r")
+            y_down_all = np.load(chunk.array_paths["y_down"], mmap_mode="r")
+            y_up = np.asarray(y_up_all[local_indices], dtype="int64")
+            y_down = np.asarray(y_down_all[local_indices], dtype="int64")
+        else:
+            with np.load(chunk.file_path) as npz:
+                y_up = np.asarray(npz["y_up"][local_indices], dtype="int64")
+                y_down = np.asarray(npz["y_down"][local_indices], dtype="int64")
+
+        valid_up = (y_up >= 0) & (y_up < num_classes)
+        valid_down = (y_down >= 0) & (y_down < num_classes)
+
+        if bool(valid_up.any()):
+            binc_up = np.bincount(y_up[valid_up], minlength=num_classes)
+            for c in range(num_classes):
+                up_counts[c] += int(binc_up[c])
+
+        if bool(valid_down.any()):
+            binc_down = np.bincount(y_down[valid_down], minlength=num_classes)
+            for c in range(num_classes):
+                down_counts[c] += int(binc_down[c])
+
+    logger.info(
+        "Computed label distribution for indices: total_samples=%s, up_counts=%s, down_counts=%s",
         total_samples,
         up_counts,
         down_counts,
@@ -3246,7 +3713,9 @@ __all__ = [
     "SnapshotChunk",
     "SnapshotDataset",
     "build_training_generator",
+    "build_training_generator_for_indices",
     "compute_label_distribution",
+    "compute_label_distribution_for_indices",
     "compute_normalization_stats",
     "get_chunk_x_shape",
     "get_mask_channel_info",

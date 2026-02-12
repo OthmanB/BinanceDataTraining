@@ -15,6 +15,7 @@ from training.snapshot_dataset import (
     _compute_intensity_bins,
     _compute_current_day,
     build_training_generator,
+    build_training_generator_for_indices,
     compute_normalization_stats,
     iter_snapshot_batches,
     iter_snapshot_minibatches,
@@ -455,6 +456,76 @@ class TestSnapshotDataset(unittest.TestCase):
 
             expected_weights = np.array([0.25, 0.5], dtype="float32")
             self.assertTrue(np.allclose(w_up, expected_weights, rtol=1e-6, atol=1e-6))
+
+    def test_build_training_generator_for_indices_yields_selected_samples_in_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            x = np.asarray(
+                [
+                    [[[[10.0]]]],
+                    [[[[11.0]]]],
+                    [[[[12.0]]]],
+                    [[[[13.0]]]],
+                    [[[[14.0]]]],
+                    [[[[15.0]]]],
+                ],
+                dtype="float32",
+            )
+            y_up = np.asarray([0, 1, 0, 1, 0, 1], dtype="int64")
+            y_down = np.asarray([1, 0, 1, 0, 1, 0], dtype="int64")
+            anchor_ts = np.arange(6, dtype="int64")
+            duty_cycle = np.ones((6,), dtype="float32")
+
+            chunk_path = os.path.join(tmp_dir, "chunk.npz")
+            np.savez_compressed(
+                chunk_path,
+                x=x,
+                y_up=y_up,
+                y_down=y_down,
+                anchor_ts=anchor_ts,
+                duty_cycle=duty_cycle,
+            )
+
+            chunk = SnapshotChunk(
+                start="2024-01-01 00:00:00",
+                end="2024-01-01 01:00:00",
+                file_path=chunk_path,
+                num_samples=int(x.shape[0]),
+                start_index=0,
+            )
+            dataset = SnapshotDataset(
+                snapshot_dir=tmp_dir,
+                manifest={"chunks": []},
+                chunks=[chunk],
+                total_samples=int(x.shape[0]),
+                config_hash="hash",
+            )
+
+            indices = np.asarray([0, 2, 4, 5], dtype="int64")
+            gen, steps = build_training_generator_for_indices(
+                dataset=dataset,
+                indices=indices,
+                batch_size=2,
+                num_classes=2,
+                normalization=None,
+                sample_weight_cfg=None,
+            )
+            self.assertEqual(steps, 2)
+
+            batch0 = next(iter(gen))
+            x0 = batch0[0]
+            y0_up = batch0[1][0]
+            y0_down = batch0[1][1]
+            np.testing.assert_allclose(x0, x[[0, 2]])
+            np.testing.assert_array_equal(y0_up.argmax(axis=1), y_up[[0, 2]])
+            np.testing.assert_array_equal(y0_down.argmax(axis=1), y_down[[0, 2]])
+
+            batch1 = next(iter(gen))
+            x1 = batch1[0]
+            y1_up = batch1[1][0]
+            y1_down = batch1[1][1]
+            np.testing.assert_allclose(x1, x[[4, 5]])
+            np.testing.assert_array_equal(y1_up.argmax(axis=1), y_up[[4, 5]])
+            np.testing.assert_array_equal(y1_down.argmax(axis=1), y_down[[4, 5]])
 
     @given(
         boundaries=st.lists(

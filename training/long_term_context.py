@@ -347,6 +347,59 @@ def get_long_term_input_dim(config: Dict[str, Any]) -> int:
     return lt_config.input_dim
 
 
+def wrap_generator_with_long_term_for_indices(
+    base_generator: Iterator[Tuple[Any, ...]],
+    long_term_features: np.ndarray,
+    indices: np.ndarray,
+) -> Iterator[Tuple[Any, ...]]:
+    """Wrap a training generator to include long-term features for index-selected samples.
+
+    This is analogous to :func:`wrap_generator_with_long_term` but uses an
+    explicit index list instead of a contiguous [start_index, end_index) span.
+    The wrapper assumes the base generator yields batches in the same order as
+    ``indices`` (and restarts from the beginning when it loops).
+    """
+    indices = np.asarray(indices, dtype="int64")
+    if indices.ndim != 1:
+        raise ValueError("indices must be rank 1")
+    if indices.size == 0:
+        raise ValueError("indices must be non-empty")
+
+    cursor = 0
+    total = int(indices.shape[0])
+
+    for batch_data in base_generator:
+        batch_len = int(batch_data[0].shape[0])
+        if batch_len <= 0:
+            raise ValueError("Base generator yielded an empty batch")
+
+        if cursor >= total:
+            cursor = 0
+
+        end = cursor + batch_len
+        if end > total:
+            raise ValueError(
+                "Index-selected long-term wrapper encountered an incomplete tail batch. "
+                f"cursor={cursor}, batch_len={batch_len}, total_indices={total}"
+            )
+
+        batch_indices = indices[cursor:end]
+        lt_batch = long_term_features[batch_indices]
+        if int(lt_batch.shape[0]) != batch_len:
+            raise ValueError("Long-term feature batch size mismatch during index-wrapped training")
+        cursor = end
+
+        x_short = batch_data[0]
+        x_dual = (x_short, lt_batch)
+
+        if len(batch_data) == 2:
+            yield (x_dual, batch_data[1])
+        elif len(batch_data) == 3:
+            yield (x_dual, batch_data[1], batch_data[2])
+        else:
+            yield (x_dual,) + batch_data[1:]
+
+
 def is_long_term_enabled(config: Dict[str, Any]) -> bool:
     """Check if long-term context is enabled in configuration.
 
@@ -370,6 +423,7 @@ __all__ = [
     "load_anchor_timestamps",
     "load_snapshot_series",
     "wrap_generator_with_long_term",
+    "wrap_generator_with_long_term_for_indices",
     "get_long_term_input_dim",
     "is_long_term_enabled",
 ]
