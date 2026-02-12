@@ -128,7 +128,7 @@ targets:  # Defines what future event the model predicts and how labels are cons
 
   price_classes:
     definition_type: "percentage"  # How price-move bins are defined: by percentage, absolute size, or adaptive rules.
-    boundaries: [1.0, 2.0, 5.0]    # Ordered boundaries (in percent) that split price moves into intensity classes.
+    boundaries: [0.1, 0.2, 0.4, 0.6, 1., 2.0]    # Ordered boundaries (in percent) that split price moves into intensity classes.
 
   labeling:
     scheme: "two_head_intensity"   # Label scheme: separate up/down intensity heads with discretised classes.
@@ -176,8 +176,8 @@ preprocessing:  # Controls normalization, feature engineering, and dataset split
     undersampling:
       labeling_criteria: "max_intensity"  # One of: "max_intensity" | "up_intensity" | "down_intensity".
       # Relative class weights; length must equal model.output.num_classes.
-      # Values do not need to sum to 1.0 (e.g. [70, 15, 10, 5]).
-      target_distribution: [70, 15, 10, 5]
+      # Values do not need to sum to 1.0.
+      target_distribution: [70, 15, 7, 4, 2, 1, 1]
       selection_policy: "uniform_time"  # One of: "uniform_time" | "kmeans" | "random".
       min_samples_after_balance: 1000  # Fail fast if undersampling keeps fewer samples.
       min_fraction_after_balance: 0.01  # Fail fast if undersampling keeps a smaller fraction of the train split.
@@ -264,7 +264,7 @@ model:  # Defines the neural network architecture and its compilation settings.
 
   output:
     type: "two_head_intensity"  # Output head configuration: separate up/down intensity classifications.
-    num_classes: 4               # Number of classes per head; should equal len(targets.price_classes.boundaries) + 1.
+    num_classes: 7               # Number of classes per head; should equal len(targets.price_classes.boundaries) + 1.
     activation: "softmax"       # Activation for each classification head.
 
   compilation:

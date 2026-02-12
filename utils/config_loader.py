@@ -218,6 +218,49 @@ def _validate_class_balancing_config(config: Dict[str, Any]) -> None:
             )
 
 
+def _validate_two_head_intensity_num_classes(config: Dict[str, Any]) -> None:
+    """Validate that output.num_classes matches targets.price_classes boundaries.
+
+    This invariant is enforced in multiple runtime components. Validating it at
+    config-load time provides clearer, earlier error messages (especially before
+    launching parallel HPO workers).
+    """
+
+    model_cfg = config.get("model")
+    if not isinstance(model_cfg, dict):
+        return
+    output_cfg = model_cfg.get("output")
+    if not isinstance(output_cfg, dict):
+        return
+
+    output_type = str(output_cfg.get("type") or "")
+    if output_type != "two_head_intensity":
+        return
+
+    try:
+        num_classes = int(output_cfg["num_classes"])
+    except Exception as exc:  # noqa: BLE001
+        raise ConfigError("model.output.num_classes must be an integer") from exc
+
+    targets_cfg = config.get("targets")
+    if not isinstance(targets_cfg, dict):
+        raise ConfigError("targets must be a dict")
+    price_classes_cfg = targets_cfg.get("price_classes")
+    if not isinstance(price_classes_cfg, dict):
+        raise ConfigError("targets.price_classes must be a dict")
+
+    boundaries = price_classes_cfg.get("boundaries")
+    if not isinstance(boundaries, list) or not boundaries:
+        raise ConfigError("targets.price_classes.boundaries must be a non-empty list")
+
+    expected = len(boundaries) + 1
+    if num_classes != expected:
+        raise ConfigError(
+            "model.output.num_classes must equal len(targets.price_classes.boundaries) + 1: "
+            f"num_classes={num_classes}, boundaries_len={len(boundaries)}, expected={expected}"
+        )
+
+
 def _get_nested(config: Dict[str, Any], dotted_key: str) -> Any:
     parts = dotted_key.split(".")
     current: Any = config
@@ -353,6 +396,7 @@ def load_config(
     _validate_config_schema(resolved_config, schema)
 
     _validate_class_balancing_config(resolved_config)
+    _validate_two_head_intensity_num_classes(resolved_config)
 
     # Return a deep copy so callers cannot accidentally mutate internal state
     return copy.deepcopy(resolved_config)

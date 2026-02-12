@@ -531,6 +531,30 @@ def _is_resource_exhaustion_error(exc: Exception) -> bool:
     return any(pattern in message for pattern in patterns)
 
 
+def _is_configuration_error(exc: Exception) -> bool:
+    """Heuristic for config/validation failures vs resource pressure.
+
+    In regime mode we want to distinguish deterministic configuration problems
+    (which cannot be fixed by batch backoff) from OOM/resource errors.
+    """
+
+    try:
+        from utils.config_loader import ConfigError
+
+        if isinstance(exc, ConfigError):
+            return True
+    except Exception:
+        pass
+
+    message = str(exc)
+    if "model.output.num_classes must equal len(targets.price_classes.boundaries) + 1" in message:
+        return True
+    if "For two_head_intensity, model.output.num_classes must equal len(targets.price_classes.boundaries) + 1" in message:
+        return True
+
+    return False
+
+
 def _compute_next_batch_size(current_batch: int, factor: float, min_batch_size: int) -> int:
     candidate = int(math.floor(float(current_batch) * factor))
     if candidate >= current_batch:
@@ -1344,6 +1368,7 @@ def _evaluate_trial_objective(
         except Exception as exc:  # noqa: BLE001
             last_exception = exc
             is_oom = _is_resource_exhaustion_error(exc)
+            is_config_error = _is_configuration_error(exc)
             if regime_enabled and is_oom and bool(regime_settings["safe_envelope_persistence_enabled"]):
                 _update_regime_memory(
                     memory_path,
@@ -1392,6 +1417,11 @@ def _evaluate_trial_objective(
                 trial.set_user_attr("batch_size_effective", int(active_batch_size))
                 trial.set_user_attr("regime_failure_type", type(exc).__name__)
                 trial.set_user_attr("regime_failure_message", str(exc))
+                trial.set_user_attr("regime_failure_is_oom", bool(is_oom))
+                trial.set_user_attr(
+                    "regime_failure_category",
+                    "configuration" if is_config_error else ("resource" if is_oom else "other"),
+                )
                 trial.set_user_attr("resource", resource)
                 if str(regime_settings["failure_policy"]) == "penalize":
                     return _resolve_failure_objective_value(
@@ -1401,8 +1431,16 @@ def _evaluate_trial_objective(
 
                 import optuna  # type: ignore[import]
 
+                if is_oom:
+                    raise optuna.TrialPruned(
+                        f"Resource-constrained trial pruned after {attempt} retries: {exc}"
+                    ) from exc
+                if is_config_error:
+                    raise optuna.TrialPruned(
+                        f"Configuration error: {type(exc).__name__}: {exc}"
+                    ) from exc
                 raise optuna.TrialPruned(
-                    f"Resource-constrained trial pruned after {attempt} retries: {exc}"
+                    f"Trial pruned due to non-resource error: {type(exc).__name__}: {exc}"
                 ) from exc
             raise
         finally:
@@ -2084,13 +2122,55 @@ def run_hyperparameter_search(
                 "Delete the study DB or set parallel.resume_study=false (default)."
             )
         else:
-            detail = (
-                f"All {total_finished} trial(s) ended without a successful completion "
-                f"(pruned={counts['pruned']} failed={counts['failed']}). "
-                "This typically indicates OOM errors exhausting all batch-backoff retries. "
-                "Review the search space and relax constraints. Suggested adjustments:\n"
-                f"{guidance}"
-            )
+            failure_categories: Dict[str, int] = {}
+            failure_messages: List[str] = []
+            for trial in getattr(study, "trials", []) or []:
+                state_obj = getattr(trial, "state", None)
+                state_name = getattr(state_obj, "name", str(state_obj))
+                if state_name not in {"PRUNED", "FAIL"}:
+                    continue
+
+                user_attrs = getattr(trial, "user_attrs", {}) or {}
+                category = str(user_attrs.get("regime_failure_category") or "unknown")
+                failure_categories[category] = int(failure_categories.get(category, 0)) + 1
+
+                msg = user_attrs.get("regime_failure_message")
+                if msg:
+                    failure_messages.append(str(msg))
+
+            # Prefer deterministic config errors over generic resource guidance.
+            config_mismatch_detail = None
+            try:
+                boundaries = config["targets"]["price_classes"]["boundaries"]
+                num_classes = int(config["model"]["output"]["num_classes"])
+                expected = (len(boundaries) + 1) if isinstance(boundaries, list) else None
+                if expected is not None and num_classes != expected:
+                    config_mismatch_detail = (
+                        "Configuration mismatch: model.output.num_classes must equal "
+                        "len(targets.price_classes.boundaries) + 1. "
+                        f"num_classes={num_classes}, boundaries_len={len(boundaries)}, expected={expected}."
+                    )
+            except Exception:  # noqa: BLE001
+                config_mismatch_detail = None
+
+            if int(failure_categories.get("configuration", 0)) >= max(1, total_finished):
+                example = failure_messages[0] if failure_messages else "(no message)"
+                detail = (
+                    f"All {total_finished} trial(s) failed due to configuration errors "
+                    f"(pruned={counts['pruned']} failed={counts['failed']}). "
+                    f"Example: {example}"
+                )
+                if config_mismatch_detail is not None:
+                    detail = detail + " " + config_mismatch_detail
+            else:
+                detail = (
+                    f"All {total_finished} trial(s) ended without a successful completion "
+                    f"(pruned={counts['pruned']} failed={counts['failed']}). "
+                    f"Failure categories={failure_categories}. "
+                    "This typically indicates OOM errors exhausting all batch-backoff retries. "
+                    "Review the search space and relax constraints. Suggested adjustments:\n"
+                    f"{guidance}"
+                )
         raise ConfigError(
             "Hyperparameter optimization completed with no successful trials. "
             f"completed={counts['completed']} pruned={counts['pruned']} failed={counts['failed']}. "

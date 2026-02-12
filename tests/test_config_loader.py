@@ -146,6 +146,32 @@ preprocessing:
                         schema_path="config/validation_schema.yaml",
                     )
 
+    def test_two_head_intensity_num_classes_mismatch_raises(self) -> None:
+        base_config_path = os.path.abspath("config/training_config.yaml")
+        override_yaml = f"""
+base_config: "{base_config_path}"
+targets:
+  price_classes:
+    boundaries: [0.1, 0.2, 0.4, 0.6]
+"""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            override_path = Path(tmpdir) / "override_bad_num_classes.yaml"
+            override_path.write_text(override_yaml, encoding="utf-8")
+
+            env = {
+                "DATABASE_URI": "http://example-db",
+                "DATABASE_URI_HIST": "http://example-db-hist",
+                "DATABASE_URI_LIVE": "http://example-db-live",
+                "MLFLOW_TRACKING_URI": "http://mlflow",
+            }
+            with mock.patch.dict(os.environ, env, clear=False):
+                with self.assertRaises(ConfigError):
+                    load_config(
+                        config_path=str(override_path),
+                        schema_path="config/validation_schema.yaml",
+                    )
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
