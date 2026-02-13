@@ -17,6 +17,7 @@ from training.snapshot_dataset import (
     CHUNK_STORAGE_NPY_SHARDS_V1,
     SnapshotChunk,
     SnapshotDataset,
+    _open_chunk_sample_reader,
     get_chunk_x_shape,
     iter_snapshot_batches,
     load_chunk_anchor_timestamps,
@@ -156,6 +157,63 @@ class TestSnapshotChunkStorage(unittest.TestCase):
             outputs = list(iter_snapshot_batches(dataset, 0, 2))
             self.assertEqual(len(outputs), 1)
             x, y_up, y_down, anchor_ts, duty = outputs[0]
+
+            np.testing.assert_array_equal(x, expected_x)
+            np.testing.assert_array_equal(y_up, expected_y_up)
+            np.testing.assert_array_equal(y_down, expected_y_down)
+            np.testing.assert_array_equal(anchor_ts, expected_anchor_ts)
+            np.testing.assert_array_equal(duty, expected_duty)
+
+    def test_frame_store_sample_reader_matches_materialized_batches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            files, expected_x, expected_y_up, expected_y_down, expected_anchor_ts, expected_duty = _write_chunk_frame_store(
+                tmp_dir,
+                os.path.join("chunks", "chunk-frame"),
+            )
+
+            manifest_path = os.path.join(tmp_dir, "manifest.json")
+            with open(manifest_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "config_hash": "hash-frame",
+                        "chunks": [
+                            {
+                                "start": "2024-01-01 00:00:00",
+                                "end": "2024-01-01 01:00:00",
+                                "format": CHUNK_STORAGE_FRAME_STORE_V1,
+                                "file": files["frames_base"],
+                                "files": files,
+                                "num_samples": 2,
+                                "window_steps": 3,
+                                "include_mask_channel": True,
+                                "num_assets": 1,
+                                "aux_dim": 2,
+                                "x_shape": [2, 3, 1, 1, 4],
+                            }
+                        ],
+                    },
+                    handle,
+                )
+
+            context = SnapshotContext(
+                snapshot_dir=tmp_dir,
+                manifest_path=manifest_path,
+                config_hash="hash-frame",
+                config_snapshot={},
+                snapshot_name="test",
+                root_name="test",
+            )
+            dataset = load_snapshot_dataset(context, config={})
+            chunk = dataset.chunks[0]
+
+            reader = _open_chunk_sample_reader(chunk)
+            try:
+                x, y_up, y_down, anchor_ts, duty = reader.get_samples(np.array([0, 1], dtype="int64"))
+            finally:
+                try:
+                    reader.close()
+                except Exception:
+                    pass
 
             np.testing.assert_array_equal(x, expected_x)
             np.testing.assert_array_equal(y_up, expected_y_up)

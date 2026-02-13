@@ -23,7 +23,12 @@ from preprocessing.snapshot_sequence_builder import (
 )
 from preprocessing.normalizer import create_normalizer_from_config
 from preprocessing.feature_engineering import FeatureEngineer
-from mlflow_integration.model_registry import register_model
+from preprocessing.train_test_split import compute_split_boundaries
+from mlflow_integration.safe_fluent import (
+    get_mlflow_if_active,
+    log_keras_model_and_register_if_enabled,
+    log_keras_model_to_active_run,
+)
 from .snapshot_dataset import (
     NormalizationStats,
     build_training_generator,
@@ -115,24 +120,6 @@ def _create_first_batch_probe_callback(config: Dict[str, Any]) -> Optional[Any]:
     return _FirstBatchProbeCallback(probe)
 
 
-def _compute_split_boundaries(
-    n_samples: int,
-    train_ratio: float,
-    validation_ratio: float,
-    test_ratio: float,
-) -> Tuple[int, int, int]:
-    ratio_sum = train_ratio + validation_ratio + test_ratio
-    if abs(ratio_sum - 1.0) > 1e-6:
-        raise ValueError("train_ratio + validation_ratio + test_ratio must equal 1.0")
-
-    train_end = int(n_samples * train_ratio)
-    val_end = train_end + int(n_samples * validation_ratio)
-    if val_end > n_samples:
-        val_end = n_samples
-    test_end = n_samples
-    return train_end, val_end, test_end
-
-
 def _resolve_snapshot_training_indices(
     config: Dict[str, Any],
     n_samples: int,
@@ -150,7 +137,7 @@ def _resolve_snapshot_training_indices(
             "training.validation_split must match preprocessing.train_test_split.validation_ratio",
         )
 
-    train_end, val_end, _ = _compute_split_boundaries(
+    train_end, val_end, _ = compute_split_boundaries(
         n_samples,
         train_ratio,
         validation_ratio,
@@ -379,6 +366,7 @@ def _get_normalization_stats(
             dataset,
             start_index,
             end_index,
+            int(config["training"]["batch_size"]),
             method,
             mask_start=mask_start,
             mask_count=mask_count,
@@ -965,11 +953,8 @@ def _fit_snapshot_model_once(
         metric_name = str(config["hyperparameter_optimization"]["metric"])
         hpo_metric_weight = _resolve_hpo_metric_weight(metric_name, effective_train_used_n, val_count)
 
-    try:
-        import mlflow  # type: ignore[import]
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to import MLFlow for training history logging: %s", exc)
-    else:
+    mlflow = get_mlflow_if_active()
+    if mlflow is not None:
         if hasattr(history, "history") and isinstance(history.history, dict):
             for metric_name, values in history.history.items():
                 try:
@@ -977,7 +962,15 @@ def _fit_snapshot_model_once(
                 except TypeError:
                     continue
                 for step, value in enumerate(series):
-                    mlflow.log_metric(metric_name, float(value), step=epoch_step_offset + step)
+                    try:
+                        mlflow.log_metric(metric_name, float(value), step=epoch_step_offset + step)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "Failed to log MLFlow metric %s at step %s: %s",
+                            metric_name,
+                            epoch_step_offset + step,
+                            exc,
+                        )
 
     return model, epochs, hpo_metric_value, hpo_metric_weight
 
@@ -1142,11 +1135,8 @@ def _run_snapshot_training_pipeline_sequential(
     mlflow_cfg = config["mlflow"]
     artifact_logging_cfg = mlflow_cfg["artifact_logging"]
     if bool(artifact_logging_cfg["trained_model"]):
-        try:
-            import mlflow  # type: ignore[import]
-            mlflow_tf = __import__("mlflow.tensorflow", fromlist=["log_model"])
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to import MLFlow TensorFlow integration for sequential model logging: %s", exc)
+        if get_mlflow_if_active() is None:
+            logger.debug("Skipping sequential MLFlow model logging: no active run.")
         else:
             signature = None
             try:
@@ -1161,9 +1151,7 @@ def _run_snapshot_training_pipeline_sequential(
                     inp_shape = model.input_shape
                     _safe = lambda s: tuple(1 if d is None else d for d in s)
                     if isinstance(inp_shape, list):
-                        x_sample = [
-                            np.zeros(_safe(s), dtype=np.float32) for s in inp_shape
-                        ]
+                        x_sample = [np.zeros(_safe(s), dtype=np.float32) for s in inp_shape]
                     else:
                         x_sample = np.zeros(_safe(inp_shape), dtype=np.float32)
                     y_pred = model.predict(x_sample, verbose=0)
@@ -1175,13 +1163,7 @@ def _run_snapshot_training_pipeline_sequential(
                     )
 
             logger.info("Logging sequentially trained model to MLFlow using mlflow.tensorflow.log_model.")
-            try:
-                if signature is not None:
-                    mlflow_tf.log_model(model, "model", signature=signature)
-                else:
-                    mlflow_tf.log_model(model, "model")
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to log sequentially trained model to MLFlow: %s", exc)
+            log_keras_model_to_active_run(model, artifact_path="model", signature=signature)
 
     logger.info(
         "Sequential snapshot training completed: processed_windows=%s, total_epoch_steps_logged=%s",
@@ -1382,12 +1364,9 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
             {c: round(w, 4) for c, w in sorted(class_weights_down.items())},
         )
 
-        # Log class weights to MLFlow if available
-        try:
-            import mlflow  # type: ignore[import]
-        except Exception:  # noqa: BLE001
-            pass
-        else:
+        # Log class weights to MLFlow when a run is active.
+        mlflow = get_mlflow_if_active()
+        if mlflow is not None:
             try:
                 for c, w in class_weights_up.items():
                     mlflow.log_metric(f"class_weight_up_{c}", float(w))
@@ -1490,12 +1469,9 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
                 "Enable model.long_term and rebuild the snapshot dataset."
             )
 
-    # Log model complexity metrics to MLFlow if available.
-    try:
-        import mlflow  # type: ignore[import]
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to import MLFlow for model complexity logging: %s", exc)
-    else:
+    # Log model complexity metrics to MLFlow when a run is active.
+    mlflow = get_mlflow_if_active()
+    if mlflow is not None:
         try:
             total_params = int(model.count_params())
             trainable_params = int(
@@ -1720,11 +1696,8 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
         final_loss,
     )
 
-    try:
-        import mlflow  # type: ignore[import]
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to import MLFlow for snapshot training metrics: %s", exc)
-    else:
+    mlflow = get_mlflow_if_active()
+    if mlflow is not None:
         if hasattr(history, "history") and isinstance(history.history, dict):
             for metric_name, values in history.history.items():
                 try:
@@ -1754,14 +1727,8 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
     log_trained_model = bool(artifact_logging_cfg["trained_model"])
 
     if log_trained_model:
-        try:
-            import mlflow  # type: ignore[import]
-            mlflow_tf = __import__("mlflow.tensorflow", fromlist=["log_model"])
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "Failed to import MLFlow TensorFlow integration for model logging: %s",
-                exc,
-            )
+        if get_mlflow_if_active() is None:
+            logger.debug("Skipping MLFlow model logging: no active run.")
         else:
             signature = None
             try:
@@ -1773,49 +1740,40 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
                 )
             else:
                 try:
-                    sample_n = effective_train_n
-                    if sample_n > batch_size:
-                        sample_n = batch_size
-                    sample_gen, _ = build_training_generator(
-                        dataset=snapshot_dataset,
-                        start_index=0,
-                        end_index=sample_n,
-                        batch_size=sample_n,
-                        num_classes=int(output_cfg["num_classes"]),
-                        normalization=train_stats,
-                        sample_weight_cfg=None,
-                        mask_start=mask_start,
-                        mask_count=mask_count,
-                    )
-                    if long_term_features is not None:
-                        sample_gen = wrap_generator_with_long_term(
-                            sample_gen,
-                            long_term_features,
+                    max_signature_samples = 8
+                    sample_n = int(min(int(effective_train_n), int(max_signature_samples)))
+                    if sample_n > 0:
+                        sample_gen, _ = build_training_generator(
+                            dataset=snapshot_dataset,
                             start_index=0,
                             end_index=sample_n,
+                            batch_size=sample_n,
+                            num_classes=int(output_cfg["num_classes"]),
+                            normalization=train_stats,
+                            sample_weight_cfg=None,
+                            mask_start=mask_start,
+                            mask_count=mask_count,
                         )
-                    batch = next(iter(sample_gen))
-                    x_sample = batch[0]
-                    y_sample = batch[1]
-                    signature = infer_signature(x_sample, model.predict(x_sample))
+                        if long_term_features is not None:
+                            sample_gen = wrap_generator_with_long_term(
+                                sample_gen,
+                                long_term_features,
+                                start_index=0,
+                                end_index=sample_n,
+                            )
+                        batch = next(iter(sample_gen))
+                        x_sample = batch[0]
+                        y_pred = model.predict(x_sample, verbose=0)
+                        signature = infer_signature(x_sample, y_pred)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "Failed to infer MLFlow model signature from snapshot training data: %s",
                         exc,
                     )
 
-            logger.info("Logging trained model to MLFlow using mlflow.tensorflow.log_model.")
-            try:
-                if signature is not None:
-                    mlflow_tf.log_model(model, "model", signature=signature)
-                else:
-                    mlflow_tf.log_model(model, "model")
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to log trained model to MLFlow: %s", exc)
-
             model_registry_cfg = mlflow_cfg["model_registry"]
             register_enabled = bool(model_registry_cfg["register_model"])
-
+            model_name = ""
             if register_enabled:
                 try:
                     model_name_pattern = model_registry_cfg["model_name_pattern"]
@@ -1824,31 +1782,36 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
                         "MLFlow model registry is enabled but mlflow.model_registry.model_name_pattern is missing or invalid: %s",
                         exc,
                     )
+                    register_enabled = False
                 else:
                     try:
                         data_cfg = config["data"]
                         asset_pairs_cfg = data_cfg["asset_pairs"]
                         target_asset = str(asset_pairs_cfg["target_asset"])
                         architecture_name = str(model_cfg["architecture"])
-
-                        model_name = model_name_pattern.format(
-                            asset=target_asset,
-                            model=architecture_name,
-                        )
-
-                        try:
-                            register_model(model, model_name)
-                        except Exception as exc:  # noqa: BLE001
-                            logger.warning(
-                                "Failed to register model '%s' in MLFlow model registry: %s",
-                                model_name,
-                                exc,
-                            )
+                        model_name = model_name_pattern.format(asset=target_asset, model=architecture_name)
                     except Exception as exc:  # noqa: BLE001
                         logger.warning(
                             "Failed to prepare model name for MLFlow model registry: %s",
                             exc,
                         )
+                        register_enabled = False
+
+            logger.info("Logging trained model to MLFlow using mlflow.tensorflow.log_model.")
+            if register_enabled:
+                log_keras_model_and_register_if_enabled(
+                    model,
+                    model_name=model_name,
+                    register_enabled=True,
+                    artifact_path="model",
+                    signature=signature,
+                )
+            else:
+                log_keras_model_to_active_run(
+                    model,
+                    artifact_path="model",
+                    signature=signature,
+                )
 
     return model
 

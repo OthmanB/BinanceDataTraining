@@ -11,8 +11,9 @@ import tempfile
 import numpy as np
 
 from observability.run_state import get_run_state_writer
+from preprocessing.train_test_split import compute_split_boundaries
 from training.long_term_context import load_anchor_timestamps, load_snapshot_series
-from training.snapshot_dataset import iter_snapshot_batches, prepare_snapshot_dataset
+from training.snapshot_dataset import _open_chunk_sample_reader, prepare_snapshot_dataset
 
 
 logger = logging.getLogger(__name__)
@@ -81,15 +82,6 @@ def _resolve_diagnostics_artifact_path(scope_label: Optional[str]) -> str:
     if not normalized_scope:
         normalized_scope = "scope"
     return f"{base_path}/{normalized_scope}"
-
-
-def _compute_split_boundaries(n_samples: int, train_ratio: float, validation_ratio: float, test_ratio: float) -> Tuple[int, int, int]:
-    ratio_sum = train_ratio + validation_ratio + test_ratio
-    if abs(ratio_sum - 1.0) > 1e-6:
-        raise ValueError("preprocessing.train_test_split ratios must sum to 1.0")
-    train_end = int(n_samples * train_ratio)
-    val_end = train_end + int(n_samples * validation_ratio)
-    return train_end, min(val_end, n_samples), n_samples
 
 
 def _sample_indices(base_indices: np.ndarray, method: str, num_samples: int, seed: int) -> np.ndarray:
@@ -234,7 +226,7 @@ def run_snapshot_diagnostics_for_dataset(
     )
 
     split_cfg = config["preprocessing"]["train_test_split"]
-    train_end, _, _ = _compute_split_boundaries(
+    train_end, _, _ = compute_split_boundaries(
         n_samples,
         float(split_cfg["train_ratio"]),
         float(split_cfg["validation_ratio"]),
@@ -262,24 +254,82 @@ def run_snapshot_diagnostics_for_dataset(
     bid_qty_sampled: List[float] = []
     ask_qty_sampled: List[float] = []
 
-    sampled_set = set(int(i) for i in sampled_indices.tolist())
     warned_bad_feature = False
-    cursor = 0
-    for x_chunk, y_up_chunk, y_down_chunk, _, duty_cycle_chunk in iter_snapshot_batches(snapshot_dataset, 0, train_end):
-        chunk_len = int(y_up_chunk.shape[0])
-        for i in range(chunk_len):
-            y_up = int(y_up_chunk[i])
-            y_down = int(y_down_chunk[i])
-            label_up_counts[y_up] = int(label_up_counts.get(y_up, 0)) + 1
-            label_down_counts[y_down] = int(label_down_counts.get(y_down, 0)) + 1
-            global_idx = cursor + i
-            if global_idx in sampled_set:
-                duty_cycle_sampled.append(float(duty_cycle_chunk[i]))
+
+    # Count labels for the full train split without reconstructing x.
+    chunks = getattr(snapshot_dataset, "chunks", []) or []
+    for chunk in chunks:
+        chunk_start = int(getattr(chunk, "start_index", 0))
+        chunk_end = chunk_start + int(getattr(chunk, "num_samples", 0))
+        if train_end <= chunk_start:
+            break
+        if chunk_end <= 0:
+            continue
+
+        local_start = max(0, 0 - chunk_start)
+        local_end = min(int(getattr(chunk, "num_samples", 0)), int(train_end - chunk_start))
+        if local_end <= local_start:
+            continue
+
+        array_paths = getattr(chunk, "array_paths", None)
+        if isinstance(array_paths, dict) and array_paths:
+            y_up_all = np.load(array_paths["y_up"], mmap_mode="r")
+            y_down_all = np.load(array_paths["y_down"], mmap_mode="r")
+            y_up = np.asarray(y_up_all[local_start:local_end], dtype="int64")
+            y_down = np.asarray(y_down_all[local_start:local_end], dtype="int64")
+        else:
+            with np.load(str(getattr(chunk, "file_path"))) as npz:
+                y_up = np.asarray(npz["y_up"][local_start:local_end], dtype="int64")
+                y_down = np.asarray(npz["y_down"][local_start:local_end], dtype="int64")
+
+        up_vals, up_counts = np.unique(y_up, return_counts=True)
+        down_vals, down_counts = np.unique(y_down, return_counts=True)
+        for v, c in zip(up_vals.tolist(), up_counts.tolist()):
+            key = int(v)
+            label_up_counts[key] = int(label_up_counts.get(key, 0)) + int(c)
+        for v, c in zip(down_vals.tolist(), down_counts.tolist()):
+            key = int(v)
+            label_down_counts[key] = int(label_down_counts.get(key, 0)) + int(c)
+
+    # Fetch only sampled windows (x, duty_cycle) for spread / duty-cycle stats.
+    indices = np.asarray(sampled_indices, dtype="int64")
+    if indices.ndim != 1:
+        raise ValueError("diagnostics sampling produced non-1D indices")
+
+    pos = 0
+    total = int(indices.shape[0])
+    for chunk in chunks:
+        if pos >= total:
+            break
+        chunk_start = int(getattr(chunk, "start_index", 0))
+        chunk_end = chunk_start + int(getattr(chunk, "num_samples", 0))
+
+        if int(indices[pos]) < chunk_start:
+            raise ValueError("Sampled indices are not aligned with snapshot chunk boundaries")
+        if int(indices[pos]) >= chunk_end:
+            continue
+
+        end = pos
+        while end < total and int(indices[end]) < chunk_end:
+            end += 1
+        if end <= pos:
+            continue
+
+        local_indices = np.asarray(indices[pos:end] - chunk_start, dtype="int64")
+        pos = end
+
+        reader = _open_chunk_sample_reader(chunk)
+        try:
+            for local_idx in local_indices:
+                x_one, _, _, _, duty_one = reader.get_samples(np.asarray([int(local_idx)], dtype="int64"))
+                if duty_one.size > 0:
+                    duty_cycle_sampled.append(float(duty_one.reshape(-1)[0]))
+
+                extracted = None
                 try:
-                    features = np.asarray(x_chunk[i])
+                    features = np.asarray(x_one.reshape(x_one.shape[1:]))
                     extracted = _extract_top_of_book(features)
                 except Exception as exc:  # noqa: BLE001
-                    extracted = None
                     if not warned_bad_feature:
                         logger.warning("Snapshot diagnostics failed to parse sample features: %s", exc)
                         warned_bad_feature = True
@@ -295,7 +345,14 @@ def run_snapshot_diagnostics_for_dataset(
                         mid_price_sampled.append(mid_price)
                         if mid_price > 0.0:
                             spread_pct_sampled.append((ask_price - bid_price) / mid_price * 100.0)
-        cursor += chunk_len
+        finally:
+            try:
+                reader.close()
+            except Exception:
+                pass
+
+    if pos < total:
+        raise ValueError("Sampled indices exceed snapshot dataset bounds")
 
     if duty_cycle_sampled:
         duty_arr = np.asarray(duty_cycle_sampled, dtype="float64")

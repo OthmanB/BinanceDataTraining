@@ -99,16 +99,40 @@ class TestSnapshotDiagnostics(unittest.TestCase):
         }
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            dataset = _FakeSnapshotDataset(tmp_dir)
+            import os
 
-            def _iter_batches(_dataset: _FakeSnapshotDataset, _start: int, _end: int):
-                yield (
-                    np.zeros((2, 1, 1, 1, 1), dtype=np.float32),
-                    np.asarray([0, 1], dtype=np.int64),
-                    np.asarray([1, 0], dtype=np.int64),
-                    np.asarray([0, 10], dtype=np.int64),
-                    np.asarray([1.0, 0.5], dtype=np.float32),
-                )
+            from training.snapshot_dataset import SnapshotChunk, SnapshotDataset
+
+            x = np.zeros((4, 1, 1, 1, 1), dtype=np.float32)
+            y_up = np.asarray([0, 1, 0, 1], dtype=np.int64)
+            y_down = np.asarray([1, 0, 1, 0], dtype=np.int64)
+            anchor_ts = np.asarray([0, 10, 20, 30], dtype=np.int64)
+            duty_cycle = np.asarray([1.0, 0.5, 1.0, 0.5], dtype=np.float32)
+
+            chunk_path = os.path.join(tmp_dir, "chunk.npz")
+            np.savez_compressed(
+                chunk_path,
+                x=x,
+                y_up=y_up,
+                y_down=y_down,
+                anchor_ts=anchor_ts,
+                duty_cycle=duty_cycle,
+            )
+
+            chunk = SnapshotChunk(
+                start="2024-01-01 00:00:00",
+                end="2024-01-01 01:00:00",
+                file_path=chunk_path,
+                num_samples=4,
+                start_index=0,
+            )
+            dataset = SnapshotDataset(
+                snapshot_dir=tmp_dir,
+                manifest={"chunks": []},
+                chunks=[chunk],
+                total_samples=4,
+                config_hash="hash",
+            )
 
             def _fake_load_snapshot_series(_dataset: _FakeSnapshotDataset):
                 return (
@@ -118,12 +142,9 @@ class TestSnapshotDiagnostics(unittest.TestCase):
                 )
 
             def _fake_load_anchor_timestamps(_dataset: _FakeSnapshotDataset):
-                return np.asarray([0, 10, 20, 30], dtype=np.int64)
+                return anchor_ts
 
             with mock.patch("diagnostics.snapshot_diagnostics.prepare_snapshot_dataset", return_value=dataset), mock.patch(
-                "diagnostics.snapshot_diagnostics.iter_snapshot_batches",
-                side_effect=_iter_batches,
-            ), mock.patch(
                 "diagnostics.snapshot_diagnostics.load_anchor_timestamps",
                 side_effect=_fake_load_anchor_timestamps,
             ), mock.patch(

@@ -484,7 +484,7 @@ def main() -> int:
     finally:
         if mlflow_run is not None:
             try:
-                end_run()
+                end_run(expected_run_id=str(mlflow_run.info.run_id))
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to end MLFlow run cleanly: %s", exc)
 

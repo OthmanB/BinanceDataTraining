@@ -515,6 +515,7 @@ class TestSnapshotAlignmentBehavior(unittest.TestCase):
                 dataset,
                 0,
                 4,
+                batch_size=2,
                 method="min_max",
                 mask_start=mask_start,
                 mask_count=mask_count,

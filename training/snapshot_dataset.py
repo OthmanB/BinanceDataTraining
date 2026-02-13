@@ -782,6 +782,92 @@ def _slice_chunk_arrays(
     return x, y_up, y_down, anchor_ts, duty_cycle
 
 
+def _materialize_frame_store_v1_x(
+    *,
+    frames_base: np.ndarray,
+    frames_confidence: np.ndarray,
+    frames_observed: np.ndarray,
+    frames_ts: np.ndarray,
+    window_steps: int,
+    anchor_local_idx: np.ndarray,
+    aux: np.ndarray,
+    include_mask_channel: bool,
+    num_assets: Optional[int],
+    validate_shapes: bool = True,
+) -> np.ndarray:
+    if window_steps <= 0:
+        raise ConfigError("Snapshot chunk window_steps must be present for frame_store_v1 format")
+
+    anchor_local_idx = np.asarray(anchor_local_idx, dtype="int64")
+    aux = np.asarray(aux, dtype="float32")
+
+    if aux.ndim == 1:
+        aux = aux.reshape(aux.shape[0], 1)
+    if aux.ndim != 2:
+        raise ConfigError("Snapshot frame_store_v1 aux array must be rank 2")
+
+    if validate_shapes:
+        if frames_base.ndim != 4:
+            raise ConfigError("Snapshot frame_store_v1 frames_base array must be rank 4")
+
+        if frames_confidence.ndim != 2 or frames_observed.ndim != 2:
+            raise ConfigError("Snapshot frame_store_v1 confidence/observed arrays must be rank 2")
+
+        if frames_ts.ndim != 1:
+            raise ConfigError("Snapshot frame_store_v1 frames_ts array must be rank 1")
+
+        n_frames = int(frames_base.shape[0])
+        if (
+            n_frames != int(frames_confidence.shape[0])
+            or n_frames != int(frames_observed.shape[0])
+            or n_frames != int(frames_ts.shape[0])
+        ):
+            raise ConfigError("Snapshot frame_store_v1 frame arrays have inconsistent first dimension")
+    else:
+        n_frames = int(frames_base.shape[0])
+
+    sample_count = int(anchor_local_idx.shape[0])
+    starts = anchor_local_idx - (window_steps - 1)
+    if sample_count > 0:
+        if int(starts.min()) < 0:
+            raise ConfigError("Snapshot frame_store_v1 has invalid anchor index below window start")
+        if int(anchor_local_idx.max()) >= n_frames:
+            raise ConfigError("Snapshot frame_store_v1 has invalid anchor index beyond frame count")
+
+    h_dim = int(frames_base.shape[1])
+    w_dim = int(frames_base.shape[2])
+    base_channels = int(frames_base.shape[3])
+
+    x_base = np.empty((sample_count, window_steps, h_dim, w_dim, base_channels), dtype="float32")
+    for idx, start_idx in enumerate(starts):
+        end_idx = int(start_idx) + window_steps
+        x_base[idx] = np.asarray(frames_base[int(start_idx):end_idx], dtype="float32")
+
+    x_out = x_base
+
+    if include_mask_channel:
+        resolved_assets = int(num_assets) if num_assets is not None else int(frames_confidence.shape[1])
+        if int(frames_confidence.shape[1]) != resolved_assets:
+            raise ConfigError("Snapshot frame_store_v1 confidence width does not match num_assets")
+
+        mask = np.empty((sample_count, window_steps, h_dim, w_dim, resolved_assets), dtype="float32")
+        for idx, start_idx in enumerate(starts):
+            end_idx = int(start_idx) + window_steps
+            conf_window = np.asarray(frames_confidence[int(start_idx):end_idx], dtype="float32")
+            mask[idx] = conf_window[:, None, None, :]
+        x_out = np.concatenate([x_out, mask], axis=-1)
+
+    aux_dim = int(aux.shape[1])
+    if aux_dim > 0:
+        aux_view = np.broadcast_to(
+            aux[:, None, None, None, :],
+            (sample_count, window_steps, h_dim, w_dim, aux_dim),
+        )
+        x_out = np.concatenate([x_out, np.asarray(aux_view, dtype="float32")], axis=-1)
+
+    return x_out
+
+
 def _slice_chunk_arrays_frame_store(
     chunk: SnapshotChunk,
     local_start: int,
@@ -817,70 +903,20 @@ def _slice_chunk_arrays_frame_store(
         np.load(chunk.array_paths["duty_cycle"], mmap_mode="r")[local_start:local_end],
         dtype="float32",
     )
-    aux = np.asarray(np.load(chunk.array_paths["aux"], mmap_mode="r")[local_start:local_end], dtype="float32")
+    aux = np.load(chunk.array_paths["aux"], mmap_mode="r")[local_start:local_end]
 
-    if aux.ndim == 1:
-        aux = aux.reshape(aux.shape[0], 1)
-    if aux.ndim != 2:
-        raise ConfigError("Snapshot frame_store_v1 aux array must be rank 2")
-
-    if frames_base.ndim != 4:
-        raise ConfigError("Snapshot frame_store_v1 frames_base array must be rank 4")
-
-    if frames_confidence.ndim != 2 or frames_observed.ndim != 2:
-        raise ConfigError("Snapshot frame_store_v1 confidence/observed arrays must be rank 2")
-
-    if frames_ts.ndim != 1:
-        raise ConfigError("Snapshot frame_store_v1 frames_ts array must be rank 1")
-
-    n_frames = int(frames_base.shape[0])
-    if n_frames != int(frames_confidence.shape[0]) or n_frames != int(frames_observed.shape[0]) or n_frames != int(
-        frames_ts.shape[0]
-    ):
-        raise ConfigError("Snapshot frame_store_v1 frame arrays have inconsistent first dimension")
-
-    sample_count = int(anchor_local_idx.shape[0])
-    h_dim = int(frames_base.shape[1])
-    w_dim = int(frames_base.shape[2])
-    base_channels = int(frames_base.shape[3])
-
-    starts = anchor_local_idx - (window_steps - 1)
-    if sample_count > 0:
-        if int(starts.min()) < 0:
-            raise ConfigError("Snapshot frame_store_v1 has invalid anchor index below window start")
-        if int(anchor_local_idx.max()) >= n_frames:
-            raise ConfigError("Snapshot frame_store_v1 has invalid anchor index beyond frame count")
-
-    x_base = np.empty((sample_count, window_steps, h_dim, w_dim, base_channels), dtype="float32")
-    for idx, start_idx in enumerate(starts):
-        end_idx = int(start_idx) + window_steps
-        x_base[idx] = np.asarray(frames_base[int(start_idx):end_idx], dtype="float32")
-
-    x_out = x_base
-
-    if chunk.include_mask_channel:
-        if chunk.num_assets is not None:
-            num_assets = int(chunk.num_assets)
-        else:
-            num_assets = int(frames_confidence.shape[1])
-
-        if int(frames_confidence.shape[1]) != num_assets:
-            raise ConfigError("Snapshot frame_store_v1 confidence width does not match num_assets")
-
-        mask = np.empty((sample_count, window_steps, h_dim, w_dim, num_assets), dtype="float32")
-        for idx, start_idx in enumerate(starts):
-            end_idx = int(start_idx) + window_steps
-            conf_window = np.asarray(frames_confidence[int(start_idx):end_idx], dtype="float32")
-            mask[idx] = conf_window[:, None, None, :]
-        x_out = np.concatenate([x_out, mask], axis=-1)
-
-    aux_dim = int(aux.shape[1])
-    if aux_dim > 0:
-        aux_view = np.broadcast_to(
-            aux[:, None, None, None, :],
-            (sample_count, window_steps, h_dim, w_dim, aux_dim),
-        )
-        x_out = np.concatenate([x_out, np.asarray(aux_view, dtype="float32")], axis=-1)
+    x_out = _materialize_frame_store_v1_x(
+        frames_base=frames_base,
+        frames_confidence=frames_confidence,
+        frames_observed=frames_observed,
+        frames_ts=frames_ts,
+        window_steps=window_steps,
+        anchor_local_idx=anchor_local_idx,
+        aux=aux,
+        include_mask_channel=bool(chunk.include_mask_channel),
+        num_assets=chunk.num_assets,
+        validate_shapes=True,
+    )
 
     return x_out, y_up, y_down, anchor_ts, duty_cycle
 
@@ -1007,6 +1043,8 @@ def iter_snapshot_minibatches(
     start_index: int,
     end_index: int,
     batch_size: int,
+    *,
+    drop_remainder: bool = True,
 ) -> Iterator[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
     """Iterate fixed-size mini-batches directly from snapshot chunks.
 
@@ -1016,8 +1054,9 @@ def iter_snapshot_minibatches(
 
     Notes
     -----
-    Incomplete tail batches are dropped per chunk to preserve fixed batch
-    shapes, matching the historical ``build_training_generator`` behaviour.
+    Incomplete tail batches are dropped per chunk when ``drop_remainder`` is
+    true to preserve fixed batch shapes, matching the historical
+    ``build_training_generator`` behaviour.
     """
     if batch_size <= 0:
         raise ValueError("training.batch_size must be positive")
@@ -1026,7 +1065,11 @@ def iter_snapshot_minibatches(
         for batch_local_start in range(local_start, local_end, batch_size):
             batch_local_end = batch_local_start + batch_size
             if batch_local_end > local_end:
-                break
+                if drop_remainder:
+                    break
+                batch_local_end = local_end
+                if batch_local_end <= batch_local_start:
+                    break
 
             x, y_up, y_down, anchor_ts, duty_cycle = _slice_chunk_arrays(
                 chunk,
@@ -1315,58 +1358,20 @@ class _FrameStoreV1SampleReader(_ChunkSampleReader):
         y_down = np.asarray(self._y_down[local_indices], dtype="int64")
         anchor_ts = np.asarray(self._anchor_ts[local_indices], dtype="int64")
         duty_cycle = np.asarray(self._duty_cycle[local_indices], dtype="float32")
-        aux = np.asarray(self._aux[local_indices], dtype="float32")
+        aux = self._aux[local_indices]
 
-        if aux.ndim == 1:
-            aux = aux.reshape(aux.shape[0], 1)
-        if aux.ndim != 2:
-            raise ConfigError("Snapshot frame_store_v1 aux array must be rank 2")
-
-        window_steps = int(self._window_steps)
-        starts = anchor_local_idx - (window_steps - 1)
-        sample_count = int(anchor_local_idx.shape[0])
-
-        n_frames = int(self._frames_base.shape[0])
-        if sample_count > 0:
-            if int(starts.min()) < 0:
-                raise ConfigError("Snapshot frame_store_v1 has invalid anchor index below window start")
-            if int(anchor_local_idx.max()) >= n_frames:
-                raise ConfigError("Snapshot frame_store_v1 has invalid anchor index beyond frame count")
-
-        h_dim = int(self._frames_base.shape[1])
-        w_dim = int(self._frames_base.shape[2])
-        base_channels = int(self._frames_base.shape[3])
-
-        x_base = np.empty((sample_count, window_steps, h_dim, w_dim, base_channels), dtype="float32")
-        for idx, start_idx in enumerate(starts):
-            end_idx = int(start_idx) + window_steps
-            x_base[idx] = np.asarray(self._frames_base[int(start_idx):end_idx], dtype="float32")
-
-        x_out = x_base
-
-        if bool(self.chunk.include_mask_channel):
-            if self.chunk.num_assets is not None:
-                num_assets = int(self.chunk.num_assets)
-            else:
-                num_assets = int(self._frames_confidence.shape[1])
-
-            if int(self._frames_confidence.shape[1]) != num_assets:
-                raise ConfigError("Snapshot frame_store_v1 confidence width does not match num_assets")
-
-            mask = np.empty((sample_count, window_steps, h_dim, w_dim, num_assets), dtype="float32")
-            for idx, start_idx in enumerate(starts):
-                end_idx = int(start_idx) + window_steps
-                conf_window = np.asarray(self._frames_confidence[int(start_idx):end_idx], dtype="float32")
-                mask[idx] = conf_window[:, None, None, :]
-            x_out = np.concatenate([x_out, mask], axis=-1)
-
-        aux_dim = int(aux.shape[1])
-        if aux_dim > 0:
-            aux_view = np.broadcast_to(
-                aux[:, None, None, None, :],
-                (sample_count, window_steps, h_dim, w_dim, aux_dim),
-            )
-            x_out = np.concatenate([x_out, np.asarray(aux_view, dtype="float32")], axis=-1)
+        x_out = _materialize_frame_store_v1_x(
+            frames_base=self._frames_base,
+            frames_confidence=self._frames_confidence,
+            frames_observed=self._frames_observed,
+            frames_ts=self._frames_ts,
+            window_steps=int(self._window_steps),
+            anchor_local_idx=anchor_local_idx,
+            aux=aux,
+            include_mask_channel=bool(self.chunk.include_mask_channel),
+            num_assets=self.chunk.num_assets,
+            validate_shapes=False,
+        )
 
         return x_out, y_up, y_down, anchor_ts, duty_cycle
 
@@ -1648,11 +1653,15 @@ def compute_normalization_stats(
     dataset: SnapshotDataset,
     start_index: int,
     end_index: int,
+    batch_size: int,
     method: str,
     mask_start: int = 0,
     mask_count: int = 0,
 ) -> NormalizationStats:
     """Compute normalization stats in a streaming pass."""
+
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
 
     if method not in {"min_max", "standard"}:
         raise ConfigError(
@@ -1665,10 +1674,16 @@ def compute_normalization_stats(
     m2_vals: Optional[np.ndarray] = None
     count = 0
 
-    for x_chunk, _, _, _, _ in iter_snapshot_batches(dataset, start_index, end_index):
-        if x_chunk.size == 0:
+    for x_batch, _, _, _, _ in iter_snapshot_minibatches(
+        dataset,
+        start_index,
+        end_index,
+        batch_size=int(batch_size),
+        drop_remainder=False,
+    ):
+        if x_batch.size == 0:
             continue
-        x_non_mask, _ = _strip_mask_channels(x_chunk, mask_start, mask_count)
+        x_non_mask, _ = _strip_mask_channels(x_batch, mask_start, mask_count)
         x_flat = x_non_mask.reshape(x_non_mask.shape[0], -1).astype("float64")
 
         if method == "min_max":
@@ -1785,19 +1800,33 @@ def compute_label_distribution(
     down_counts: Dict[int, int] = {c: 0 for c in range(num_classes)}
     total_samples = 0
 
-    for _, y_up_chunk, y_down_chunk, _, _ in iter_snapshot_batches(
-        dataset, start_index, end_index
-    ):
-        for y_up_val in y_up_chunk:
-            class_idx = int(y_up_val)
-            if 0 <= class_idx < num_classes:
-                up_counts[class_idx] += 1
-            total_samples += 1
+    for chunk, local_start, local_end in _iter_snapshot_chunk_ranges(dataset, start_index, end_index):
+        if chunk.storage_format in {CHUNK_STORAGE_NPY_SHARDS_V1, CHUNK_STORAGE_FRAME_STORE_V1}:
+            if chunk.array_paths is None:
+                raise ConfigError("Snapshot chunk array_paths are required for label distribution")
+            y_up_all = np.load(chunk.array_paths["y_up"], mmap_mode="r")
+            y_down_all = np.load(chunk.array_paths["y_down"], mmap_mode="r")
+            y_up = np.asarray(y_up_all[local_start:local_end], dtype="int64")
+            y_down = np.asarray(y_down_all[local_start:local_end], dtype="int64")
+        else:
+            with np.load(chunk.file_path) as npz:
+                y_up = np.asarray(npz["y_up"][local_start:local_end], dtype="int64")
+                y_down = np.asarray(npz["y_down"][local_start:local_end], dtype="int64")
 
-        for y_down_val in y_down_chunk:
-            class_idx = int(y_down_val)
-            if 0 <= class_idx < num_classes:
-                down_counts[class_idx] += 1
+        total_samples += int(y_up.shape[0])
+
+        valid_up = (y_up >= 0) & (y_up < num_classes)
+        valid_down = (y_down >= 0) & (y_down < num_classes)
+
+        if bool(valid_up.any()):
+            binc_up = np.bincount(y_up[valid_up], minlength=num_classes)
+            for c in range(num_classes):
+                up_counts[c] += int(binc_up[c])
+
+        if bool(valid_down.any()):
+            binc_down = np.bincount(y_down[valid_down], minlength=num_classes)
+            for c in range(num_classes):
+                down_counts[c] += int(binc_down[c])
 
     if total_samples == 0:
         raise ValueError(

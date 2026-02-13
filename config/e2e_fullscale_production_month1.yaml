@@ -21,12 +21,12 @@ model:
       - filters: 16
         kernel_size: [5, 5]
         pool_size: [2, 2]
-        normalisation: null
+        normalization: null
         dropout: 0.
       - filters: 32
         kernel_size: [5, 5]
         pool_size: [2, 2]
-        normalisation: null
+        normalization: null
         dropout: 0.
       - filters: 64
         kernel_size: [5, 5]

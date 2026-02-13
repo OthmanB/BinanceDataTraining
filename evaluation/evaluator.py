@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 import json
 import logging
 from pathlib import Path
@@ -11,12 +11,12 @@ import os
 
 import numpy as np
 
-from preprocessing.train_test_split import chronological_split_indices
+from preprocessing.train_test_split import chronological_split_indices, compute_split_boundaries
 from training.snapshot_dataset import (
     NormalizationStats,
     compute_normalization_stats,
     get_mask_channel_info,
-    iter_snapshot_batches,
+    iter_snapshot_minibatches,
     load_normalization_stats,
     prepare_snapshot_dataset,
     save_normalization_stats,
@@ -33,6 +33,7 @@ from preprocessing.snapshot_sequence_builder import (
     build_hybrid_depth_sequence_tensor,
 )
 from preprocessing.feature_engineering import FeatureEngineer
+from mlflow_integration.safe_fluent import get_mlflow_if_active
 from .calibration import (
     compute_calibration_metrics,
     fit_temperature,
@@ -633,10 +634,9 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
         macro_f1_down,
     )
 
-    try:
-        import mlflow  # type: ignore[import]
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to import MLFlow for evaluation metric logging: %s", exc)
+    mlflow = get_mlflow_if_active()
+    if mlflow is None:
+        logger.debug("Skipping MLFlow evaluation metric logging: no active run.")
         return
 
     metrics = {
@@ -833,16 +833,13 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
     validation_ratio = float(split_cfg["validation_ratio"])
     test_ratio = float(split_cfg["test_ratio"])
 
-    ratio_sum = train_ratio + validation_ratio + test_ratio
-    if abs(ratio_sum - 1.0) > 1e-6:
-        raise ValueError("train_ratio + validation_ratio + test_ratio must equal 1.0")
-
-    train_end = int(n_samples * train_ratio)
-    val_end = train_end + int(n_samples * validation_ratio)
-    if val_end > n_samples:
-        val_end = n_samples
+    train_end, val_end, test_end = compute_split_boundaries(
+        n_samples,
+        train_ratio,
+        validation_ratio,
+        test_ratio,
+    )
     test_start = val_end
-    test_end = n_samples
 
     if test_end <= test_start:
         logger.info("No test samples available for snapshot evaluation; skipping.")
@@ -908,44 +905,66 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
 
     mask_start, mask_count = get_mask_channel_info(config)
 
-    stats_path = os.path.join(context.snapshot_dir, "normalization_stats_train.npz")
-    if os.path.exists(stats_path):
-        train_stats = load_normalization_stats(stats_path)
-    else:
-        train_stats = compute_normalization_stats(
-            snapshot_dataset,
-            0,
-            train_end,
-            method,
-            mask_start=mask_start,
-            mask_count=mask_count,
-        )
-        save_normalization_stats(stats_path, train_stats)
-
-    stats_meta = manifest.get("normalization_stats", {})
-    stats_meta["train"] = {
-        "method": train_stats.method,
-        "path": stats_path,
-        "start_index": 0,
-        "end_index": train_end,
-    }
-    manifest["normalization_stats"] = stats_meta
-    save_manifest(context, manifest)
-
-    eval_stats: NormalizationStats
-    if fit_on_train_only:
-        eval_stats = train_stats
-    else:
-        eval_stats = train_stats
-
     batch_size = int(training_cfg["batch_size"])
     if batch_size <= 0:
         raise ValueError("training.batch_size must be positive")
 
+    def _get_normalization_stats(
+        stats_key: str,
+        start_index: int,
+        end_index: int,
+    ) -> NormalizationStats:
+        stats_path = os.path.join(context.snapshot_dir, f"normalization_stats_{stats_key}.npz")
+        if os.path.exists(stats_path):
+            stats = load_normalization_stats(stats_path)
+        else:
+            stats = compute_normalization_stats(
+                snapshot_dataset,
+                start_index,
+                end_index,
+                batch_size,
+                method,
+                mask_start=mask_start,
+                mask_count=mask_count,
+            )
+            save_normalization_stats(stats_path, stats)
+
+        stats_meta = manifest.get("normalization_stats", {})
+        stats_meta[stats_key] = {
+            "method": stats.method,
+            "path": stats_path,
+            "start_index": int(start_index),
+            "end_index": int(end_index),
+        }
+        manifest["normalization_stats"] = stats_meta
+        save_manifest(context, manifest)
+        return stats
+
+    train_stats = _get_normalization_stats("train", 0, train_end)
+    val_stats: Optional[NormalizationStats] = None
+    test_stats = train_stats
+    if fit_on_train_only:
+        logger.info("Normalization fit_on_train_only=true: using train stats for val/test evaluation")
+    else:
+        val_count = int(val_end - train_end)
+        if val_count > 0:
+            val_stats = _get_normalization_stats("val", train_end, val_end)
+        test_stats = _get_normalization_stats("test", test_start, test_end)
+        logger.info("Normalization fit_on_train_only=false: using per-split stats for evaluation")
+
     min_predict_batch_size = _resolve_min_predict_batch_size(model)
 
     total_eval_samples = test_end - test_start
-    total_eval_batches = int(np.ceil(total_eval_samples / float(batch_size))) if total_eval_samples > 0 else 0
+    total_eval_batches = 0
+    if total_eval_samples > 0:
+        for chunk in getattr(snapshot_dataset, "chunks", []) or []:
+            chunk_start = int(getattr(chunk, "start_index", 0))
+            chunk_end = chunk_start + int(getattr(chunk, "num_samples", 0))
+            overlap_start = max(test_start, chunk_start)
+            overlap_end = min(test_end, chunk_end)
+            overlap_len = overlap_end - overlap_start
+            if overlap_len > 0:
+                total_eval_batches += int(np.ceil(overlap_len / float(batch_size)))
     eval_batches_done = 0
     if writer is not None:
         try:
@@ -980,8 +999,9 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
 
     backtest_prices: Optional[np.ndarray] = None
     backtest_timestamps: Optional[np.ndarray] = None
-    backtest_prob_up_parts: List[np.ndarray] = []
-    backtest_prob_down_parts: List[np.ndarray] = []
+    backtest_prob_up: Optional[np.memmap] = None
+    backtest_prob_down: Optional[np.memmap] = None
+    backtest_prob_tmp_dir: Optional[tempfile.TemporaryDirectory] = None
 
     def _map_anchor_timestamps_to_prices(
         series_timestamps: np.ndarray,
@@ -1036,9 +1056,29 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
 
         if backtest_prices.shape[0] > BACKTEST_MEMORY_WARN_THRESHOLD:
             logger.warning(
-                "Backtesting will buffer %s samples in memory; consider reducing evaluation range",
+                "Backtesting will buffer %s samples for prices and write probabilities to temporary files; consider reducing evaluation range",
                 backtest_prices.shape[0],
             )
+
+        backtest_prob_tmp_dir = tempfile.TemporaryDirectory(prefix="snapshot_backtest_buffers_")
+        backtest_prob_up = cast(
+            np.memmap,
+            np.lib.format.open_memmap(
+                os.path.join(backtest_prob_tmp_dir.name, "backtest_prob_up.npy"),
+                mode="w+",
+                dtype="float64",
+                shape=(int(backtest_prices.shape[0]), num_classes),
+            ),
+        )
+        backtest_prob_down = cast(
+            np.memmap,
+            np.lib.format.open_memmap(
+                os.path.join(backtest_prob_tmp_dir.name, "backtest_prob_down.npy"),
+                mode="w+",
+                dtype="float64",
+                shape=(int(backtest_prices.shape[0]), num_classes),
+            ),
+        )
 
     # Temporal degradation configuration
     temporal_cfg = eval_cfg["temporal_degradation"]
@@ -1113,12 +1153,10 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
         start_index: int,
         end_index: int,
         lt_features: Optional[np.ndarray],
+        stats: NormalizationStats,
+        *,
+        buffer_dir: str,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        probs_up_parts = []
-        probs_down_parts = []
-        labels_up_parts = []
-        labels_down_parts = []
-
         expected_len = end_index - start_index
         if lt_features is not None and lt_features.shape[0] != expected_len:
             raise ValueError(
@@ -1126,57 +1164,112 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
                 f"features={lt_features.shape[0]}, expected={expected_len}"
             )
 
+        if expected_len <= 0:
+            raise ValueError("Calibration range is empty")
+
+        # Buffer logits/labels to disk to avoid holding full-range arrays in RAM.
+        logits_up = cast(
+            np.memmap,
+            np.lib.format.open_memmap(
+                os.path.join(buffer_dir, "calibration_logits_up.npy"),
+                mode="w+",
+                dtype="float64",
+                shape=(expected_len, num_classes),
+            ),
+        )
+        logits_down = cast(
+            np.memmap,
+            np.lib.format.open_memmap(
+                os.path.join(buffer_dir, "calibration_logits_down.npy"),
+                mode="w+",
+                dtype="float64",
+                shape=(expected_len, num_classes),
+            ),
+        )
+        labels_up = cast(
+            np.memmap,
+            np.lib.format.open_memmap(
+                os.path.join(buffer_dir, "calibration_labels_up.npy"),
+                mode="w+",
+                dtype="int64",
+                shape=(expected_len,),
+            ),
+        )
+        labels_down = cast(
+            np.memmap,
+            np.lib.format.open_memmap(
+                os.path.join(buffer_dir, "calibration_labels_down.npy"),
+                mode="w+",
+                dtype="int64",
+                shape=(expected_len,),
+            ),
+        )
+
         current_idx = 0
 
-        for x_chunk, y_up_chunk, y_down_chunk, _, _ in iter_snapshot_batches(
-            snapshot_dataset, start_index, end_index
+        for x_batch, y_true_up, y_true_down, _, _ in iter_snapshot_minibatches(
+            snapshot_dataset,
+            start_index,
+            end_index,
+            batch_size=batch_size,
+            drop_remainder=False,
         ):
-            x_chunk = _apply_normalization_snapshot(x_chunk, eval_stats, mask_start, mask_count)
-            n_chunk = x_chunk.shape[0]
+            x_batch = _apply_normalization_snapshot(x_batch, stats, mask_start, mask_count)
+            if x_batch.shape[0] == 0:
+                continue
 
-            for offset in range(0, n_chunk, batch_size):
-                x_batch = x_chunk[offset : offset + batch_size]
-                y_true_up = y_up_chunk[offset : offset + batch_size]
-                y_true_down = y_down_chunk[offset : offset + batch_size]
-                if x_batch.shape[0] == 0:
-                    continue
+            lt_batch: Optional[np.ndarray] = None
+            if lt_features is not None:
+                lt_batch = lt_features[current_idx : current_idx + x_batch.shape[0]]
+                if lt_batch.shape[0] != x_batch.shape[0]:
+                    raise ValueError("Long-term feature batch size mismatch during calibration")
 
-                lt_batch: Optional[np.ndarray] = None
-                if lt_features is not None:
-                    lt_batch = lt_features[current_idx : current_idx + x_batch.shape[0]]
-                    if lt_batch.shape[0] != x_batch.shape[0]:
-                        raise ValueError("Long-term feature batch size mismatch during calibration")
+            y_prob_up, y_prob_down = _predict_two_head_with_safe_batching(
+                model,
+                x_batch,
+                lt_batch=lt_batch,
+                batch_size=batch_size,
+                min_predict_batch_size=min_predict_batch_size,
+            )
 
-                y_prob_up, y_prob_down = _predict_two_head_with_safe_batching(
-                    model,
-                    x_batch,
-                    lt_batch=lt_batch,
-                    batch_size=batch_size,
-                    min_predict_batch_size=min_predict_batch_size,
+            if y_prob_up.shape[1] != num_classes or y_prob_down.shape[1] != num_classes:
+                raise ValueError("Prediction output classes do not match model.output.num_classes")
+
+            batch_len = int(x_batch.shape[0])
+            next_idx = current_idx + batch_len
+            if next_idx > expected_len:
+                raise ValueError(
+                    "Calibration range overrun while buffering predictions: "
+                    f"next_idx={next_idx}, expected_len={expected_len}"
                 )
 
-                if y_prob_up.shape[1] != num_classes or y_prob_down.shape[1] != num_classes:
-                    raise ValueError("Prediction output classes do not match model.output.num_classes")
+            logits_up[current_idx:next_idx] = probs_to_logits_proxy(y_prob_up)
+            logits_down[current_idx:next_idx] = probs_to_logits_proxy(y_prob_down)
+            labels_up[current_idx:next_idx] = np.asarray(y_true_up, dtype="int64")
+            labels_down[current_idx:next_idx] = np.asarray(y_true_down, dtype="int64")
 
-                probs_up_parts.append(y_prob_up)
-                probs_down_parts.append(y_prob_down)
-                labels_up_parts.append(np.asarray(y_true_up, dtype="int64"))
-                labels_down_parts.append(np.asarray(y_true_down, dtype="int64"))
+            current_idx = next_idx
 
-                current_idx += x_batch.shape[0]
+        if current_idx != expected_len:
+            raise ValueError(
+                "Calibration prediction count mismatch: processed={processed} expected={expected}".format(
+                    processed=current_idx,
+                    expected=expected_len,
+                )
+            )
 
-        if not probs_up_parts:
+        if current_idx <= 0:
             raise ValueError("No predictions collected for post-hoc calibration fitting")
 
-        probs_up = np.concatenate(probs_up_parts, axis=0)
-        probs_down = np.concatenate(probs_down_parts, axis=0)
-        labels_up = np.concatenate(labels_up_parts, axis=0)
-        labels_down = np.concatenate(labels_down_parts, axis=0)
+        try:
+            logits_up.flush()
+            logits_down.flush()
+            labels_up.flush()
+            labels_down.flush()
+        except Exception:
+            pass
 
-        if probs_up.shape[0] != labels_up.shape[0] or probs_down.shape[0] != labels_down.shape[0]:
-            raise ValueError("Calibration data size mismatch between predictions and labels")
-
-        return probs_up, probs_down, labels_up, labels_down
+        return logits_up, logits_down, labels_up, labels_down
 
     if post_hoc_enabled:
         method = str(post_hoc_cfg["method"])
@@ -1206,7 +1299,7 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
 
         if fit_count > CALIBRATION_MEMORY_WARN_THRESHOLD:
             logger.warning(
-                "Post-hoc calibration will buffer %s samples in memory; consider reducing evaluation range",
+                "Post-hoc calibration will buffer %s samples to temporary files; consider reducing evaluation range",
                 fit_count,
             )
 
@@ -1214,36 +1307,49 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
         if long_term_features is not None:
             long_term_fit_features = long_term_features[fit_start:fit_end]
 
-        probs_up_fit, probs_down_fit, labels_up_fit, labels_down_fit = _collect_calibration_predictions(
-            fit_start,
-            fit_end,
-            long_term_fit_features,
-        )
+        scaler_up = None
+        scaler_down = None
+        fit_samples = 0
+        with tempfile.TemporaryDirectory(prefix="snapshot_calibration_buffers_") as buffer_dir:
+            fit_stats = train_stats
+            if not fit_on_train_only:
+                if fit_on_validation:
+                    fit_stats = val_stats if val_stats is not None else train_stats
+                else:
+                    fit_stats = test_stats
 
-        fit_samples = int(probs_up_fit.shape[0])
-        if fit_samples < min_samples:
-            raise ValueError(
-                "Post-hoc calibration requires at least {min_samples} samples; got {fit_samples}".format(
-                    min_samples=min_samples,
-                    fit_samples=fit_samples,
-                )
+            logits_up_fit, logits_down_fit, labels_up_fit, labels_down_fit = _collect_calibration_predictions(
+                fit_start,
+                fit_end,
+                long_term_fit_features,
+                fit_stats,
+                buffer_dir=buffer_dir,
             )
 
-        logits_up = probs_to_logits_proxy(probs_up_fit)
-        logits_down = probs_to_logits_proxy(probs_down_fit)
+            fit_samples = int(logits_up_fit.shape[0])
+            if fit_samples < min_samples:
+                raise ValueError(
+                    "Post-hoc calibration requires at least {min_samples} samples; got {fit_samples}".format(
+                        min_samples=min_samples,
+                        fit_samples=fit_samples,
+                    )
+                )
 
-        scaler_up = fit_temperature(
-            logits_up,
-            labels_up_fit,
-            num_bins=n_bins,
-            bounds=(min_temp, max_temp),
-        )
-        scaler_down = fit_temperature(
-            logits_down,
-            labels_down_fit,
-            num_bins=n_bins,
-            bounds=(min_temp, max_temp),
-        )
+            scaler_up = fit_temperature(
+                logits_up_fit,
+                labels_up_fit,
+                num_bins=n_bins,
+                bounds=(min_temp, max_temp),
+            )
+            scaler_down = fit_temperature(
+                logits_down_fit,
+                labels_down_fit,
+                num_bins=n_bins,
+                bounds=(min_temp, max_temp),
+            )
+
+        if scaler_up is None or scaler_down is None:
+            raise ValueError("Post-hoc calibration failed to produce temperature scalers")
 
         if not scaler_up.fitted or not scaler_down.fitted:
             raise ValueError("Post-hoc calibration failed to fit temperature scalers")
@@ -1262,171 +1368,191 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
 
     sample_offset = 0
 
-    for x_chunk, y_up_chunk, y_down_chunk, _, _ in iter_snapshot_batches(
-        snapshot_dataset, test_start, test_end
+    for x_batch, y_true_up, y_true_down, _, _ in iter_snapshot_minibatches(
+        snapshot_dataset,
+        test_start,
+        test_end,
+        batch_size=batch_size,
+        drop_remainder=False,
     ):
-        x_chunk = _apply_normalization_snapshot(x_chunk, eval_stats, mask_start, mask_count)
-        n_chunk = x_chunk.shape[0]
+        x_batch = _apply_normalization_snapshot(x_batch, test_stats, mask_start, mask_count)
+        if x_batch.shape[0] == 0:
+            continue
 
-        for offset in range(0, n_chunk, batch_size):
-            x_batch = x_chunk[offset : offset + batch_size]
-            y_true_up = y_up_chunk[offset : offset + batch_size]
-            y_true_down = y_down_chunk[offset : offset + batch_size]
-            if x_batch.shape[0] == 0:
-                continue
+        lt_batch: Optional[np.ndarray] = None
+        if long_term_test_features is not None:
+            lt_batch = long_term_test_features[sample_offset : sample_offset + x_batch.shape[0]]
+            if lt_batch.shape[0] != x_batch.shape[0]:
+                raise ValueError("Long-term feature batch size mismatch during evaluation")
 
-            lt_batch: Optional[np.ndarray] = None
-            if long_term_test_features is not None:
-                lt_batch = long_term_test_features[sample_offset : sample_offset + x_batch.shape[0]]
-                if lt_batch.shape[0] != x_batch.shape[0]:
-                    raise ValueError("Long-term feature batch size mismatch during evaluation")
+        y_prob_up, y_prob_down = _predict_two_head_with_safe_batching(
+            model,
+            x_batch,
+            lt_batch=lt_batch,
+            batch_size=batch_size,
+            min_predict_batch_size=min_predict_batch_size,
+        )
 
-            y_prob_up, y_prob_down = _predict_two_head_with_safe_batching(
-                model,
-                x_batch,
-                lt_batch=lt_batch,
-                batch_size=batch_size,
-                min_predict_batch_size=min_predict_batch_size,
+        if y_prob_up.shape[1] != num_classes or y_prob_down.shape[1] != num_classes:
+            raise ValueError("Prediction output classes do not match model.output.num_classes")
+
+        y_pred_up = np.argmax(y_prob_up, axis=1)
+        y_pred_down = np.argmax(y_prob_down, axis=1)
+
+        correct_up += int(np.sum(y_pred_up == y_true_up))
+        correct_down += int(np.sum(y_pred_down == y_true_down))
+        total_eval += int(y_true_up.shape[0])
+
+        np.add.at(confusion_up, (y_true_up, y_pred_up), 1)
+        np.add.at(confusion_down, (y_true_down, y_pred_down), 1)
+
+        batch_start = sample_offset
+        batch_end = batch_start + y_true_up.shape[0]
+
+        if temporal_enabled and temporal_windows:
+            for window_index, (win_start, win_end) in enumerate(temporal_windows):
+                overlap_start = max(win_start, batch_start)
+                overlap_end = min(win_end, batch_end)
+                if overlap_start >= overlap_end:
+                    continue
+
+                local_start = overlap_start - batch_start
+                local_end = overlap_end - batch_start
+
+                y_true_up_slice = y_true_up[local_start:local_end]
+                y_pred_up_slice = y_pred_up[local_start:local_end]
+                y_true_down_slice = y_true_down[local_start:local_end]
+                y_pred_down_slice = y_pred_down[local_start:local_end]
+
+                np.add.at(
+                    temporal_confusions_up[window_index],
+                    (y_true_up_slice, y_pred_up_slice),
+                    1,
+                )
+                np.add.at(
+                    temporal_confusions_down[window_index],
+                    (y_true_down_slice, y_pred_down_slice),
+                    1,
+                )
+                temporal_counts[window_index] += int(local_end - local_start)
+
+        y_true_up_onehot = np.eye(num_classes, dtype="float64")[y_true_up]
+        y_true_down_onehot = np.eye(num_classes, dtype="float64")[y_true_down]
+
+        if calib_enabled:
+            up_brier_sum += float(
+                np.sum(np.sum((y_prob_up - y_true_up_onehot) ** 2, axis=1))
+            )
+            down_brier_sum += float(
+                np.sum(np.sum((y_prob_down - y_true_down_onehot) ** 2, axis=1))
+            )
+            up_count += int(y_true_up.shape[0])
+            down_count += int(y_true_down.shape[0])
+
+            up_bins = _assign_calibration_bins_with_truth(
+                y_prob_up,
+                y_true_up_onehot,
+                bin_edges,
+            )
+            down_bins = _assign_calibration_bins_with_truth(
+                y_prob_down,
+                y_true_down_onehot,
+                bin_edges,
             )
 
-            if y_prob_up.shape[1] != num_classes or y_prob_down.shape[1] != num_classes:
-                raise ValueError("Prediction output classes do not match model.output.num_classes")
+            up_conf_sum += up_bins[0]
+            up_acc_sum += up_bins[1]
+            up_bin_count += up_bins[2]
 
-            y_pred_up = np.argmax(y_prob_up, axis=1)
-            y_pred_down = np.argmax(y_prob_down, axis=1)
+            down_conf_sum += down_bins[0]
+            down_acc_sum += down_bins[1]
+            down_bin_count += down_bins[2]
 
-            correct_up += int(np.sum(y_pred_up == y_true_up))
-            correct_down += int(np.sum(y_pred_down == y_true_down))
-            total_eval += int(y_true_up.shape[0])
+        y_prob_up_cal: Optional[np.ndarray] = None
+        y_prob_down_cal: Optional[np.ndarray] = None
 
-            np.add.at(confusion_up, (y_true_up, y_pred_up), 1)
-            np.add.at(confusion_down, (y_true_down, y_pred_down), 1)
+        if post_hoc_enabled:
+            if temperature_up is None or temperature_down is None:
+                raise ValueError("Post-hoc calibration is enabled but temperatures are missing")
 
-            batch_start = sample_offset
-            batch_end = batch_start + y_true_up.shape[0]
+            y_prob_up_cal = logits_to_calibrated_probs(
+                probs_to_logits_proxy(y_prob_up),
+                temperature_up,
+            )
+            y_prob_down_cal = logits_to_calibrated_probs(
+                probs_to_logits_proxy(y_prob_down),
+                temperature_down,
+            )
 
-            if temporal_enabled and temporal_windows:
-                for window_index, (win_start, win_end) in enumerate(temporal_windows):
-                    overlap_start = max(win_start, batch_start)
-                    overlap_end = min(win_end, batch_end)
-                    if overlap_start >= overlap_end:
-                        continue
+            up_brier_sum_cal += float(
+                np.sum(np.sum((y_prob_up_cal - y_true_up_onehot) ** 2, axis=1))
+            )
+            down_brier_sum_cal += float(
+                np.sum(np.sum((y_prob_down_cal - y_true_down_onehot) ** 2, axis=1))
+            )
+            up_count_cal += int(y_true_up.shape[0])
+            down_count_cal += int(y_true_down.shape[0])
 
-                    local_start = overlap_start - batch_start
-                    local_end = overlap_end - batch_start
+            up_bins_cal = _assign_calibration_bins_with_truth(
+                y_prob_up_cal,
+                y_true_up_onehot,
+                bin_edges,
+            )
+            down_bins_cal = _assign_calibration_bins_with_truth(
+                y_prob_down_cal,
+                y_true_down_onehot,
+                bin_edges,
+            )
 
-                    y_true_up_slice = y_true_up[local_start:local_end]
-                    y_pred_up_slice = y_pred_up[local_start:local_end]
-                    y_true_down_slice = y_true_down[local_start:local_end]
-                    y_pred_down_slice = y_pred_down[local_start:local_end]
+            up_conf_sum_cal += up_bins_cal[0]
+            up_acc_sum_cal += up_bins_cal[1]
+            up_bin_count_cal += up_bins_cal[2]
 
-                    np.add.at(
-                        temporal_confusions_up[window_index],
-                        (y_true_up_slice, y_pred_up_slice),
-                        1,
+            down_conf_sum_cal += down_bins_cal[0]
+            down_acc_sum_cal += down_bins_cal[1]
+            down_bin_count_cal += down_bins_cal[2]
+
+        if backtest_enabled:
+            if backtest_prob_up is None or backtest_prob_down is None:
+                raise ValueError("Backtesting is enabled but probability buffers are not initialized")
+
+            batch_len = int(y_true_up.shape[0])
+            bt_start = int(sample_offset)
+            bt_end = bt_start + batch_len
+            if bt_end > int(backtest_prob_up.shape[0]):
+                raise ValueError(
+                    "Backtesting probability buffer overrun: end={end} buffer_len={buf_len}".format(
+                        end=bt_end,
+                        buf_len=int(backtest_prob_up.shape[0]),
                     )
-                    np.add.at(
-                        temporal_confusions_down[window_index],
-                        (y_true_down_slice, y_pred_down_slice),
-                        1,
-                    )
-                    temporal_counts[window_index] += int(local_end - local_start)
-
-            y_true_up_onehot = np.eye(num_classes, dtype="float64")[y_true_up]
-            y_true_down_onehot = np.eye(num_classes, dtype="float64")[y_true_down]
-
-            if calib_enabled:
-                up_brier_sum += float(
-                    np.sum(np.sum((y_prob_up - y_true_up_onehot) ** 2, axis=1))
                 )
-                down_brier_sum += float(
-                    np.sum(np.sum((y_prob_down - y_true_down_onehot) ** 2, axis=1))
-                )
-                up_count += int(y_true_up.shape[0])
-                down_count += int(y_true_down.shape[0])
-
-                up_bins = _assign_calibration_bins_with_truth(
-                    y_prob_up,
-                    y_true_up_onehot,
-                    bin_edges,
-                )
-                down_bins = _assign_calibration_bins_with_truth(
-                    y_prob_down,
-                    y_true_down_onehot,
-                    bin_edges,
-                )
-
-                up_conf_sum += up_bins[0]
-                up_acc_sum += up_bins[1]
-                up_bin_count += up_bins[2]
-
-                down_conf_sum += down_bins[0]
-                down_acc_sum += down_bins[1]
-                down_bin_count += down_bins[2]
-
-            y_prob_up_cal: Optional[np.ndarray] = None
-            y_prob_down_cal: Optional[np.ndarray] = None
 
             if post_hoc_enabled:
-                if temperature_up is None or temperature_down is None:
-                    raise ValueError("Post-hoc calibration is enabled but temperatures are missing")
+                if y_prob_up_cal is None or y_prob_down_cal is None:
+                    raise ValueError("Backtesting requires calibrated probabilities but none were produced")
+                backtest_prob_up[bt_start:bt_end] = y_prob_up_cal
+                backtest_prob_down[bt_start:bt_end] = y_prob_down_cal
+            else:
+                backtest_prob_up[bt_start:bt_end] = y_prob_up
+                backtest_prob_down[bt_start:bt_end] = y_prob_down
 
-                y_prob_up_cal = logits_to_calibrated_probs(
-                    probs_to_logits_proxy(y_prob_up),
-                    temperature_up,
-                )
-                y_prob_down_cal = logits_to_calibrated_probs(
-                    probs_to_logits_proxy(y_prob_down),
-                    temperature_down,
-                )
-
-                up_brier_sum_cal += float(
-                    np.sum(np.sum((y_prob_up_cal - y_true_up_onehot) ** 2, axis=1))
-                )
-                down_brier_sum_cal += float(
-                    np.sum(np.sum((y_prob_down_cal - y_true_down_onehot) ** 2, axis=1))
-                )
-                up_count_cal += int(y_true_up.shape[0])
-                down_count_cal += int(y_true_down.shape[0])
-
-                up_bins_cal = _assign_calibration_bins_with_truth(
-                    y_prob_up_cal,
-                    y_true_up_onehot,
-                    bin_edges,
-                )
-                down_bins_cal = _assign_calibration_bins_with_truth(
-                    y_prob_down_cal,
-                    y_true_down_onehot,
-                    bin_edges,
-                )
-
-                up_conf_sum_cal += up_bins_cal[0]
-                up_acc_sum_cal += up_bins_cal[1]
-                up_bin_count_cal += up_bins_cal[2]
-
-                down_conf_sum_cal += down_bins_cal[0]
-                down_acc_sum_cal += down_bins_cal[1]
-                down_bin_count_cal += down_bins_cal[2]
-
-            if backtest_enabled:
-                if post_hoc_enabled:
-                    if y_prob_up_cal is None or y_prob_down_cal is None:
-                        raise ValueError("Backtesting requires calibrated probabilities but none were produced")
-                    backtest_prob_up_parts.append(y_prob_up_cal)
-                    backtest_prob_down_parts.append(y_prob_down_cal)
-                else:
-                    backtest_prob_up_parts.append(y_prob_up)
-                    backtest_prob_down_parts.append(y_prob_down)
-
-            sample_offset += int(y_true_up.shape[0])
-            eval_batches_done += 1
-            if writer is not None:
-                try:
-                    writer.update_eval_progress(processed=eval_batches_done, total=total_eval_batches)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Failed to publish eval progress update: %s", exc)
+        sample_offset += int(y_true_up.shape[0])
+        eval_batches_done += 1
+        if writer is not None:
+            try:
+                writer.update_eval_progress(processed=eval_batches_done, total=total_eval_batches)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to publish eval progress update: %s", exc)
 
     if total_eval <= 0:
+        if backtest_prob_tmp_dir is not None:
+            try:
+                backtest_prob_up = None
+                backtest_prob_down = None
+                backtest_prob_tmp_dir.cleanup()
+            except Exception:
+                pass
+            backtest_prob_tmp_dir = None
         logger.info("Snapshot evaluation found no samples after batching; skipping.")
         return
 
@@ -1486,18 +1612,28 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
     if backtest_enabled:
         if backtest_prices is None or backtest_timestamps is None:
             raise ValueError("Backtesting is enabled but price data is missing")
-        if not backtest_prob_up_parts or not backtest_prob_down_parts:
-            raise ValueError("Backtesting is enabled but no probabilities were collected")
+        if backtest_prob_up is None or backtest_prob_down is None:
+            raise ValueError("Backtesting is enabled but probability buffers are missing")
 
-        backtest_prob_up = np.concatenate(backtest_prob_up_parts, axis=0)
-        backtest_prob_down = np.concatenate(backtest_prob_down_parts, axis=0)
-
-        expected_len = backtest_prices.shape[0]
-        if backtest_prob_up.shape[0] != expected_len or backtest_prob_down.shape[0] != expected_len:
+        expected_len = int(backtest_prices.shape[0])
+        if int(backtest_prob_up.shape[0]) != expected_len or int(backtest_prob_down.shape[0]) != expected_len:
             raise ValueError(
                 "Backtesting probability length mismatch: "
-                f"up={backtest_prob_up.shape[0]}, down={backtest_prob_down.shape[0]}, expected={expected_len}"
+                f"up={int(backtest_prob_up.shape[0])}, down={int(backtest_prob_down.shape[0])}, expected={expected_len}"
             )
+        if int(sample_offset) != expected_len:
+            raise ValueError(
+                "Backtesting probability fill mismatch: filled={filled} expected={expected}".format(
+                    filled=int(sample_offset),
+                    expected=expected_len,
+                )
+            )
+
+        try:
+            backtest_prob_up.flush()
+            backtest_prob_down.flush()
+        except Exception:
+            pass
 
         from .backtesting import log_backtest_to_mlflow, run_backtest
 
@@ -1510,6 +1646,15 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
             timestamps=backtest_timestamps,
         )
         log_backtest_to_mlflow(backtest_result)
+
+        if backtest_prob_tmp_dir is not None:
+            try:
+                backtest_prob_up = None
+                backtest_prob_down = None
+                backtest_prob_tmp_dir.cleanup()
+            except Exception:
+                pass
+            backtest_prob_tmp_dir = None
 
     logger.info(
         "Snapshot evaluation metrics. eval_n=%s, up_accuracy=%s, down_accuracy=%s, "
@@ -1526,11 +1671,9 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
         macro_f1_down,
     )
 
-    try:
-        import mlflow  # type: ignore[import]
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to import MLFlow for snapshot evaluation metric logging: %s", exc)
-        return
+    mlflow = get_mlflow_if_active()
+    if mlflow is None:
+        logger.debug("Skipping MLFlow snapshot evaluation metric logging: no active run.")
 
     metrics = {
         "eval_up_accuracy": accuracy_up,
@@ -1581,11 +1724,12 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
         metrics["calibration_fit_down_ece_post"] = float(down_summary.get("post_calibration_ece", 0.0))
         metrics["calibration_fit_samples"] = float(calibration_fit_summary.get("num_samples", 0))
 
-    for name, value in metrics.items():
-        try:
-            mlflow.log_metric(name, float(value))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to log MLFlow evaluation metric %s: %s", name, exc)
+    if mlflow is not None:
+        for name, value in metrics.items():
+            try:
+                mlflow.log_metric(name, float(value))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to log MLFlow evaluation metric %s: %s", name, exc)
 
     # Optional confusion matrix artifact logging.
     try:
@@ -1595,7 +1739,7 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
     except Exception:  # noqa: BLE001
         log_confusion = False
 
-    if log_confusion:
+    if mlflow is not None and log_confusion:
         tmp_dir = Path(tempfile.mkdtemp())
         cm_up_path = tmp_dir / "confusion_matrix_up.csv"
         cm_down_path = tmp_dir / "confusion_matrix_down.csv"
@@ -1612,7 +1756,7 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to log confusion matrix artifacts to MLFlow: %s", exc)
 
-    if (
+    if mlflow is not None and (
         (calib_enabled and (calibration_results_up is not None or calibration_results_down is not None))
         or (
             post_hoc_enabled
@@ -1771,48 +1915,49 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
                 temporal_result_up = _build_temporal_result(window_metrics_up)
                 temporal_result_down = _build_temporal_result(window_metrics_down)
 
-                # Log summary metrics to MLflow
-                mlflow.log_metric("temporal_up_total_degradation", temporal_result_up.total_degradation)
-                mlflow.log_metric("temporal_up_degradation_rate", temporal_result_up.degradation_rate)
-                mlflow.log_metric("temporal_up_overall_trend", temporal_result_up.overall_trend)
-                mlflow.log_metric("temporal_up_first_window_accuracy", temporal_result_up.first_window_accuracy)
-                mlflow.log_metric("temporal_up_last_window_accuracy", temporal_result_up.last_window_accuracy)
+                if mlflow is not None:
+                    # Log summary metrics to MLflow
+                    mlflow.log_metric("temporal_up_total_degradation", temporal_result_up.total_degradation)
+                    mlflow.log_metric("temporal_up_degradation_rate", temporal_result_up.degradation_rate)
+                    mlflow.log_metric("temporal_up_overall_trend", temporal_result_up.overall_trend)
+                    mlflow.log_metric("temporal_up_first_window_accuracy", temporal_result_up.first_window_accuracy)
+                    mlflow.log_metric("temporal_up_last_window_accuracy", temporal_result_up.last_window_accuracy)
 
-                mlflow.log_metric("temporal_down_total_degradation", temporal_result_down.total_degradation)
-                mlflow.log_metric("temporal_down_degradation_rate", temporal_result_down.degradation_rate)
-                mlflow.log_metric("temporal_down_overall_trend", temporal_result_down.overall_trend)
-                mlflow.log_metric("temporal_down_first_window_accuracy", temporal_result_down.first_window_accuracy)
-                mlflow.log_metric("temporal_down_last_window_accuracy", temporal_result_down.last_window_accuracy)
+                    mlflow.log_metric("temporal_down_total_degradation", temporal_result_down.total_degradation)
+                    mlflow.log_metric("temporal_down_degradation_rate", temporal_result_down.degradation_rate)
+                    mlflow.log_metric("temporal_down_overall_trend", temporal_result_down.overall_trend)
+                    mlflow.log_metric("temporal_down_first_window_accuracy", temporal_result_down.first_window_accuracy)
+                    mlflow.log_metric("temporal_down_last_window_accuracy", temporal_result_down.last_window_accuracy)
 
-                # Log per-window metrics if configured
-                if temporal_log_per_window:
-                    for wm in temporal_result_up.window_metrics:
-                        prefix = f"temporal_up_window_{wm.window_index}"
-                        mlflow.log_metric(f"{prefix}_accuracy", wm.accuracy)
-                        mlflow.log_metric(f"{prefix}_f1_macro", wm.f1_macro)
-                        mlflow.log_metric(f"{prefix}_num_samples", float(wm.num_samples))
+                    # Log per-window metrics if configured
+                    if temporal_log_per_window:
+                        for wm in temporal_result_up.window_metrics:
+                            prefix = f"temporal_up_window_{wm.window_index}"
+                            mlflow.log_metric(f"{prefix}_accuracy", wm.accuracy)
+                            mlflow.log_metric(f"{prefix}_f1_macro", wm.f1_macro)
+                            mlflow.log_metric(f"{prefix}_num_samples", float(wm.num_samples))
 
-                    for wm in temporal_result_down.window_metrics:
-                        prefix = f"temporal_down_window_{wm.window_index}"
-                        mlflow.log_metric(f"{prefix}_accuracy", wm.accuracy)
-                        mlflow.log_metric(f"{prefix}_f1_macro", wm.f1_macro)
-                        mlflow.log_metric(f"{prefix}_num_samples", float(wm.num_samples))
+                        for wm in temporal_result_down.window_metrics:
+                            prefix = f"temporal_down_window_{wm.window_index}"
+                            mlflow.log_metric(f"{prefix}_accuracy", wm.accuracy)
+                            mlflow.log_metric(f"{prefix}_f1_macro", wm.f1_macro)
+                            mlflow.log_metric(f"{prefix}_num_samples", float(wm.num_samples))
 
-                # Save full results as JSON artifact
-                tmp_dir = Path(tempfile.mkdtemp())
-                temporal_path = tmp_dir / "temporal_degradation_analysis.json"
-                temporal_artifact = {
-                    "up": temporal_result_up.to_dict(),
-                    "down": temporal_result_down.to_dict(),
-                    "config": {
-                        "num_windows": temporal_num_windows,
-                        "overlap_fraction": temporal_overlap,
-                        "total_samples": expected_samples,
-                    },
-                }
-                with temporal_path.open("w", encoding="utf-8") as f:
-                    json.dump(temporal_artifact, f, indent=2, sort_keys=True)
-                mlflow.log_artifact(str(temporal_path), artifact_path="evaluation")
+                    # Save full results as JSON artifact
+                    tmp_dir = Path(tempfile.mkdtemp())
+                    temporal_path = tmp_dir / "temporal_degradation_analysis.json"
+                    temporal_artifact = {
+                        "up": temporal_result_up.to_dict(),
+                        "down": temporal_result_down.to_dict(),
+                        "config": {
+                            "num_windows": temporal_num_windows,
+                            "overlap_fraction": temporal_overlap,
+                            "total_samples": expected_samples,
+                        },
+                    }
+                    with temporal_path.open("w", encoding="utf-8") as f:
+                        json.dump(temporal_artifact, f, indent=2, sort_keys=True)
+                    mlflow.log_artifact(str(temporal_path), artifact_path="evaluation")
 
                 logger.info(
                     "Temporal degradation analysis complete. Up: degradation=%.4f, Down: degradation=%.4f",

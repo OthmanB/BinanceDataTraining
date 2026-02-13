@@ -202,12 +202,12 @@ model:  # Defines the neural network architecture and its compilation settings.
       - filters: 16
         kernel_size: [5,5]
         pool_size: [2,2]
-        normalisation: null
+        normalization: null
         dropout: 0.
       - filters: 32
         kernel_size: [5,5]
         pool_size: [2,2]
-        normalisation: null
+        normalization: null
         dropout: 0.
       - filters: 64               # Number of filters for this convolutional layer.
         kernel_size: [5, 5]       # Spatial kernel size (height, width).
@@ -366,6 +366,7 @@ hyperparameter_optimization:  # Controls Optuna-based search over selected hyper
     resources: []  # Resource list like ["gpu:0", "gpu:1", "cpu"]; each worker is pinned to one entry.
     storage_uri: null  # Optional Optuna storage URI (e.g. sqlite:///tmp/optuna/hpo.db); null auto-creates local SQLite.
     study_name: null  # Optional Optuna study name used by parallel workers; null defaults to "binance_hpo".
+    resume_study: false  # When true, reuse an existing Optuna study; when false, delete stale prior trials and start fresh.
 
   regime:
     enabled: false  # When true, apply adaptive safeguards/penalties to keep HPO trials in stable GPU/CPU operating regimes.

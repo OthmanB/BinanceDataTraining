@@ -359,6 +359,9 @@ def _build_regime_memory_path(base_config: Dict[str, Any], study_name: str) -> s
     return os.path.join(optuna_dir, f"regime_memory_{_sanitize_study_name(study_name)}.json")
 
 
+_REGIME_MEMORY_WRITE_FAILURES: set[str] = set()
+
+
 def _read_regime_memory(path: str) -> Dict[str, Any]:
     if not os.path.exists(path):
         return _default_regime_memory()
@@ -366,9 +369,15 @@ def _read_regime_memory(path: str) -> Dict[str, Any]:
         with open(path, "r", encoding="utf-8") as handle:
             payload = json.load(handle)
         if not isinstance(payload, dict):
+            logger.debug(
+                "Invalid regime memory payload type at %s (type=%s); using defaults",
+                path,
+                type(payload).__name__,
+            )
             return _default_regime_memory()
         return payload
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Failed to read regime memory at %s: %s; using defaults", path, exc)
         return _default_regime_memory()
 
 
@@ -392,77 +401,91 @@ def _update_regime_memory(
     successful_batch: Optional[int] = None,
     oom_batch: Optional[int] = None,
 ) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
-            handle.seek(0)
-            raw = handle.read().strip()
-            if raw:
-                try:
-                    payload = json.loads(raw)
-                except Exception:  # noqa: BLE001
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                handle.seek(0)
+                raw = handle.read().strip()
+                if raw:
+                    try:
+                        payload = json.loads(raw)
+                    except Exception:  # noqa: BLE001
+                        logger.debug("Failed to parse regime memory JSON at %s; resetting to defaults", path)
+                        payload = _default_regime_memory()
+                else:
                     payload = _default_regime_memory()
-            else:
-                payload = _default_regime_memory()
-            if not isinstance(payload, dict):
-                payload = _default_regime_memory()
+                if not isinstance(payload, dict):
+                    logger.debug(
+                        "Invalid regime memory payload type at %s (type=%s); resetting to defaults",
+                        path,
+                        type(payload).__name__,
+                    )
+                    payload = _default_regime_memory()
 
-            payload.setdefault("global", {})
-            payload.setdefault("by_signature", {})
+                payload.setdefault("global", {})
+                payload.setdefault("by_signature", {})
 
-            global_state = payload["global"]
-            signature_state = payload["by_signature"].get(signature)
-            if not isinstance(signature_state, dict):
-                signature_state = {
-                    "success_count": 0,
-                    "failure_count": 0,
-                    "max_success_batch": None,
-                    "min_oom_batch": None,
-                }
+                global_state = payload["global"]
+                signature_state = payload["by_signature"].get(signature)
+                if not isinstance(signature_state, dict):
+                    signature_state = {
+                        "success_count": 0,
+                        "failure_count": 0,
+                        "max_success_batch": None,
+                        "min_oom_batch": None,
+                    }
 
-            if successful_batch is not None:
-                signature_state["success_count"] = int(signature_state.get("success_count", 0)) + 1
-                global_state["success_count"] = int(global_state.get("success_count", 0)) + 1
-                current_sig_max = signature_state.get("max_success_batch")
-                current_global_max = global_state.get("max_success_batch")
-                signature_state["max_success_batch"] = (
-                    successful_batch
-                    if current_sig_max is None
-                    else max(int(current_sig_max), successful_batch)
-                )
-                global_state["max_success_batch"] = (
-                    successful_batch
-                    if current_global_max is None
-                    else max(int(current_global_max), successful_batch)
-                )
+                if successful_batch is not None:
+                    signature_state["success_count"] = int(signature_state.get("success_count", 0)) + 1
+                    global_state["success_count"] = int(global_state.get("success_count", 0)) + 1
+                    current_sig_max = signature_state.get("max_success_batch")
+                    current_global_max = global_state.get("max_success_batch")
+                    signature_state["max_success_batch"] = (
+                        successful_batch
+                        if current_sig_max is None
+                        else max(int(current_sig_max), successful_batch)
+                    )
+                    global_state["max_success_batch"] = (
+                        successful_batch
+                        if current_global_max is None
+                        else max(int(current_global_max), successful_batch)
+                    )
 
-            if oom_batch is not None:
-                signature_state["failure_count"] = int(signature_state.get("failure_count", 0)) + 1
-                global_state["failure_count"] = int(global_state.get("failure_count", 0)) + 1
-                current_sig_min = signature_state.get("min_oom_batch")
-                current_global_min = global_state.get("min_oom_batch")
-                signature_state["min_oom_batch"] = (
-                    oom_batch
-                    if current_sig_min is None
-                    else min(int(current_sig_min), oom_batch)
-                )
-                global_state["min_oom_batch"] = (
-                    oom_batch
-                    if current_global_min is None
-                    else min(int(current_global_min), oom_batch)
-                )
+                if oom_batch is not None:
+                    signature_state["failure_count"] = int(signature_state.get("failure_count", 0)) + 1
+                    global_state["failure_count"] = int(global_state.get("failure_count", 0)) + 1
+                    current_sig_min = signature_state.get("min_oom_batch")
+                    current_global_min = global_state.get("min_oom_batch")
+                    signature_state["min_oom_batch"] = (
+                        oom_batch
+                        if current_sig_min is None
+                        else min(int(current_sig_min), oom_batch)
+                    )
+                    global_state["min_oom_batch"] = (
+                        oom_batch
+                        if current_global_min is None
+                        else min(int(current_global_min), oom_batch)
+                    )
 
-            payload["by_signature"][signature] = signature_state
-            payload["global"] = global_state
+                payload["by_signature"][signature] = signature_state
+                payload["global"] = global_state
 
-            handle.seek(0)
-            handle.truncate(0)
-            json.dump(payload, handle, indent=2, sort_keys=True)
-            handle.flush()
-            os.fsync(handle.fileno())
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                handle.seek(0)
+                handle.truncate(0)
+                json.dump(payload, handle, indent=2, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except Exception as exc:  # noqa: BLE001
+        if path not in _REGIME_MEMORY_WRITE_FAILURES:
+            logger.warning("Failed to update regime memory at %s: %s", path, exc)
+            _REGIME_MEMORY_WRITE_FAILURES.add(path)
+        else:
+            logger.debug("Failed to update regime memory at %s: %s", path, exc)
+        return
 
 
 def _compute_safe_batch_cap_from_memory(
@@ -1756,6 +1779,50 @@ def _apply_hyperparameters(base_config: Dict[str, Any], params: Dict[str, Any]) 
     return cfg
 
 
+def _resolve_best_params_for_final_training(best_trial: Any) -> tuple[Dict[str, Any], Optional[int], Optional[int]]:
+    """Resolve the best hyperparameters to apply to the final config.
+
+    In regime mode, the sampled batch size may be clamped (safe envelope) or
+    backed off (OOM retry). The objective value recorded for a trial therefore
+    corresponds to the **effective** batch size, not necessarily the originally
+    sampled one. To keep final training consistent with the evaluated trial, we
+    prefer the effective batch size when it is available.
+
+    Returns
+    -------
+    tuple
+        (best_params, requested_batch_size, effective_batch_size)
+    """
+
+    params_raw = getattr(best_trial, "params", None)
+    best_params = dict(params_raw) if isinstance(params_raw, dict) else {}
+
+    requested_batch_size: Optional[int] = None
+    if "batch_size" in best_params:
+        try:
+            requested_batch_size = int(best_params["batch_size"])
+        except (TypeError, ValueError):
+            requested_batch_size = None
+
+    user_attrs_raw = getattr(best_trial, "user_attrs", None)
+    user_attrs: Dict[str, Any] = user_attrs_raw if isinstance(user_attrs_raw, dict) else {}
+    effective_batch_size: Optional[int] = None
+    if user_attrs.get("batch_size_effective") is not None:
+        try:
+            effective_batch_size = int(user_attrs["batch_size_effective"])
+        except (TypeError, ValueError):
+            effective_batch_size = None
+
+    if (
+        effective_batch_size is not None
+        and effective_batch_size > 0
+        and "batch_size" in best_params
+    ):
+        best_params["batch_size"] = effective_batch_size
+
+    return best_params, requested_batch_size, effective_batch_size
+
+
 def run_hyperparameter_search(
     config: Dict[str, Any],
     data_object: Optional[Dict[str, Any]],
@@ -2327,11 +2394,28 @@ def run_hyperparameter_search(
         )
 
     best_trial = study.best_trial
-    best_params = dict(best_trial.params)
+    best_params, requested_batch_size, effective_batch_size = _resolve_best_params_for_final_training(best_trial)
     best_value = best_trial.value
     if best_value is None:
         raise ValueError("Optuna best trial has no objective value")
     best_value_float = float(best_value)
+
+    try:
+        best_trial_number = int(getattr(best_trial, "number"))
+    except Exception:  # noqa: BLE001
+        best_trial_number = None
+
+    if (
+        requested_batch_size is not None
+        and effective_batch_size is not None
+        and requested_batch_size != effective_batch_size
+    ):
+        logger.info(
+            "Best trial%s used effective batch_size=%s (requested=%s); applying effective batch size for final training.",
+            f" {best_trial_number}" if best_trial_number is not None else "",
+            effective_batch_size,
+            requested_batch_size,
+        )
 
     best_config = _apply_hyperparameters(config, best_params)
 
@@ -2346,6 +2430,10 @@ def run_hyperparameter_search(
             mlflow.log_param("hpo_n_trials", n_trials)
             mlflow.log_param("hpo_direction", direction)
             mlflow.log_param("hpo_metric", metric_name)
+            if requested_batch_size is not None:
+                mlflow.log_param("hpo_best_batch_size_requested", int(requested_batch_size))
+            if effective_batch_size is not None:
+                mlflow.log_param("hpo_best_batch_size_effective", int(effective_batch_size))
             for name, value in best_params.items():
                 mlflow.log_param(f"hpo_best_{name}", value)
             mlflow.log_metric("hpo_best_value", best_value_float)

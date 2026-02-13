@@ -25,6 +25,10 @@ logger = logging.getLogger(__name__)
 # Store the original working directory at module load time
 _ORIGINAL_CWD: Path = Path.cwd().resolve()
 
+# Track the run started by this module so end_run() does not
+# accidentally close runs started by other code.
+_STARTED_RUN_ID: Optional[str] = None
+
 
 def get_original_cwd() -> Path:
     """Return the original working directory from application startup.
@@ -131,7 +135,30 @@ def start_run(config: Dict[str, Any], run_name: Optional[str] = None):
         run_name,
     )
 
-    run = mlflow.start_run(run_name=run_name)
+    global _STARTED_RUN_ID
+
+    active = None
+    try:
+        active = mlflow.active_run()
+    except Exception:  # noqa: BLE001
+        active = None
+
+    if active is not None:
+        try:
+            active_id = getattr(getattr(active, "info", None), "run_id", None)
+        except Exception:  # noqa: BLE001
+            active_id = None
+        logger.info(
+            "MLFlow active run detected; reusing existing run. active_run_id=%s",
+            active_id,
+        )
+        run = active
+    else:
+        run = mlflow.start_run(run_name=run_name)
+        try:
+            _STARTED_RUN_ID = str(run.info.run_id)
+        except Exception:  # noqa: BLE001
+            _STARTED_RUN_ID = None
 
     try:
         snapshot_path = tmp_path / "training_config_effective.yaml"
@@ -178,12 +205,89 @@ def start_run(config: Dict[str, Any], run_name: Optional[str] = None):
     return run
 
 
-def end_run() -> None:
-    """End the active MLFlow run."""
+def end_run(expected_run_id: Optional[str] = None) -> None:
+    """End the active MLFlow run if it was started by this module.
+
+    Parameters
+    ----------
+    expected_run_id:
+        Optional run id returned by :func:`start_run`. When provided, this
+        function will only end the run if it matches the run started by this
+        module.
+    """
+
+    global _STARTED_RUN_ID
+    if _STARTED_RUN_ID is None:
+        logger.info("Skipping MLFlow end_run: no run was started by experiment_tracker.")
+        return
+
+    if expected_run_id is not None and str(expected_run_id) != str(_STARTED_RUN_ID):
+        logger.warning(
+            "Skipping MLFlow end_run: expected_run_id does not match started run. expected=%s started=%s",
+            expected_run_id,
+            _STARTED_RUN_ID,
+        )
+        return
 
     mlflow = _import_mlflow()
-    logger.info("Ending MLFlow run.")
-    mlflow.end_run()
+    active = None
+    try:
+        active = mlflow.active_run()
+    except Exception:  # noqa: BLE001
+        active = None
+
+    if active is None:
+        logger.info("Skipping MLFlow end_run: no active run.")
+        _STARTED_RUN_ID = None
+        return
+
+    try:
+        active_id = str(active.info.run_id)
+    except Exception:  # noqa: BLE001
+        active_id = None
+
+    if active_id == str(_STARTED_RUN_ID):
+        logger.info("Ending MLFlow run. run_id=%s", active_id)
+        mlflow.end_run()
+        _STARTED_RUN_ID = None
+        return
+
+    # If a nested run is still active, end it only when it clearly belongs
+    # to the run we started.
+    try:
+        tags = getattr(getattr(active, "data", None), "tags", None)
+        parent_id = tags.get("mlflow.parentRunId") if isinstance(tags, dict) else None
+    except Exception:  # noqa: BLE001
+        parent_id = None
+
+    if parent_id == str(_STARTED_RUN_ID):
+        logger.warning(
+            "Ending nested MLFlow run before ending parent. nested_run_id=%s parent_run_id=%s",
+            active_id,
+            parent_id,
+        )
+        mlflow.end_run()
+        # Try ending the parent if it becomes active.
+        try:
+            active2 = mlflow.active_run()
+        except Exception:  # noqa: BLE001
+            active2 = None
+        if active2 is not None:
+            try:
+                active2_id = str(active2.info.run_id)
+            except Exception:  # noqa: BLE001
+                active2_id = None
+            if active2_id == str(_STARTED_RUN_ID):
+                logger.info("Ending MLFlow run. run_id=%s", active2_id)
+                mlflow.end_run()
+        _STARTED_RUN_ID = None
+        return
+
+    logger.warning(
+        "Skipping MLFlow end_run: active run does not match started run. active=%s started=%s",
+        active_id,
+        _STARTED_RUN_ID,
+    )
 
 
 __all__ = ["start_run", "end_run", "get_original_cwd", "resolve_path_from_original_cwd"]

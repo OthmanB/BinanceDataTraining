@@ -23,6 +23,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from mlflow_integration.safe_fluent import get_mlflow_if_active
+
 logger = logging.getLogger(__name__)
 
 # Valid signal generation strategies
@@ -618,10 +620,9 @@ def log_backtest_to_mlflow(result: BacktestResult) -> None:
     Args:
         result: BacktestResult to log
     """
-    try:
-        import mlflow  # type: ignore[import]
-    except ImportError:
-        logger.warning("MLflow not available; skipping backtest logging")
+    mlflow = get_mlflow_if_active()
+    if mlflow is None:
+        logger.debug("Skipping MLFlow backtest logging: no active run.")
         return
 
     # Log metrics
