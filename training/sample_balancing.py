@@ -82,20 +82,38 @@ def resolve_undersampling_config(config: Dict[str, Any]) -> Optional[Undersampli
     selection_policy = str(undersampling_cfg.get("selection_policy") or "")
 
     target_raw = undersampling_cfg.get("target_distribution")
-    if not isinstance(target_raw, list) or not target_raw:
-        raise ConfigError(
-            "preprocessing.class_balancing.undersampling.target_distribution must be a non-empty list"
-        )
-    try:
-        target_distribution = tuple(float(v) for v in target_raw)
-    except (TypeError, ValueError) as exc:
-        raise ConfigError(
-            "preprocessing.class_balancing.undersampling.target_distribution must contain only numbers"
-        ) from exc
+    if isinstance(target_raw, str):
+        if target_raw.strip().lower() != "auto":
+            raise ConfigError(
+                "preprocessing.class_balancing.undersampling.target_distribution must be a list or 'auto'"
+            )
+        target_distribution = (0.0,)
+    else:
+        if not isinstance(target_raw, list) or not target_raw:
+            raise ConfigError(
+                "preprocessing.class_balancing.undersampling.target_distribution must be a non-empty list"
+            )
+        try:
+            target_distribution = tuple(float(v) for v in target_raw)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(
+                "preprocessing.class_balancing.undersampling.target_distribution must contain only numbers"
+            ) from exc
 
-    min_samples = int(undersampling_cfg.get("min_samples_after_balance"))
-    min_fraction = float(undersampling_cfg.get("min_fraction_after_balance"))
-    random_seed = int(undersampling_cfg.get("random_seed", 0))
+    min_samples_raw = undersampling_cfg.get("min_samples_after_balance")
+    if min_samples_raw is None:
+        raise ConfigError(
+            "preprocessing.class_balancing.undersampling.min_samples_after_balance is required when enabled"
+        )
+    min_samples = int(min_samples_raw)
+    min_fraction_raw = undersampling_cfg.get("min_fraction_after_balance")
+    if min_fraction_raw is None:
+        raise ConfigError(
+            "preprocessing.class_balancing.undersampling.min_fraction_after_balance is required when enabled"
+        )
+    min_fraction = float(min_fraction_raw)
+    random_seed_raw = undersampling_cfg.get("random_seed", 0)
+    random_seed = int(random_seed_raw)
 
     return UndersamplingConfig(
         labeling_criteria=labeling_criteria,
@@ -124,11 +142,12 @@ def compute_undersample_counts(
     ConfigError.
     """
 
-    if len(available_counts) != len(target_distribution):
-        raise ValueError("available_counts and target_distribution must have the same length")
-
     counts = [int(v) for v in available_counts]
     target = [float(v) for v in target_distribution]
+    if len(target) == 1 and target[0] == 0.0:
+        target = _auto_target_distribution(counts)
+    if len(counts) != len(target):
+        raise ValueError("available_counts and target_distribution must have the same length")
     if any(v < 0 for v in counts):
         raise ValueError("available_counts must be >= 0")
     if any(v < 0.0 for v in target):
@@ -183,6 +202,15 @@ def compute_undersample_counts(
         remaining -= 1
 
     return keep
+
+
+def _auto_target_distribution(available_counts: Sequence[int]) -> List[float]:
+    present = [int(v) > 0 for v in available_counts]
+    present_count = int(sum(1 for v in present if v))
+    if present_count <= 0:
+        raise ConfigError("Undersampling auto target_distribution requires at least one non-empty class")
+    weight = 100.0 / float(present_count)
+    return [weight if is_present else 0.0 for is_present in present]
 
 
 def _iter_chunk_ranges(

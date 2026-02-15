@@ -1942,29 +1942,41 @@ def run_hyperparameter_search(
             + int(pre_existing_counts["pruned"])
             + int(pre_existing_counts["failed"])
         )
+        pre_existing_running = int(pre_existing_counts["running"])
+        pre_existing_stale = pre_existing_finished + pre_existing_running
 
-        if pre_existing_finished > 0:
+        if pre_existing_stale > 0:
             if resume_study:
                 logger.info(
                     "Resuming existing study '%s' with %d pre-existing trials "
-                    "(completed=%d pruned=%d failed=%d). Only %d new trial(s) will be launched.",
+                    "(completed=%d pruned=%d failed=%d running=%d). "
+                    "Only %d new trial(s) will be launched.",
                     study_name,
-                    pre_existing_finished,
+                    pre_existing_stale,
                     pre_existing_counts["completed"],
                     pre_existing_counts["pruned"],
                     pre_existing_counts["failed"],
+                    pre_existing_running,
                     max(0, n_trials - pre_existing_finished),
                 )
+                if pre_existing_running > 0:
+                    logger.warning(
+                        "Study '%s' contains %d RUNNING trial(s). If they are stale from a previous interruption, "
+                        "set parallel.resume_study=false to reset the study cleanly.",
+                        study_name,
+                        pre_existing_running,
+                    )
             else:
                 logger.warning(
                     "Existing study '%s' has %d stale trials from a previous run "
-                    "(completed=%d pruned=%d failed=%d). Deleting and recreating study "
+                    "(completed=%d pruned=%d failed=%d running=%d). Deleting and recreating study "
                     "(set parallel.resume_study=true to keep them).",
                     study_name,
-                    pre_existing_finished,
+                    pre_existing_stale,
                     pre_existing_counts["completed"],
                     pre_existing_counts["pruned"],
                     pre_existing_counts["failed"],
+                    pre_existing_running,
                 )
                 optuna.delete_study(study_name=study_name, storage=storage_uri)
                 study = optuna.create_study(

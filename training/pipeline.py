@@ -190,9 +190,11 @@ def _resolve_undersampled_train_indices(
         num_classes=int(num_classes),
         labeling_criteria=str(undersampling_cfg.labeling_criteria),
     )
+    target_distribution = list(undersampling_cfg.target_distribution)
+    auto_target = len(target_distribution) == 1 and float(target_distribution[0]) == 0.0
     keep_counts = compute_undersample_counts(
         available_counts=available,
-        target_distribution=list(undersampling_cfg.target_distribution),
+        target_distribution=target_distribution,
     )
     selected = select_undersampled_indices(
         dataset=snapshot_dataset,
@@ -235,13 +237,14 @@ def _resolve_undersampled_train_indices(
         )
 
     logger.info(
-        "Preprocessing undersampling enabled: criteria=%s policy=%s train_end=%s available=%s keep=%s kept=%s",
+        "Preprocessing undersampling enabled: criteria=%s policy=%s train_end=%s available=%s keep=%s kept=%s auto=%s",
         undersampling_cfg.labeling_criteria,
         undersampling_cfg.selection_policy,
         int(train_end),
         available,
         keep_counts,
         int(selected.shape[0]),
+        bool(auto_target),
     )
 
     return selected

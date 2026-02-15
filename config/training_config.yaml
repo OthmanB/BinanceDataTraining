@@ -245,7 +245,7 @@ model:  # Defines the neural network architecture and its compilation settings.
 
   output:
     type: "two_head_intensity"  # Output head configuration: separate up/down intensity classifications.
-    num_classes: 4               # Number of classes per head; should equal len(targets.price_classes.boundaries) + 1.
+    num_classes: "auto"          # Number of classes per head; should equal len(targets.price_classes.boundaries) + 1.
     activation: "softmax"       # Activation for each classification head.
 
   compilation:

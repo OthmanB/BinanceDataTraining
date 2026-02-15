@@ -123,28 +123,36 @@ def _validate_class_balancing_config(config: Dict[str, Any]) -> None:
         )
 
     target_dist_raw = undersampling_cfg.get("target_distribution")
-    if not isinstance(target_dist_raw, list) or not target_dist_raw:
-        raise ConfigError(
-            "preprocessing.class_balancing.undersampling.target_distribution must be a non-empty list"
-        )
+    if isinstance(target_dist_raw, str):
+        if target_dist_raw.strip().lower() != "auto":
+            raise ConfigError(
+                "preprocessing.class_balancing.undersampling.target_distribution must be a list or 'auto'"
+            )
+        target_dist = None
+    else:
+        if not isinstance(target_dist_raw, list) or not target_dist_raw:
+            raise ConfigError(
+                "preprocessing.class_balancing.undersampling.target_distribution must be a non-empty list"
+            )
 
-    try:
-        target_dist = [float(v) for v in target_dist_raw]
-    except (TypeError, ValueError) as exc:
-        raise ConfigError(
-            "preprocessing.class_balancing.undersampling.target_distribution must contain only numbers"
-        ) from exc
+        try:
+            target_dist = [float(v) for v in target_dist_raw]
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(
+                "preprocessing.class_balancing.undersampling.target_distribution must contain only numbers"
+            ) from exc
 
-    if any(v < 0.0 for v in target_dist):
-        raise ConfigError(
-            "preprocessing.class_balancing.undersampling.target_distribution values must be >= 0"
-        )
+    if target_dist is not None:
+        if any(v < 0.0 for v in target_dist):
+            raise ConfigError(
+                "preprocessing.class_balancing.undersampling.target_distribution values must be >= 0"
+            )
 
-    total_weight = float(sum(target_dist))
-    if total_weight <= 0.0:
-        raise ConfigError(
-            "preprocessing.class_balancing.undersampling.target_distribution must have a positive sum"
-        )
+        total_weight = float(sum(target_dist))
+        if total_weight <= 0.0:
+            raise ConfigError(
+                "preprocessing.class_balancing.undersampling.target_distribution must have a positive sum"
+            )
 
     model_cfg = config.get("model")
     if not isinstance(model_cfg, dict):
@@ -153,18 +161,9 @@ def _validate_class_balancing_config(config: Dict[str, Any]) -> None:
     if not isinstance(output_cfg, dict):
         raise ConfigError("model.output must be a dict")
 
-    try:
-        num_classes_raw = output_cfg["num_classes"]
-    except KeyError as exc:
-        raise ConfigError("model.output.num_classes is required") from exc
-    try:
-        num_classes = int(num_classes_raw)
-    except (TypeError, ValueError) as exc:
-        raise ConfigError("model.output.num_classes must be an integer") from exc
-    if num_classes < 2:
-        raise ConfigError("model.output.num_classes must be >= 2")
+    num_classes = _resolve_output_num_classes(config)
 
-    if len(target_dist) != num_classes:
+    if target_dist is not None and len(target_dist) != num_classes:
         raise ConfigError(
             "preprocessing.class_balancing.undersampling.target_distribution length must equal model.output.num_classes: "
             f"len(target_distribution)={len(target_dist)}, num_classes={num_classes}"
@@ -237,10 +236,7 @@ def _validate_two_head_intensity_num_classes(config: Dict[str, Any]) -> None:
     if output_type != "two_head_intensity":
         return
 
-    try:
-        num_classes = int(output_cfg["num_classes"])
-    except Exception as exc:  # noqa: BLE001
-        raise ConfigError("model.output.num_classes must be an integer") from exc
+    num_classes = _resolve_output_num_classes(config)
 
     targets_cfg = config.get("targets")
     if not isinstance(targets_cfg, dict):
@@ -259,6 +255,49 @@ def _validate_two_head_intensity_num_classes(config: Dict[str, Any]) -> None:
             "model.output.num_classes must equal len(targets.price_classes.boundaries) + 1: "
             f"num_classes={num_classes}, boundaries_len={len(boundaries)}, expected={expected}"
         )
+
+
+def _resolve_output_num_classes(config: Dict[str, Any]) -> int:
+    model_cfg = config.get("model")
+    if not isinstance(model_cfg, dict):
+        raise ConfigError("model must be a dict")
+    output_cfg = model_cfg.get("output")
+    if not isinstance(output_cfg, dict):
+        raise ConfigError("model.output must be a dict")
+
+    try:
+        num_classes_raw = output_cfg["num_classes"]
+    except KeyError as exc:
+        raise ConfigError("model.output.num_classes is required") from exc
+
+    output_type = str(output_cfg.get("type") or "")
+    if isinstance(num_classes_raw, str):
+        if num_classes_raw.strip().lower() != "auto":
+            raise ConfigError("model.output.num_classes must be an integer or 'auto'")
+        if output_type != "two_head_intensity":
+            raise ConfigError(
+                "model.output.num_classes='auto' is only supported for model.output.type='two_head_intensity'"
+            )
+        targets_cfg = config.get("targets")
+        if not isinstance(targets_cfg, dict):
+            raise ConfigError("targets must be a dict")
+        price_classes_cfg = targets_cfg.get("price_classes")
+        if not isinstance(price_classes_cfg, dict):
+            raise ConfigError("targets.price_classes must be a dict")
+        boundaries = price_classes_cfg.get("boundaries")
+        if not isinstance(boundaries, list) or not boundaries:
+            raise ConfigError("targets.price_classes.boundaries must be a non-empty list")
+        num_classes = int(len(boundaries) + 1)
+        output_cfg["num_classes"] = num_classes
+        return num_classes
+
+    try:
+        num_classes = int(num_classes_raw)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("model.output.num_classes must be an integer") from exc
+    if num_classes < 2:
+        raise ConfigError("model.output.num_classes must be >= 2")
+    return num_classes
 
 
 def _validate_model_layer_configs(config: Dict[str, Any]) -> None:
@@ -908,8 +947,8 @@ def load_config(
 
     _validate_config_schema(resolved_config, schema)
 
-    _validate_class_balancing_config(resolved_config)
     _validate_two_head_intensity_num_classes(resolved_config)
+    _validate_class_balancing_config(resolved_config)
     _validate_model_layer_configs(resolved_config)
     _validate_market_session_sessions(resolved_config)
     _validate_multi_database_connections(resolved_config)

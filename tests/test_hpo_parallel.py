@@ -26,10 +26,101 @@ from models.hyperparameter_tuning import (
     _resolve_regime_settings,
     _resolve_worker_runtime_options,
     _update_adaptive_scheduler_state,
+    run_hyperparameter_search,
 )
 
 
 class TestHPOParallelHelpers(unittest.TestCase):
+    def test_run_hyperparameter_search_resets_study_with_stale_running_trials(self) -> None:
+        class _FakeTrial:
+            def __init__(self, state_name: str, number: int, value: float) -> None:
+                self.state = types.SimpleNamespace(name=state_name)
+                self.number = int(number)
+                self.value = float(value)
+                self.params = {"batch_size": 8}
+                self.user_attrs = {"batch_size_effective": 8}
+                self.datetime_start = None
+                self.datetime_complete = None
+
+        class _FakeStudy:
+            def __init__(self, trials: list[object], best_trial: object) -> None:
+                self.trials = trials
+                self.best_trial = best_trial
+
+        stale_running = _FakeStudy(
+            trials=[_FakeTrial("RUNNING", 0, 0.0)],
+            best_trial=_FakeTrial("RUNNING", 0, 0.0),
+        )
+
+        complete_a = _FakeTrial("COMPLETE", 1, 0.8)
+        complete_b = _FakeTrial("COMPLETE", 2, 0.7)
+        clean_study = _FakeStudy(trials=[complete_a, complete_b], best_trial=complete_b)
+
+        create_calls: list[dict] = []
+        delete_calls: list[dict] = []
+
+        def _create_study(*, direction: str, study_name: str, storage: str, load_if_exists: bool = False):
+            create_calls.append(
+                {
+                    "direction": direction,
+                    "study_name": study_name,
+                    "storage": storage,
+                    "load_if_exists": bool(load_if_exists),
+                }
+            )
+            if load_if_exists:
+                return stale_running
+            return clean_study
+
+        def _delete_study(*, study_name: str, storage: str) -> None:
+            delete_calls.append({"study_name": study_name, "storage": storage})
+
+        fake_optuna = types.SimpleNamespace(
+            create_study=_create_study,
+            load_study=lambda **_kwargs: clean_study,
+            delete_study=_delete_study,
+        )
+
+        config = {
+            "snapshot": {"enabled": False},
+            "mlflow": {"local_tmp_dir": "/tmp"},
+            "hyperparameter_optimization": {
+                "enabled": True,
+                "framework": "optuna",
+                "n_trials": 2,
+                "direction": "minimize",
+                "metric": "loss",
+                "trial_model_logging": {"enabled": False},
+                "search_space": {"batch_size": [8, 16]},
+                "parallel": {
+                    "enabled": True,
+                    "max_trials_per_worker_process": 1,
+                    "resources": ["gpu:0"],
+                    "storage_uri": "sqlite:////tmp/test_hpo_stale_running.db",
+                    "study_name": "test_hpo_stale_running",
+                    "resume_study": False,
+                },
+            },
+        }
+
+        with mock.patch.dict("sys.modules", {"optuna": fake_optuna}):
+            with mock.patch("models.hyperparameter_tuning._apply_hyperparameters", side_effect=lambda cfg, _p: copy.deepcopy(cfg)):
+                with mock.patch(
+                    "models.hyperparameter_tuning._resolve_best_params_for_final_training",
+                    return_value=({"batch_size": 8}, 8, 8),
+                ):
+                    with mock.patch("observability.run_state.get_run_state_writer", return_value=None):
+                        with mock.patch("models.hyperparameter_tuning._try_import_mlflow", return_value=None):
+                            best_config = run_hyperparameter_search(config, data_object=None)
+
+        self.assertIsInstance(best_config, dict)
+        self.assertEqual(len(delete_calls), 1)
+        self.assertEqual(delete_calls[0]["study_name"], "test_hpo_stale_running")
+        self.assertEqual(delete_calls[0]["storage"], "sqlite:////tmp/test_hpo_stale_running.db")
+        self.assertGreaterEqual(len(create_calls), 2)
+        self.assertTrue(bool(create_calls[0]["load_if_exists"]))
+        self.assertFalse(bool(create_calls[1]["load_if_exists"]))
+
     def test_allocate_trials_balanced(self) -> None:
         self.assertEqual(_allocate_trials_to_workers(7, 3), [3, 2, 2])
 

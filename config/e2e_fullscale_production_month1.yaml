@@ -33,16 +33,17 @@ model:
         pool_size: [2, 1]
         normalization: null
         dropout: 0.
-      - filters: 128
-        kernel_size: [3, 3]
-        pool_size: [2, 1]
-        normalization: null
-        dropout: 0.3
-#      - filters: 256
+#      - filters: 128
 #        kernel_size: [3, 3]
 #        pool_size: [2, 1]
 #        normalization: null
-#        dropout: 0.25
+#        dropout: 0.3
+  lstm:
+    layers:                       # Per-layer configuration; supports stacked LSTMs.
+      - units: 96                 # Number of hidden units in this LSTM layer.
+        dropout: 0.              # Keras LSTM input dropout.
+        recurrent_dropout: 0.0    # Recurrent dropout; keep 0.0 for cuDNN acceleration.
+        post_dropout: 0.2         # Standalone Dropout layer after this LSTM; 0.0 to skip.
   long_term:
     enabled: true
     windows_days: [3, 7]
@@ -96,7 +97,7 @@ hyperparameter_optimization:
     retry_on_oom: true
     max_retry_attempts: 2
     batch_backoff_factor: 0.6
-    min_batch_size: 8
+    min_batch_size: 2
     failure_policy: "prune"
     failure_penalty_value: 1000000.0
     max_vram_fraction: 0.93
@@ -110,6 +111,16 @@ hyperparameter_optimization:
       min_success_trials: 2
       headroom_fraction: 1.0
       persistence_enabled: true
+  search_space:
+    cnn:                            # Per-layer CNN search ranges; list index matches model.cnn.layers index.
+      - filters: [8, 24]         # Integer range [low, high] for CNN layer 0 filters.
+      - filters: [24, 64]         # Integer range for CNN layer 1 filters.
+      - filters: [64, 128]
+    lstm:                           # Per-layer LSTM search ranges; list index matches model.lstm.layers index.
+      - units: [16, 96]           # Integer range for LSTM layer 0 units.
+    learning_rate: [0.0001, 0.01]   # Continuous range [low, high] for learning rate; third entry can be "log" for log scale.
+    batch_size: [2, 4, 8]        # Batch-size candidates; list can encode either a range or categorical set.
+
 
 snapshot:
   enabled: true

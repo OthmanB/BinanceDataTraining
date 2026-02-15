@@ -146,6 +146,43 @@ preprocessing:
                         schema_path="config/validation_schema.yaml",
                     )
 
+    def test_class_balancing_accepts_auto_target_distribution(self) -> None:
+        base_config_path = os.path.abspath("config/training_config.yaml")
+        override_yaml = f"""
+base_config: "{base_config_path}"
+preprocessing:
+  class_balancing:
+    enabled: true
+    method: "undersampling"
+    undersampling:
+      target_distribution: "auto"
+      labeling_criteria: "max_intensity"
+      selection_policy: "uniform_time"
+      min_samples_after_balance: 1
+      min_fraction_after_balance: 0.01
+"""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            override_path = Path(tmpdir) / "override_auto_target_distribution.yaml"
+            override_path.write_text(override_yaml, encoding="utf-8")
+
+            env = {
+                "DATABASE_URI": "http://example-db",
+                "DATABASE_URI_HIST": "http://example-db-hist",
+                "DATABASE_URI_LIVE": "http://example-db-live",
+                "MLFLOW_TRACKING_URI": "http://mlflow",
+            }
+            with mock.patch.dict(os.environ, env, clear=False):
+                cfg = load_config(
+                    config_path=str(override_path),
+                    schema_path="config/validation_schema.yaml",
+                )
+
+        self.assertEqual(
+            str(cfg["preprocessing"]["class_balancing"]["undersampling"]["target_distribution"]),
+            "auto",
+        )
+
     def test_two_head_intensity_num_classes_mismatch_raises(self) -> None:
         base_config_path = os.path.abspath("config/training_config.yaml")
         override_yaml = f"""
@@ -171,6 +208,36 @@ targets:
                         config_path=str(override_path),
                         schema_path="config/validation_schema.yaml",
                     )
+
+    def test_output_num_classes_auto_resolves(self) -> None:
+        base_config_path = os.path.abspath("config/training_config.yaml")
+        override_yaml = f"""
+base_config: "{base_config_path}"
+targets:
+  price_classes:
+    boundaries: [0.1, 0.2, 0.4]
+model:
+  output:
+    num_classes: "auto"
+"""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            override_path = Path(tmpdir) / "override_auto_num_classes.yaml"
+            override_path.write_text(override_yaml, encoding="utf-8")
+
+            env = {
+                "DATABASE_URI": "http://example-db",
+                "DATABASE_URI_HIST": "http://example-db-hist",
+                "DATABASE_URI_LIVE": "http://example-db-live",
+                "MLFLOW_TRACKING_URI": "http://mlflow",
+            }
+            with mock.patch.dict(os.environ, env, clear=False):
+                cfg = load_config(
+                    config_path=str(override_path),
+                    schema_path="config/validation_schema.yaml",
+                )
+
+        self.assertEqual(int(cfg["model"]["output"]["num_classes"]), 4)
 
     def test_model_cnn_layer_unknown_key_raises(self) -> None:
         base_config_path = os.path.abspath("config/training_config.yaml")

@@ -165,7 +165,7 @@ sections:
       class_balancing.undersampling.labeling_criteria:
         type: string
       class_balancing.undersampling.target_distribution:
-        type: list
+        type: any
       class_balancing.undersampling.selection_policy:
         type: string
       class_balancing.undersampling.min_samples_after_balance:
@@ -203,7 +203,7 @@ sections:
       output.type:
         type: string
       output.num_classes:
-        type: integer
+        type: any
       output.activation:
         type: string
       compilation.optimizer:

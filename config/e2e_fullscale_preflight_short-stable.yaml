@@ -1,0 +1,20 @@
+base_config: "e2e_fullscale_preflight_short.yaml"
+
+training:
+  runtime:
+    gpu_allocator: "default"
+
+hyperparameter_optimization:
+  parallel:
+    resources: ["gpu:0"]
+    max_trials_per_worker_process: 2
+    storage_uri: "sqlite:////home/obenomar/Trade/BinanceAlgo/BinanceDataTraining/tmp/mlflow/optuna/fullscale_preflight_short_stable.db"
+    study_name: "e2e_fullscale_preflight_short_stable"
+    resume_study: false
+
+  regime:
+    retry_on_oom: false
+    max_retry_attempts: 0
+
+  search_space:
+    batch_size: [8, 10, 12]

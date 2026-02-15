@@ -122,13 +122,21 @@ class TestSampleBalancing(unittest.TestCase):
                 random_seed=123,
             )
 
-            self.assertEqual(int(selected.shape[0]), 4)
-            self.assertTrue(bool(np.all(selected[:-1] <= selected[1:])))
+        self.assertEqual(int(selected.shape[0]), 4)
+        self.assertTrue(bool(np.all(selected[:-1] <= selected[1:])))
 
             # Validate per-class counts from selected indices.
             y_bal = y_up[selected]
-            binc = np.bincount(y_bal, minlength=4)
-            self.assertEqual(binc.tolist(), keep)
+        binc = np.bincount(y_bal, minlength=4)
+        self.assertEqual(binc.tolist(), keep)
+
+    def test_compute_undersample_counts_auto_skips_missing_classes(self) -> None:
+        counts = [10, 0, 4, 0]
+        keep = compute_undersample_counts(
+            available_counts=counts,
+            target_distribution=[0.0],
+        )
+        self.assertEqual(keep, [4, 0, 4, 0])
 
 
 if __name__ == "__main__":  # pragma: no cover

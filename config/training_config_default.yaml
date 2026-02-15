@@ -128,7 +128,7 @@ targets:  # Defines what future event the model predicts and how labels are cons
 
   price_classes:
     definition_type: "percentage"  # How price-move bins are defined: by percentage, absolute size, or adaptive rules.
-    boundaries: [0.1, 0.2, 0.4, 0.6, 1., 2.0]    # Ordered boundaries (in percent) that split price moves into intensity classes.
+    boundaries: [0.1, 0.2, 0.4, 0.6, 1.5]    # Ordered boundaries (in percent) that split price moves into intensity classes.
 
   labeling:
     scheme: "two_head_intensity"   # Label scheme: separate up/down intensity heads with discretised classes.
@@ -219,20 +219,11 @@ model:  # Defines the neural network architecture and its compilation settings.
         pool_size: [2, 2]
         normalization: null
         dropout: 0.3
-      - filters: 256
-        kernel_size: [3, 3]
-        pool_size: [2, 2]
-        normalization: null
-        dropout: 0.25
 
   lstm:
     layers:                       # Per-layer configuration; supports stacked LSTMs.
       - units: 96                 # Number of hidden units in this LSTM layer.
-        dropout: 0.3              # Keras LSTM input dropout.
-        recurrent_dropout: 0.0    # Recurrent dropout; keep 0.0 for cuDNN acceleration.
-        post_dropout: 0.2         # Standalone Dropout layer after this LSTM; 0.0 to skip.
-      - units: 128                 # Number of hidden units in this LSTM layer.
-        dropout: 0.3              # Keras LSTM input dropout.
+        dropout: 0.              # Keras LSTM input dropout.
         recurrent_dropout: 0.0    # Recurrent dropout; keep 0.0 for cuDNN acceleration.
         post_dropout: 0.2         # Standalone Dropout layer after this LSTM; 0.0 to skip.
 
@@ -264,7 +255,7 @@ model:  # Defines the neural network architecture and its compilation settings.
 
   output:
     type: "two_head_intensity"  # Output head configuration: separate up/down intensity classifications.
-    num_classes: 7               # Number of classes per head; should equal len(targets.price_classes.boundaries) + 1.
+    num_classes: "auto"          # Number of classes per head; should equal len(targets.price_classes.boundaries) + 1.
     activation: "softmax"       # Activation for each classification head.
 
   compilation:
@@ -391,15 +382,12 @@ hyperparameter_optimization:  # Controls Optuna-based search over selected hyper
   search_space:
     cnn:                            # Per-layer CNN search ranges; list index matches model.cnn.layers index.
       - filters: [8, 24]         # Integer range [low, high] for CNN layer 0 filters.
-      - filters: [24, 48]         # Integer range for CNN layer 1 filters.
-      - filters: [48, 96]
-      - filters: [96, 156]
-#      - filters: [156, 384]
+      - filters: [24, 64]         # Integer range for CNN layer 1 filters.
+      - filters: [64, 256]
     lstm:                           # Per-layer LSTM search ranges; list index matches model.lstm.layers index.
       - units: [16, 96]           # Integer range for LSTM layer 0 units.
-      - units: [96, 256]
     learning_rate: [0.0001, 0.01]   # Continuous range [low, high] for learning rate; third entry can be "log" for log scale.
-    batch_size: [8, 16, 24, 32]        # Batch-size candidates; list can encode either a range or categorical set.
+    batch_size: [4, 8, 16]        # Batch-size candidates; list can encode either a range or categorical set.
 
 # MLFlow Configuration
 mlflow:  # Experiment tracking and model registry configuration.
