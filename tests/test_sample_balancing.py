@@ -10,6 +10,7 @@ import numpy as np
 
 from training.sample_balancing import (
     compute_available_class_counts,
+    compute_class_counts_for_indices,
     compute_undersample_counts,
     select_undersampled_indices,
 )
@@ -125,10 +126,48 @@ class TestSampleBalancing(unittest.TestCase):
         self.assertEqual(int(selected.shape[0]), 4)
         self.assertTrue(bool(np.all(selected[:-1] <= selected[1:])))
 
-            # Validate per-class counts from selected indices.
-            y_bal = y_up[selected]
+        # Validate per-class counts from selected indices.
+        y_bal = y_up[selected]
         binc = np.bincount(y_bal, minlength=4)
         self.assertEqual(binc.tolist(), keep)
+
+    def test_compute_class_counts_for_indices_matches_available_on_full_range(self) -> None:
+        y_up = np.array([0, 0, 1, 1, 2, 2, 3, 3, 3, 3], dtype="int64")
+        y_down = np.zeros_like(y_up)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            chunk_path = self._make_npz_chunk(tmp, "chunk.npz", y_up=y_up, y_down=y_down)
+            chunk = SnapshotChunk(
+                start="2024-01-01 00:00:00",
+                end="2024-01-01 01:00:00",
+                file_path=chunk_path,
+                num_samples=int(y_up.shape[0]),
+                start_index=0,
+            )
+            dataset = SnapshotDataset(
+                snapshot_dir=tmp,
+                manifest={"chunks": []},
+                chunks=[chunk],
+                total_samples=int(y_up.shape[0]),
+                config_hash="hash",
+            )
+
+            all_indices = np.arange(0, int(y_up.shape[0]), dtype="int64")
+            by_range = compute_available_class_counts(
+                dataset=dataset,
+                start_index=0,
+                end_index=int(y_up.shape[0]),
+                num_classes=4,
+                labeling_criteria="max_intensity",
+            )
+            by_indices = compute_class_counts_for_indices(
+                dataset=dataset,
+                indices=all_indices,
+                num_classes=4,
+                labeling_criteria="max_intensity",
+            )
+
+            self.assertEqual(by_indices, by_range)
 
     def test_compute_undersample_counts_auto_skips_missing_classes(self) -> None:
         counts = [10, 0, 4, 0]

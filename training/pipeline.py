@@ -63,6 +63,104 @@ from .long_term_context import (
 logger = logging.getLogger(__name__)
 
 
+def _format_intensity_class_labels(config: Dict[str, Any], *, num_classes: Optional[int] = None) -> List[str]:
+    """Return human-readable intensity class labels based on targets.price_classes.boundaries.
+
+    Labels are aligned with two-head intensity bins: class 0 is the smallest
+    magnitude (<= first boundary) and the last class is the overflow bin.
+    """
+    targets_cfg = config.get("targets")
+    if not isinstance(targets_cfg, dict):
+        raise ConfigError("targets must be a dict")
+    price_classes_cfg = targets_cfg.get("price_classes")
+    if not isinstance(price_classes_cfg, dict):
+        raise ConfigError("targets.price_classes must be a dict")
+    boundaries = price_classes_cfg.get("boundaries")
+    if not isinstance(boundaries, list) or not boundaries:
+        raise ConfigError("targets.price_classes.boundaries must be a non-empty list")
+
+    boundaries_f = [float(b) for b in boundaries]
+    if len(boundaries_f) != len(boundaries):
+        raise ConfigError("targets.price_classes.boundaries must be numeric")
+    if any(v <= 0.0 for v in boundaries_f):
+        raise ConfigError("targets.price_classes.boundaries must be > 0")
+    if any(boundaries_f[i] >= boundaries_f[i + 1] for i in range(len(boundaries_f) - 1)):
+        raise ConfigError("targets.price_classes.boundaries must be strictly increasing")
+
+    def _fmt(v: float) -> str:
+        s = f"{v:g}"
+        return s if s else str(v)
+
+    labels: List[str] = []
+    first = boundaries_f[0]
+    labels.append(f"0 < x <= {_fmt(first)}")
+    for left, right in zip(boundaries_f[:-1], boundaries_f[1:]):
+        labels.append(f"{_fmt(left)} < x <= {_fmt(right)}")
+    labels.append(f"x > {_fmt(boundaries_f[-1])}")
+
+    if num_classes is not None and int(num_classes) != len(labels):
+        raise ConfigError(
+            "targets.price_classes.boundaries length must match model.output.num_classes-1: "
+            f"boundaries_len={len(boundaries_f)}, num_classes={int(num_classes)}, expected={len(boundaries_f) + 1}"
+        )
+    return labels
+
+
+def _render_simple_table(headers: List[str], rows: List[List[str]]) -> str:
+    if not headers:
+        return ""
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for idx, cell in enumerate(row):
+            if idx >= len(widths):
+                continue
+            widths[idx] = max(widths[idx], len(cell))
+
+    def _fmt_row(values: List[str]) -> str:
+        padded = [values[i].ljust(widths[i]) for i in range(len(widths))]
+        return "| " + " | ".join(padded) + " |"
+
+    sep = "| " + " | ".join("-" * w for w in widths) + " |"
+    out_lines = [_fmt_row(headers), sep]
+    for row in rows:
+        row_norm = row + [""] * (len(headers) - len(row))
+        out_lines.append(_fmt_row(row_norm[: len(headers)]))
+    return "\n".join(out_lines)
+
+
+def _emit_label_distribution_tables(
+    config: Dict[str, Any],
+    *,
+    split_name: str,
+    dist: Any,
+    title: str,
+) -> None:
+    """Log a readable label distribution table at INFO level."""
+
+    if dist is None:
+        return
+    try:
+        num_classes = int(getattr(dist, "num_classes"))
+        total = int(getattr(dist, "total_samples"))
+        up_counts = getattr(dist, "up_counts")
+        down_counts = getattr(dist, "down_counts")
+        if not isinstance(up_counts, dict) or not isinstance(down_counts, dict):
+            return
+        up = [int(up_counts.get(c, 0)) for c in range(num_classes)]
+        down = [int(down_counts.get(c, 0)) for c in range(num_classes)]
+
+        labels = _format_intensity_class_labels(config, num_classes=num_classes)
+        headers = ["split", "head", "total", *labels]
+        rows = [
+            [str(split_name), "up", str(total), *[str(v) for v in up]],
+            [str(split_name), "down", str(total), *[str(v) for v in down]],
+        ]
+        table = _render_simple_table(headers, rows)
+        logger.info("%s\n%s", str(title), table)
+    except Exception:  # noqa: BLE001
+        logger.debug("Failed to render label distribution table", exc_info=True)
+
+
 def _emit_hpo_phase_memory_probe(
     config: Dict[str, Any],
     phase: str,
@@ -174,6 +272,7 @@ def _resolve_undersampled_train_indices(
 
     from training.sample_balancing import (
         compute_available_class_counts,
+        compute_class_counts_for_indices,
         compute_undersample_counts,
         resolve_undersampling_config,
         select_undersampled_indices,
@@ -214,26 +313,68 @@ def _resolve_undersampled_train_indices(
     steps = int(selected.shape[0]) // int(batch_size)
     usable = int(steps * int(batch_size))
     if usable <= 0:
+        kept_counts = compute_class_counts_for_indices(
+            dataset=snapshot_dataset,
+            indices=selected,
+            num_classes=int(num_classes),
+            labeling_criteria=str(undersampling_cfg.labeling_criteria),
+        )
+        class_labels = _format_intensity_class_labels(config, num_classes=int(num_classes))
+        headers = ["class", *class_labels]
+        before_row = ["Nsamples before filter", *[str(int(v)) for v in available]]
+        after_row = ["Nsamples after filter", *[str(int(v)) for v in kept_counts]]
+        table = _render_simple_table(headers, [before_row, after_row])
+
         raise ConfigError(
-            "Undersampling produced too few samples to form a full batch: "
-            f"kept={int(selected.shape[0])}, batch_size={int(batch_size)}"
+            "Undersampling constraint violated (limit hit: full_batch_required). "
+            f"kept={int(selected.shape[0])}, batch_size={int(batch_size)}.\n"
+            f"Class breakdown (labeling_criteria={undersampling_cfg.labeling_criteria!r}):\n{table}"
         )
 
     selected = np.asarray(selected[:usable], dtype="int64")
 
     min_samples = int(undersampling_cfg.min_samples_after_balance)
     if int(selected.shape[0]) < min_samples:
+        kept_counts = compute_class_counts_for_indices(
+            dataset=snapshot_dataset,
+            indices=selected,
+            num_classes=int(num_classes),
+            labeling_criteria=str(undersampling_cfg.labeling_criteria),
+        )
+        class_labels = _format_intensity_class_labels(config, num_classes=int(num_classes))
+        headers = ["class", *class_labels]
+        before_row = ["Nsamples before filter", *[str(int(v)) for v in available]]
+        after_row = ["Nsamples after filter", *[str(int(v)) for v in kept_counts]]
+        table = _render_simple_table(headers, [before_row, after_row])
+
         raise ConfigError(
-            "Undersampling kept too few samples for training: "
-            f"kept={int(selected.shape[0])} < min_samples_after_balance={min_samples}"
+            "Undersampling constraint violated (limit hit: min_samples_after_balance). "
+            f"kept={int(selected.shape[0])} < min_samples_after_balance={min_samples}.\n"
+            f"Class breakdown (labeling_criteria={undersampling_cfg.labeling_criteria!r}):\n{table}"
         )
 
     min_fraction = float(undersampling_cfg.min_fraction_after_balance)
     if train_end > 0 and float(selected.shape[0]) < float(train_end) * min_fraction:
+        kept_counts = compute_class_counts_for_indices(
+            dataset=snapshot_dataset,
+            indices=selected,
+            num_classes=int(num_classes),
+            labeling_criteria=str(undersampling_cfg.labeling_criteria),
+        )
+        class_labels = _format_intensity_class_labels(config, num_classes=int(num_classes))
+        headers = ["class", *class_labels]
+        before_row = ["Nsamples before filter", *[str(int(v)) for v in available]]
+        after_row = ["Nsamples after filter", *[str(int(v)) for v in kept_counts]]
+        table = _render_simple_table(headers, [before_row, after_row])
+
+        kept = int(selected.shape[0])
+        train_n = int(train_end)
+        fraction = float(kept) / float(train_n) if train_n > 0 else 0.0
         raise ConfigError(
-            "Undersampling kept too small a fraction of training samples: "
-            f"kept={int(selected.shape[0])}, train_end={int(train_end)}, "
-            f"min_fraction_after_balance={min_fraction}"
+            "Undersampling constraint violated (limit hit: min_fraction_after_balance). "
+            f"kept/train_end={fraction:.6f} < min_fraction_after_balance={min_fraction}. "
+            f"kept={kept}, train_end={train_n}.\n"
+            f"Class breakdown (labeling_criteria={undersampling_cfg.labeling_criteria!r}):\n{table}"
         )
 
     logger.info(
@@ -717,6 +858,50 @@ def _fit_snapshot_model_once(
         effective_train_n
     )
 
+    # Emit label distributions regardless of whether constraints were violated.
+    try:
+        if balanced_train_indices is not None:
+            train_dist = compute_label_distribution_for_indices(
+                snapshot_dataset,
+                indices=balanced_train_indices,
+                num_classes=num_classes,
+            )
+            _emit_label_distribution_tables(
+                config,
+                split_name="train(undersampled)",
+                dist=train_dist,
+                title="Label distribution (effective train after undersampling)",
+            )
+        else:
+            train_dist = compute_label_distribution(
+                snapshot_dataset,
+                start_index=0,
+                end_index=effective_train_n,
+                num_classes=num_classes,
+            )
+            _emit_label_distribution_tables(
+                config,
+                split_name="train",
+                dist=train_dist,
+                title="Label distribution (train)",
+            )
+
+        if val_count > 0:
+            val_dist = compute_label_distribution(
+                snapshot_dataset,
+                start_index=val_start,
+                end_index=val_end,
+                num_classes=num_classes,
+            )
+            _emit_label_distribution_tables(
+                config,
+                split_name="val",
+                dist=val_dist,
+                title="Label distribution (val)",
+            )
+    except Exception:  # noqa: BLE001
+        logger.debug("Failed to compute label distributions", exc_info=True)
+
     class_weights_up: Optional[Dict[int, float]] = None
     class_weights_down: Optional[Dict[int, float]] = None
     if use_class_weights:
@@ -997,6 +1182,13 @@ def _run_snapshot_training_pipeline_sequential(
     start_window_index = 0
     state_path, resume_model_path = _resolve_sequential_resume_paths(config, windows)
 
+    aggregated_train_up: Optional[Dict[int, int]] = None
+    aggregated_train_down: Optional[Dict[int, int]] = None
+    aggregated_val_up: Optional[Dict[int, int]] = None
+    aggregated_val_down: Optional[Dict[int, int]] = None
+    aggregated_train_total = 0
+    aggregated_val_total = 0
+
     if resume_enabled:
         resume_state = _load_sequential_resume_state(state_path)
         if resume_state is not None:
@@ -1075,6 +1267,65 @@ def _run_snapshot_training_pipeline_sequential(
         )
 
         snapshot_dataset = prepare_snapshot_dataset(window_config)
+
+        # Emit per-window label distribution before training.
+        try:
+            output_cfg = window_config["model"]["output"]
+            num_classes = int(output_cfg["num_classes"])
+            n_samples = int(snapshot_dataset.total_samples)
+            split_indices = _resolve_snapshot_training_indices(window_config, n_samples)
+            if split_indices is not None:
+                train_end, val_start, val_end = split_indices
+                val_count = max(0, int(val_end) - int(val_start))
+
+                train_dist = compute_label_distribution(
+                    snapshot_dataset,
+                    start_index=0,
+                    end_index=int(train_end),
+                    num_classes=num_classes,
+                )
+                _emit_label_distribution_tables(
+                    window_config,
+                    split_name=f"window{idx + 1}:train",
+                    dist=train_dist,
+                    title=f"Label distribution (window {idx + 1} train)",
+                )
+
+                if aggregated_train_up is None:
+                    aggregated_train_up = {c: 0 for c in range(num_classes)}
+                    aggregated_train_down = {c: 0 for c in range(num_classes)}
+                    aggregated_val_up = {c: 0 for c in range(num_classes)}
+                    aggregated_val_down = {c: 0 for c in range(num_classes)}
+
+                for c in range(num_classes):
+                    assert aggregated_train_up is not None
+                    assert aggregated_train_down is not None
+                    aggregated_train_up[c] += int(train_dist.up_counts.get(c, 0))
+                    aggregated_train_down[c] += int(train_dist.down_counts.get(c, 0))
+                aggregated_train_total += int(train_dist.total_samples)
+
+                if val_count > 0:
+                    val_dist = compute_label_distribution(
+                        snapshot_dataset,
+                        start_index=int(val_start),
+                        end_index=int(val_end),
+                        num_classes=num_classes,
+                    )
+                    _emit_label_distribution_tables(
+                        window_config,
+                        split_name=f"window{idx + 1}:val",
+                        dist=val_dist,
+                        title=f"Label distribution (window {idx + 1} val)",
+                    )
+                    for c in range(num_classes):
+                        assert aggregated_val_up is not None
+                        assert aggregated_val_down is not None
+                        aggregated_val_up[c] += int(val_dist.up_counts.get(c, 0))
+                        aggregated_val_down[c] += int(val_dist.down_counts.get(c, 0))
+                    aggregated_val_total += int(val_dist.total_samples)
+        except Exception:  # noqa: BLE001
+            logger.debug("Failed to compute per-window label distributions", exc_info=True)
+
         model, epochs_ran, hpo_metric_value, hpo_metric_weight = _fit_snapshot_model_once(
             window_config,
             snapshot_dataset,
@@ -1117,6 +1368,37 @@ def _run_snapshot_training_pipeline_sequential(
         logger.info("Sequential snapshot training completed with no trainable windows.")
         return None
 
+    # Emit aggregated label distribution across processed windows.
+    try:
+        if aggregated_train_up is not None and aggregated_train_down is not None:
+            class_count = len(aggregated_train_up)
+            train_dist = type("_AggDist", (), {})()
+            setattr(train_dist, "num_classes", class_count)
+            setattr(train_dist, "total_samples", int(aggregated_train_total))
+            setattr(train_dist, "up_counts", dict(aggregated_train_up))
+            setattr(train_dist, "down_counts", dict(aggregated_train_down))
+            _emit_label_distribution_tables(
+                config,
+                split_name="train",
+                dist=train_dist,
+                title="Label distribution (aggregated across windows, train)",
+            )
+        if aggregated_val_up is not None and aggregated_val_down is not None and aggregated_val_total > 0:
+            class_count = len(aggregated_val_up)
+            val_dist = type("_AggDist", (), {})()
+            setattr(val_dist, "num_classes", class_count)
+            setattr(val_dist, "total_samples", int(aggregated_val_total))
+            setattr(val_dist, "up_counts", dict(aggregated_val_up))
+            setattr(val_dist, "down_counts", dict(aggregated_val_down))
+            _emit_label_distribution_tables(
+                config,
+                split_name="val",
+                dist=val_dist,
+                title="Label distribution (aggregated across windows, val)",
+            )
+    except Exception:  # noqa: BLE001
+        logger.debug("Failed to emit aggregated window label distributions", exc_info=True)
+
     aggregated_hpo_metric = _aggregate_hpo_window_metrics(hpo_window_metrics)
     if aggregated_hpo_metric is not None:
         config["_hpo_last_metric"] = aggregated_hpo_metric
@@ -1152,11 +1434,30 @@ def _run_snapshot_training_pipeline_sequential(
             else:
                 try:
                     inp_shape = model.input_shape
-                    _safe = lambda s: tuple(1 if d is None else d for d in s)
+
+                    # Under MirroredStrategy, predicting with batch_size=1 can result in
+                    # an empty per-replica batch on one device (batch=0), which breaks
+                    # Conv/TimeDistributed. Ensure the sample batch is >= replicas.
+                    replica_count = int(getattr(dist_ctx, "num_replicas", 1) or 1)
+                    sample_batch = max(1, replica_count)
+
+                    def _safe_shape(s: Any) -> tuple:
+                        dims = []
+                        for idx, d in enumerate(tuple(s)):
+                            if idx == 0:
+                                if d is None or int(d) <= 0:
+                                    dims.append(int(sample_batch))
+                                else:
+                                    dims.append(int(d))
+                            else:
+                                dims.append(1 if d is None else int(d))
+                        return tuple(dims)
+
                     if isinstance(inp_shape, list):
-                        x_sample = [np.zeros(_safe(s), dtype=np.float32) for s in inp_shape]
+                        x_sample = [np.zeros(_safe_shape(s), dtype=np.float32) for s in inp_shape]
                     else:
-                        x_sample = np.zeros(_safe(inp_shape), dtype=np.float32)
+                        x_sample = np.zeros(_safe_shape(inp_shape), dtype=np.float32)
+
                     y_pred = model.predict(x_sample, verbose=0)
                     signature = infer_signature(x_sample, y_pred)
                 except Exception as exc:  # noqa: BLE001
@@ -1745,6 +2046,18 @@ def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
                 try:
                     max_signature_samples = 8
                     sample_n = int(min(int(effective_train_n), int(max_signature_samples)))
+
+                    # When distributed, ensure signature sample batch can be evenly
+                    # partitioned across replicas to avoid empty per-replica batches.
+                    replica_count = int(getattr(dist_ctx, "num_replicas", 1) or 1)
+                    if replica_count > 1:
+                        if sample_n < replica_count:
+                            sample_n = 0
+                        else:
+                            sample_n = int(sample_n - (sample_n % replica_count))
+                            if sample_n <= 0:
+                                sample_n = 0
+
                     if sample_n > 0:
                         sample_gen, _ = build_training_generator(
                             dataset=snapshot_dataset,

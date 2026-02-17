@@ -256,6 +256,33 @@ def _slice_chunk_labels(
         return np.asarray(y_up, dtype="int64"), np.asarray(y_down, dtype="int64")
 
 
+def _slice_chunk_labels_for_indices(
+    chunk: SnapshotChunk,
+    local_indices: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    local_indices = np.asarray(local_indices, dtype="int64")
+    if local_indices.ndim != 1:
+        raise ValueError("local_indices must be rank 1")
+    if local_indices.size == 0:
+        return np.zeros((0,), dtype="int64"), np.zeros((0,), dtype="int64")
+
+    if chunk.storage_format == CHUNK_STORAGE_NPY_SHARDS_V1 or chunk.storage_format == CHUNK_STORAGE_FRAME_STORE_V1:
+        if chunk.array_paths is None:
+            raise ConfigError("Snapshot chunk array_paths are required for label slicing")
+        y_up_all = np.load(chunk.array_paths["y_up"], mmap_mode="r")
+        y_down_all = np.load(chunk.array_paths["y_down"], mmap_mode="r")
+        y_up = np.asarray(y_up_all[local_indices], dtype="int64")
+        y_down = np.asarray(y_down_all[local_indices], dtype="int64")
+        return y_up, y_down
+
+    with np.load(chunk.file_path) as npz:
+        if "y_up" not in npz or "y_down" not in npz:
+            raise ConfigError("Snapshot chunk missing y_up/y_down arrays")
+        y_up = np.asarray(npz["y_up"][local_indices], dtype="int64")
+        y_down = np.asarray(npz["y_down"][local_indices], dtype="int64")
+        return y_up, y_down
+
+
 def _balance_labels(y_up: np.ndarray, y_down: np.ndarray, labeling_criteria: str) -> np.ndarray:
     if labeling_criteria == _CRITERIA_MAX_INTENSITY:
         return np.maximum(y_up, y_down)
@@ -288,6 +315,77 @@ def compute_available_class_counts(
         y_bal = np.asarray(y_bal, dtype="int64")
 
         # Ignore out-of-range labels instead of crashing.
+        valid = (y_bal >= 0) & (y_bal < num_classes)
+        if not bool(valid.any()):
+            continue
+
+        binc = np.bincount(y_bal[valid], minlength=num_classes)
+        counts += binc.astype("int64")
+
+    return [int(v) for v in counts.tolist()]
+
+
+def _iter_indices_by_chunk(
+    dataset: SnapshotDataset,
+    indices: np.ndarray,
+) -> Iterator[Tuple[SnapshotChunk, np.ndarray]]:
+    indices = np.asarray(indices, dtype="int64")
+    if indices.ndim != 1:
+        raise ValueError("indices must be rank 1")
+
+    if indices.size == 0:
+        return
+
+    pos = 0
+    total = int(indices.shape[0])
+    for chunk in dataset.chunks:
+        if pos >= total:
+            break
+        chunk_start = int(chunk.start_index)
+        chunk_end = int(chunk.start_index + chunk.num_samples)
+
+        # Indices are expected to be sorted and within [0, dataset.total_samples).
+        if int(indices[pos]) < chunk_start:
+            raise ConfigError("Undersampling indices are not aligned with chunk boundaries")
+
+        end = pos
+        while end < total and int(indices[end]) < chunk_end:
+            end += 1
+        if end > pos:
+            local = np.asarray(indices[pos:end] - chunk_start, dtype="int64")
+            yield chunk, local
+        pos = end
+
+    if pos < total:
+        raise ConfigError("Undersampling indices exceed snapshot dataset bounds")
+
+
+def compute_class_counts_for_indices(
+    *,
+    dataset: SnapshotDataset,
+    indices: np.ndarray,
+    num_classes: int,
+    labeling_criteria: str,
+) -> List[int]:
+    """Compute per-class counts for an explicit index list under a labeling criteria.
+
+    This mirrors compute_available_class_counts but only for the given indices.
+    """
+    if num_classes < 1:
+        raise ValueError("num_classes must be >= 1")
+
+    indices = np.asarray(indices, dtype="int64")
+    if indices.ndim != 1:
+        raise ValueError("indices must be rank 1")
+    if indices.size == 0:
+        return [0 for _ in range(num_classes)]
+
+    counts = np.zeros((num_classes,), dtype="int64")
+    for chunk, local_indices in _iter_indices_by_chunk(dataset, indices):
+        y_up, y_down = _slice_chunk_labels_for_indices(chunk, local_indices)
+        y_bal = _balance_labels(y_up, y_down, labeling_criteria)
+        y_bal = np.asarray(y_bal, dtype="int64")
+
         valid = (y_bal >= 0) & (y_bal < num_classes)
         if not bool(valid.any()):
             continue
@@ -513,6 +611,7 @@ def _select_random(
 __all__ = [
     "UndersamplingConfig",
     "compute_available_class_counts",
+    "compute_class_counts_for_indices",
     "compute_undersample_counts",
     "resolve_undersampling_config",
     "select_undersampled_indices",
