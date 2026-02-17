@@ -1,0 +1,16 @@
+flowchart LR
+  subgraph ShortTerm[Short-Term Input]
+    X[(X: T x H x W x C)] --> TDConv[TimeDistributed Conv2D blocks]
+    TDConv --> TDFlat[TimeDistributed Flatten]
+    TDFlat --> LSTM[LSTM stack]
+  end
+
+  subgraph LongTerm[Long-Term Input (optional)]
+    LT[(x_lt: d_lt)] --> LTDense[Dense/Conv1D stack]
+  end
+
+  LSTM --> CAT[Concatenate]
+  LTDense --> CAT
+  CAT --> D[Dense stack]
+  D --> UP[Up intensity\nsoftmax]
+  D --> DOWN[Down intensity\nsoftmax]

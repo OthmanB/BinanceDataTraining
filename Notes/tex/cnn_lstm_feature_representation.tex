@@ -1,99 +1,458 @@
 \documentclass[11pt]{article}
 \usepackage[utf8]{inputenc}
-\usepackage{amsmath, amssymb}
+\usepackage{amsmath, amssymb, amsthm}
 \usepackage{geometry}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{booktabs}
+\usepackage{caption}
+\usepackage{ifthen}
 \geometry{margin=1in}
 
-\title{Convolutional--Recurrent Modeling of Limit Order Book Dynamics with Structured Feature Representations}
-\author{Internal Research Note}
-\date{November 17, 2025}
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue, citecolor=blue}
+
+\lstdefinestyle{mermaid}{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  columns=fullflexible,
+  frame=single,
+  rulecolor=\color{black!30},
+  backgroundcolor=\color{black!2}
+}
+
+\newcommand{\MermaidFigure}[4]{%
+\begin{figure}[t]
+  \centering
+  \IfFileExists{#1}{%
+    \includegraphics[width=0.95\linewidth]{#1}%
+  }{%
+    \IfFileExists{#3}{%
+      \lstinputlisting[style=mermaid]{#3}%
+    }{%
+      \fbox{\parbox{0.95\linewidth}{%
+        Missing figure assets. Expected either \texttt{\detokenize{#1}} (rendered image)
+        or \texttt{\detokenize{#3}} (Mermaid source).%
+      }}%
+    }%
+  }%
+  \caption{#2 (Mermaid source: \texttt{\detokenize{#3}}).}
+  \label{#4}
+\end{figure}%
+}
+
+\title{Configuration-Driven Snapshot Training for Two-Head Intensity Prediction from Limit Order Books}
+\author{BinanceDataTraining: System Specification (Internal)}
+\date{February 16, 2026}
 
 \begin{document}
-
 \maketitle
 
 \begin{abstract}
-This document describes the design of a convolutional--recurrent model for predicting the future intensity of upward and downward price moves in a limit order book. The focus is on the representation of order book states as structured feature tensors that can be consumed by a convolutional neural network (CNN) followed by a long short--term memory (LSTM) layer. We formalize the problem setting, specify the assumptions on data and configuration, and detail the construction of snapshot features and their mapping to the spatial grid used as model input. The objective is to provide a precise and reproducible description of the algorithmic choices that govern how raw order book observations are transformed into model inputs, in a way that is suitable for scientific scrutiny and future extension.
+This document specifies a configuration-driven machine learning pipeline for predicting short-horizon price move intensities from limit order book data. The system builds disk-backed ``snapshot'' datasets by streaming order book rows from a time-series database, constructs fixed-shape multi-asset tensors using alignment policies and hybrid depth aggregation, and trains a convolutional--recurrent neural network with two classification heads that separately model upward and downward intensity. The emphasis is reproducibility: all behavioral choices are explicit in YAML configuration, validated by schema and semantic checks, and executed by a deterministic pipeline that logs artifacts and metrics to MLflow. We formalize the core transformations---time discretization, multi-asset alignment, hybrid aggregation, label construction, normalization, sample weighting, optimization, calibration, and backtesting---as equations aligned with the reference implementation.
 \end{abstract}
 
 \section{Introduction}
 
-Modern electronic markets generate high--frequency streams of limit order book states. Each state reflects the outstanding buy and sell interest at multiple price levels. Trading strategies and execution algorithms often depend on predicting short--horizon price movements and their intensities, rather than only direction. Data--driven approaches based on deep learning architectures are natural candidates for this task, provided that the representation of the order book is expressive enough to capture relevant microstructural patterns while remaining computationally tractable.
+Electronic limit order books (LOBs) reveal a market's instantaneous supply and demand through ranked bid and ask queues at multiple price levels. For short horizons, practical decision-making often requires more than predicting a binary direction; it requires estimating the intensity of plausible upward and downward excursions, which naturally leads to distributional targets over discrete movement bins. The system documented here operationalizes this view through a dual-head classification objective: at each prediction time, the model outputs a categorical distribution over upward intensity classes and, independently, a categorical distribution over downward intensity classes.
 
-The system under consideration aims to predict, for each observation time, the distribution over discrete intensity classes of future upward and downward price moves. The prediction target is represented by two output heads, corresponding respectively to the upward and downward move intensity, each parameterized as a categorical distribution over a fixed set of magnitude bins. These bins are defined by configuration parameters that specify positive percentage thresholds for the future maximum price movement. The design of the input representation must therefore preserve information that is relevant for these targets, such as the shape of the book, depth at multiple levels, and imbalances between the bid and ask sides.
+Two requirements shape the design. First, the representation must capture microstructural information at multiple depths while remaining stable under variable depth availability and database ingestion constraints. Second, the entire pipeline must be reproducible and auditable, so that changes in any element of data selection, feature construction, model architecture, or evaluation are reflected in versioned configuration rather than implicit code defaults. Consequently, all parameters are sourced from YAML, validated against a strict schema, and enforced by semantic constraints at startup.
 
-The present note focuses on the design of the convolutional--recurrent model and, in particular, on the construction of the feature tensor that encodes the state of the order book at each observation time. The goal is to describe the assumptions, the mathematical formulation, and the configuration interface in a way that allows a practitioner to reproduce the model and understand the trade--offs implicit in each design choice.
+The remainder of this document is organized into (i) methods and global architecture, focusing on the flow from configuration to evaluation, and (ii) detailed functionalities, mapping core implementation modules to mathematical formulations.
 
-\section{Problem setting and assumptions}
+\section{Methods and Global Architecture}
 
-We consider a single traded instrument with a limit order book observed at discrete times. Let $t \in \{1, \dots, T\}$ index observation times, and let $S_t$ denote the state of the order book at time $t$ for the instrument of interest. At each time $t$, for each side $s \in \{b, a\}$ corresponding to bid and ask, and for each level $\ell \in \{1, \dots, L\}$, we observe a price $P_{t}^{s, \ell}$ and an available quantity $Q_{t}^{s, \ell}$. Level $\ell = 1$ corresponds to the best bid or best ask, and higher levels correspond to decreasing competitiveness on that side of the book.
+\subsection{Configuration-first execution model}
 
-The predictive task is defined with respect to a fixed prediction horizon $\Delta t$ expressed in seconds or in an equivalent time unit. For each observation time $t$, we define the maximum upward and downward price moves realized over the future interval $[t, t + \Delta t]$ relative to a reference price at time $t$, such as the mid price. These maximum moves are expressed as percentage changes. The configuration specifies positive magnitude thresholds $0 < b_1 < b_2 < \dots < b_K$ that partition the positive real line into $K+1$ bins. The upward intensity class at time $t$ is defined by assigning the maximum upward move percentage to one of these bins, including the bin corresponding to no or negligible movement. The downward intensity class is defined analogously using the magnitude of downward moves.
+The entry point (\texttt{main.py}) loads a YAML configuration and validates it against a schema (\texttt{config/validation\_schema.yaml}) with unknown keys rejected. Environment placeholders of the form \texttt{\$\{VAR\}} must resolve at load time; otherwise configuration loading raises a \texttt{ConfigError}. This discipline induces the following basic hypothesis: all run-defining functions are measurable with respect to the configuration and the environment map.
 
-We assume that the system operates in a regime where configuration is explicit and centralized. All numerical values that govern the model structure, feature construction, and target definition are supplied by a configuration file in YAML format. The code does not introduce numerical defaults for such parameters. If a required configuration key is missing or of incompatible type, the system fails with an explicit error before training or evaluation proceeds. This design ensures that experimental runs are fully reproducible and that any change in the model or feature space is reflected in the configuration.
-
-From an engineering perspective, we further assume that the data set has been preprocessed to define chronological splits into training, validation, and test sets, and that all computations respect this temporal structure. In particular, any statistics used for feature normalization are computed using training data only and are then reused for validation and test data. This prevents information leakage across splits and preserves the integrity of the evaluation.
-
-\section{Representation of order book snapshots}
-
-At each observation time $t$, the raw order book state $S_t$ is transformed into a fixed--shape tensor $X_t$ that will serve as input to the convolutional network. The representation is designed to capture information across multiple price levels and to distinguish the bid and ask sides while maintaining a regular grid structure that is well aligned with convolutional operations.
-
-The construction proceeds as follows. A configuration parameter $L$ specifies the maximum number of price levels to include on each side of the book. For each side $s$, we consider the sequence of prices and quantities $(P_{t}^{s, 1}, Q_{t}^{s, 1}), \dots, (P_{t}^{s, L}, Q_{t}^{s, L})$. If fewer than $L$ levels are available on a side at time $t$, the missing levels are represented by a consistent placeholder, such as zero or a neutral value after normalization, depending on the chosen transformation. The configuration further specifies a set of per--level feature functions that map $(P_{t}^{s, \ell}, Q_{t}^{s, \ell})$ and, when needed, global quantities such as the mid price into scalar features. Typical examples of such features include the price relative to the mid price, the raw quantity, the cumulative quantity up to level $\ell$ on a given side, and normalized measures of depth.
-
-Formally, let $\mathcal{F}$ denote the collection of selected per--level feature functions. For each $f \in \mathcal{F}$, side $s$, and level $\ell$, we compute a scalar value $f_{t}^{s, \ell} = f(S_t, s, \ell)$. The configuration defines $|\mathcal{F}|$, the number of per--level features, and determines the precise mathematical form of each $f$. In addition to per--level features, the design may include aggregate features that depend on the best levels of both sides, such as the spread or a measure of order book imbalance. These aggregate features are scalar functions of $S_t$ and are incorporated into the tensor representation through an additional mapping described below.
-
-The spatial grid is organized so that each row corresponds to a level index $\ell$ and each column corresponds to a specific combination of side and feature. For a given level $\ell$, the row of the grid contains the feature values $f_{t}^{b, \ell}$ for all $f \in \mathcal{F}$, followed by the feature values $f_{t}^{a, \ell}$ for all $f \in \mathcal{F}$. If there are $F = |\mathcal{F}|$ per--level features and two sides, the resulting grid has height $H = L$ and width $W = 2F$. The tensor $X_t$ is then constructed as a three--dimensional array in $\mathbb{R}^{H \times W \times C}$, where $C$ denotes the number of channels. In the initial design, all features are placed in a single channel, so that $C = 1$, and the values described above populate this channel. Aggregate features that do not vary with level can be incorporated either by repeating them across all levels in dedicated columns or by embedding them in additional channels. The choice is governed by configuration and must be consistent with the expectations of the convolutional architecture.
-
-The mapping from raw order book data to the tensor $X_t$ is deterministic given the configuration. The spatial arrangement is fixed once the set of per--level features, the number of levels, and the placement of aggregate features are specified. This explicit design allows the practitioner to reason about which microstructural patterns the convolutional layers can potentially capture, such as local slopes of the order book, clustering of liquidity near the mid price, or asymmetries between the bid and ask sides.
-
-\section{Normalization and statistical treatment}
-
-The numerical scales of prices and quantities can vary substantially over time and across instruments. To stabilize training and to facilitate the use of a single model architecture across different data sets, the feature representation is normalized according to a scheme defined in the configuration. The system supports several normalization strategies, such as standardization to zero mean and unit variance (often referred to as z--score normalization) and min--max scaling to a fixed interval. The choice of normalization is specified by a configuration key, and the code does not default to any particular scheme in the absence of this key.
-
-For a given choice of normalization, the procedure operates in two phases. During preprocessing of the training data, the system computes the necessary statistics of each feature, such as the mean and standard deviation for z--score normalization, using only the training subset as defined by the chronological split. These statistics are stored in the metadata associated with the data set. When constructing tensors for validation and test data, the system reuses the stored statistics and applies the same normalization transformation without recomputing the statistics. This approach ensures that the validation and test sets are treated consistently with the training set and that no information from future data leaks into the training process through the normalization step.
-
-The normalization of aggregate features follows the same principles. Each aggregate feature is treated as a distinct dimension with its own statistics. If aggregate features are replicated across levels in the spatial grid, the same normalized value is used in each corresponding cell, preserving the semantics of a global quantity while maintaining compatibility with the grid structure.
-
-\section{Convolutional--recurrent architecture}
-
-Once the per-snapshot tensor $X_t$ has been constructed and normalized, it is embedded into a temporal context window and provided as input to a convolutional neural network followed by an LSTM layer. The temporal window length is controlled by configuration parameters. Let $\Delta$ denote the sampling cadence in seconds, as specified by $\texttt{data.time\_range.cadence\_seconds}$, and let $W_\text{vis}$ denote the visible window length in seconds, as specified by $\texttt{targets.visible\_window\_seconds}$. The system requires that $W_\text{vis} > 0$ and that $W_\text{vis}$ is an integer multiple of $\Delta$, and defines the number of snapshots per sample as
+Let $\mathcal{C}$ denote the resolved configuration mapping, and let $\mathcal{E}$ denote the environment variables used for interpolation. The pipeline can be viewed as a deterministic operator
 \begin{equation}
-  T = \frac{W_\text{vis}}{\Delta}.
+  \mathcal{P} : (\mathcal{C}, \mathcal{E}) \mapsto \{\text{artifacts},\ \text{metrics},\ \text{trained model}\},
 \end{equation}
-For each anchor time index $t$ with sufficient past context and future horizon, the model receives as input the sequence of tensors $(X_{t-T+1}, \dots, X_t)$ corresponding to the last $T$ order book snapshots before and including the anchor.
-
-Formally, for each sample anchored at time $t$ we construct a four-dimensional tensor
+where nondeterminism is restricted to explicitly controlled random seeds and to external I/O latencies. In particular, the configuration constrains the valid set of executions through hard checks, for example the split consistency constraint
 \begin{equation}
-  \mathcal{X}_t \in \mathbb{R}^{T \times H \times W \times C},
+  \texttt{training.validation\_split} \;=\; \texttt{preprocessing.train\_test\_split.validation\_ratio},
 \end{equation}
-where the slice $\mathcal{X}_t[\tau] \in \mathbb{R}^{H \times W \times C}$ for $\tau = 1, \dots, T$ is the normalized grid $X_{t-T+\tau}$ defined in the previous section. In the baseline configuration $C = 1$. The convolutional block is applied independently to each temporal slice, with shared parameters across time. Conceptually, there exists a convolutional mapping
+and the output-type constraint that snapshot training and evaluation require
 \begin{equation}
-  \phi_{\text{cnn}} : \mathbb{R}^{H \times W \times C} \to \mathbb{R}^{H' \times W' \times F},
+  \texttt{model.output.type} \;=\; \texttt{"two\_head\_intensity"}.
 \end{equation}
-such that each frame $X_{t'}$ is transformed into a feature map $\phi_{\text{cnn}}(X_{t'})$. The sequence of transformed feature maps is then fed to the recurrent layer.
 
-The convolutional block itself is defined through configuration parameters that specify the number of convolutional layers, denoted $L_c$, the filter counts $f_1, \dots, f_{L_c}$, the kernel shapes, the pooling window sizes, activation functions, and dropout probabilities. At layer $\ell \in \{1, \dots, L_c\}$, the network applies $f_\ell$ two--dimensional filters of size $k_\ell\times k_\ell$ with ``same'' padding and a rectified linear unit activation, followed by a $2\times 2$ max pooling operation and, when configured, a dropout layer. This allows the network to learn local patterns in the order book structure within each snapshot, such as the rate at which quantities decay with level or local asymmetries between the bid and ask sides, while progressively reducing the spatial resolution. In the baseline configuration used for experiments, the model employs $L_c = 2$ convolutional layers with $f_1 = 64$ and $f_2 = 128$ filters, both using $3\times 3$ kernels and $2\times 2$ max pooling. The corresponding dropout probabilities after the first and second pooling layers are set to $0.2$ and $0.3$, respectively. These values are supplied by the configuration and may be adjusted by hyperparameter search procedures without altering the underlying architectural template.
+The global control flow includes optional diagnostics and optional hyperparameter optimization (HPO), followed by final training and evaluation in ``production'' mode. Figure~\ref{fig:pipeline} depicts this orchestration.
 
-After the final convolutional and pooling layers, each temporal slice is reduced to a feature map of height $H'$ and width $W'$ with $f_{L_c}$ channels. These maps are flattened to obtain a sequence of frame-level embedding vectors
+\MermaidFigure{figures/pipeline_flow.pdf}{Top-level pipeline flow (configuration load, optional diagnostics and HPO, training, evaluation, MLflow lifecycle).}{figures/pipeline_flow.mmd}{fig:pipeline}
+
+\subsection{Time discretization and sample geometry}
+
+The data source is a time-series database queried over a configured range $[t_{\min}, t_{\max})$ in UTC date-time. A cadence $\Delta>0$ seconds defines the logical sampling grid. Let $t_i = t_{\min} + i\Delta$ be the $i$th grid time. The ``visible window'' length $W_{\mathrm{vis}}$ (seconds) defines the number of historical frames per sample,
 \begin{equation}
-  z_{t-T+1}, \dots, z_t \in \mathbb{R}^{D}, \qquad D = H' W' f_{L_c},
+  T \;=\; \frac{W_{\mathrm{vis}}}{\Delta}, \qquad T \in \mathbb{N},
 \end{equation}
-which form the input to the LSTM layer. In the current design, the LSTM is parameterized by a number of units $U$, a dropout probability applied to the inputs at each time step, and a recurrent dropout probability applied to the recurrent connections. The corresponding configuration entries determine these quantities explicitly. In the baseline configuration, the LSTM layer uses $U = 96$ units with an input dropout of $0.3$ and a recurrent dropout of $0.2$. The LSTM processes the temporal sequence $(z_{t-T+1}, \dots, z_t)$ and produces a fixed--dimensional representation that summarizes how the spatial patterns of the order book evolve over the visible window. In other words, spatial structure within each snapshot is first encoded by the convolutional layers, and the LSTM then learns how these spatial properties morph over time across the $T$ snapshots.
+which is enforced in configuration by requiring that $W_{\mathrm{vis}}$ be an integer multiple of $\Delta$. The prediction horizon $W_{\mathrm{hor}}$ (seconds) similarly induces
+\begin{equation}
+  H \;=\; \frac{W_{\mathrm{hor}}}{\Delta}, \qquad H \in \mathbb{N},
+\end{equation}
+where $H$ is the number of forward steps used to construct the labels.
 
-The output of the LSTM is passed through a small stack of fully connected layers with non--linear activation functions. The configuration specifies the number of dense layers and their widths. In the baseline configuration there is a single dense layer with $64$ units and rectified linear activation, followed by a dropout layer with probability $0.2$. These layers project the LSTM representation into a space that is appropriate for the final prediction task while providing additional capacity to capture non--linear interactions between features.
+Samples are anchored at grid-aligned times for which both a complete past window of length $T$ and a complete future window of length $H$ exist. In the streaming implementation, a buffer maintains the last $T$ frames; once $H$ future frames are available after an anchor, the corresponding label is emitted.
 
-The last stage of the architecture comprises two separate dense output heads. Each head maps the final hidden representation to a vector of logits of dimension $K+1$, corresponding to the upward or downward intensity classes defined by the magnitude thresholds. A softmax activation is applied to each head, yielding a categorical distribution over intensity bins for upward and downward moves respectively. The separation into two heads allows the model to allocate distinct representational resources to upward and downward move intensities while sharing the earlier convolutional and recurrent layers that encode both the spatial structure of the order book and its evolution over time within the visible window.
+\subsection{Order book representation and hybrid depth aggregation}
 
-\section{Training objective and configuration}
+The system supports a hybrid depth representation that retains high resolution near the best quotes while compressing deeper levels into aggregated bins. Let $L$ be the configured maximum depth levels per side. The hybrid configuration chooses integers $L_{\mathrm{raw}}$ and $B$ such that
+\begin{equation}
+  0 < L_{\mathrm{raw}} < L, \qquad 0 < B, \qquad L_{\mathrm{raw}} + B \le L.
+\end{equation}
+For each side (bid or ask), the top $L_{\mathrm{raw}}$ levels are kept as-is; the remaining $L-L_{\mathrm{raw}}$ levels are partitioned into $B$ bins defined by integer boundaries $\{e_b\}_{b=0}^{B}$ with $e_0 = L_{\mathrm{raw}}$ and $e_B = L$. In the equal-width case, boundaries are approximately linear in level index; in the log-spaced case, they are approximately logarithmic to preserve more granularity closer to the market.
 
-The model is trained to approximate the joint distribution of upward and downward move intensities at each observation time. The training objective is formulated as the sum of the categorical cross--entropy losses for the two heads. For each sample, the true upward intensity class is encoded as a one--hot vector of dimension $K+1$, and the same is done for the downward intensity class. The loss function for the upward head is the cross--entropy between the true one--hot vector and the predicted probability vector, and similarly for the downward head. The total loss is the sum of these two quantities, possibly averaged over the batch.
+Within a bin $b$ with indices $\ell \in [e_b, e_{b+1})$, the aggregated quantity is
+\begin{equation}
+  \bar{Q}_{b} \;=\; \sum_{\ell=e_b}^{e_{b+1}-1} Q_{\ell},
+\end{equation}
+and the aggregated price is the volume-weighted average price (VWAP) whenever $\bar{Q}_b>0$,
+\begin{equation}
+  \bar{P}_{b} \;=\; \frac{\sum_{\ell=e_b}^{e_{b+1}-1} P_{\ell} Q_{\ell}}{\sum_{\ell=e_b}^{e_{b+1}-1} Q_{\ell}},
+\end{equation}
+with a fallback to an unweighted mean over $\{P_{\ell}\}$ if $\bar{Q}_b=0$.
 
-Optimization is performed using a variant of stochastic gradient descent, such as the Adam optimizer, as specified in the configuration. The learning rate, optimizer type, loss function identifier, and the list of evaluation metrics are all drawn from the configuration file and must be present for the model to be compiled. In particular, for a model with two output heads, the metrics configuration must map appropriately to each head. The system interprets a list of metric names as a base set to be applied symmetrically to both heads or allows a more explicit mapping when the configuration provides a dictionary from head names to metric lists.
+The resulting hybrid snapshot for one asset at one time is a matrix in $\mathbb{R}^{(L_{\mathrm{raw}}+B)\times 4}$ whose columns contain bid price, bid quantity, ask price, and ask quantity, consistent with \texttt{preprocessing/depth\_aggregator.py}.
 
-Throughout training, the data are split chronologically into training and validation sets. The model is fitted on the training set, and performance is monitored on the validation set using the configured metrics. Model checkpoints, learning curves, and other artifacts may be logged to an experiment tracking system, but the details of that integration lie outside the scope of this note. The critical point is that both the architecture and the feature representation are fully determined by the configuration and the design outlined above, allowing for rigorous experimentation and comparison across different configurations.
+\subsection{Multi-asset alignment and confidence masking}
 
-\section{Conclusion}
+The configuration may specify a target asset and a set of correlated assets. All non-target assets are aligned to the target asset's timestamp grid using either linear interpolation or bucketing. Denote by $v(t)$ the representation value (either the hybrid matrix flattened or a top-of-book vector) for a correlated asset at time $t$, and let $\{t_k\}$ be its observed timestamps. For a target time $\tau$ that lies between two observed times $t_{k}\le \tau \le t_{k+1}$, the interpolation mode computes
+\begin{equation}
+  \alpha(\tau) \;=\; \frac{\tau - t_k}{t_{k+1}-t_k}, \qquad \tilde{v}(\tau) \;=\; (1-\alpha(\tau))\,v(t_k) + \alpha(\tau)\,v(t_{k+1}),
+\end{equation}
+provided that the gap $t_{k+1}-t_k$ does not exceed a configured maximum gap; otherwise a missing-data policy applies. In bucketing mode, each observed time is assigned to a cadence bucket of width $\Delta$ and the nearest observation within a tolerance is selected.
 
-This document has presented a detailed description of the CNN--LSTM architecture and the associated feature representation used to model limit order book dynamics for the purpose of predicting future price move intensities. The central design idea is to encode each order book snapshot as a structured grid of features across price levels and sides, normalized according to statistics computed on training data, and to process this grid with convolutional and recurrent layers before producing two separate intensity distributions. By enforcing a strict separation between configuration and implementation and by avoiding implicit numerical defaults, the system facilitates reproducible research and careful ablation studies on the impact of each representational and architectural choice.
+Alignment also propagates a scalar confidence $c(t)\in[0,1]$ per asset and time, which is linearly interpolated under interpolation and forward-filled under forward-fill policies. When enabled, the pipeline appends a confidence mask ``channel'' by broadcasting $c(t)$ across the spatial dimensions of the input tensor. Concretely, if the per-asset sequence tensor for $A$ assets is $X\in\mathbb{R}^{T\times H\times W\times A}$, the augmented tensor is
+\begin{equation}
+  X' \;=\; \mathrm{concat}_{\mathrm{channels}}\bigl(X,\ M\bigr), \qquad M_{t,h,w,a} \;=\; c_a(t),
+\end{equation}
+so that the model can down-weight or learn to ignore frames with low observational support.
+
+\subsection{Snapshot tensor construction and frame-store materialization}
+
+Training operates on fixed-shape tensors that are built from aligned per-asset records over a visible window of $T$ steps. For a single asset $a\in\{1,\ldots,A\}$ and time $t$, the hybrid order book representation is a matrix
+\begin{equation}
+  S^{(a)}(t) \in \mathbb{R}^{L_{\mathrm{eff}}\times 4}, \qquad L_{\mathrm{eff}} = L_{\mathrm{raw}} + B,
+\end{equation}
+whose four columns store $(\texttt{bid\_price},\ \texttt{bid\_qty},\ \texttt{ask\_price},\ \texttt{ask\_qty})$ at each effective level. For the top-of-book representation, the system maps these four scalars into a small spatial patch whose height and width are configured; in the default layout, the entries are placed as
+\begin{equation}
+  F^{(a)}(t) = \begin{bmatrix}
+    \texttt{bid\_price}(t) & \texttt{bid\_qty}(t) \\
+    \texttt{ask\_price}(t) & \texttt{ask\_qty}(t)
+  \end{bmatrix}.
+\end{equation}
+
+For either representation, a multi-asset frame tensor is formed by stacking assets along the channel axis. In hybrid mode, the frame tensor has shape $\mathbb{R}^{L_{\mathrm{eff}}\times 4\times A}$ and satisfies
+\begin{equation}
+  F(t)[:,:,a] = S^{(a)}(t),
+\end{equation}
+while in top-of-book mode $F(t)\in\mathbb{R}^{H\times W\times A}$ is defined analogously. A sample anchored at time $t_0$ consists of the visible window of frames,
+\begin{equation}
+  X_{\mathrm{base}}(t_0) \;=\; \bigl(F(t_0-(T-1)\Delta),\ \ldots,\ F(t_0)\bigr) \in \mathbb{R}^{T\times H\times W\times A},
+\end{equation}
+where $(H,W)=(L_{\mathrm{eff}},4)$ in hybrid mode and $(H,W)$ are the configured patch dimensions in top-of-book mode.
+
+If confidence masking is enabled, an additional mask tensor $M(t_0)\in\mathbb{R}^{T\times H\times W\times A}$ is created by broadcasting the per-asset confidence scalars across spatial dimensions,
+\begin{equation}
+  M(t_0)_{\tau,h,w,a} = c_a\bigl(t_0-(T-1-\tau)\Delta\bigr),
+\end{equation}
+and the masked input becomes $\mathrm{concat}_{\mathrm{channels}}(X_{\mathrm{base}}(t_0), M(t_0))$, doubling the asset-channel count.
+
+Auxiliary features are computed at the anchor and include (i) derived order book features and momentum features and (ii) temporal encodings. The resulting vector $u(t_0)\in\mathbb{R}^{d_{\mathrm{aux}}}$ is either consumed by a separate model branch or, when \texttt{integration\_mode=concat\_channels}, broadcast into a tensor
+\begin{equation}
+  U(t_0)_{\tau,h,w,j} = u_j(t_0),
+\end{equation}
+and appended as additional channels. The final sample tensor therefore has channel dimension
+\begin{equation}
+  C \;=\; A \; +\; \mathbf{1}\{\texttt{include\_mask\_channel}\}\,A \; +\; d_{\mathrm{aux}},
+\end{equation}
+which matches the reference materialization procedure in \texttt{training/snapshot\_dataset.py:\_materialize\_frame\_store\_v1\_x}.
+
+To avoid storing duplicated visible windows for each sample, the snapshot builder uses a frame-store representation (\texttt{frame\_store\_v1}) in which all frames in a chunk are stored once as an array $\texttt{frames\_base}\in\mathbb{R}^{N_{\mathrm{frames}}\times H\times W\times A}$ together with per-frame confidence values $\texttt{frames\_confidence}\in[0,1]^{N_{\mathrm{frames}}\times A}$. Each sample stores an anchor index $s_i\in\{0,\ldots,N_{\mathrm{frames}}-1\}$ and an auxiliary vector $u_i\in\mathbb{R}^{d_{\mathrm{aux}}}$. The sample tensor is reconstructed by slicing contiguous windows,
+\begin{equation}
+  X_{\mathrm{base}}^{(i)}[\tau] = \texttt{frames\_base}[s_i-(T-1)+\tau], \qquad \tau=0,\ldots,T-1,
+\end{equation}
+and broadcasting the corresponding confidence and auxiliary values in the same manner described above.
+
+\subsection{Label construction: two-head intensity}
+
+Let $m(t)$ denote the mid-price at time $t$ (computed as half the sum of best bid and best ask when both are positive). For an anchor time $t_0$, the system forms the future window $\{m(t_0+\Delta), \ldots, m(t_0+H\Delta)\}$ and computes relative moves in percent,
+\begin{equation}
+  r(h) \;=\; 100\,\frac{m(t_0+h\Delta)-m(t_0)}{m(t_0)} \qquad (h=1,\ldots,H).
+\end{equation}
+The upward and downward summary statistics are
+\begin{equation}
+  r^{\uparrow}(t_0) \;=\; \max_{1\le h\le H} r(h), \qquad r^{\downarrow}(t_0) \;=\; \min_{1\le h\le H} r(h).
+\end{equation}
+Given ordered boundaries $0<b_1<\cdots<b_K$ (percent), the upward intensity class is
+\begin{equation}
+  y^{\uparrow}(t_0) \;=\; \min\{k\in\{0,\ldots,K\}:\ \max(r^{\uparrow}(t_0),0)\le b_{k+1}\},
+\end{equation}
+with the convention that $b_{K+1}=+\infty$; the downward class uses the nonnegative magnitude $\max(-r^{\downarrow}(t_0),0)$ and the same binning rule. This corresponds exactly to \texttt{training/snapshot\_dataset.py:\_compute\_intensity\_bins}.
+
+\subsection{Normalization and sample weighting}
+
+Feature normalization follows a fit/transform discipline, with statistics computed in a streaming pass over the snapshot dataset (\texttt{training/snapshot\_dataset.py:compute\_normalization\_stats}). Let $x\in\mathbb{R}^d$ denote the flattened input features for a sample, restricted to the non-mask subset of channels (mask channels, when enabled, are excluded from the statistics and left unchanged). In snapshot mode, only \texttt{min\_max} and \texttt{standard} scaling are implemented; selecting \texttt{robust} raises a \texttt{ConfigError} even though robust scaling exists for non-snapshot paths in \texttt{preprocessing/normalizer.py}.
+
+Let $m_j$ and $M_j$ denote feature-wise minima and maxima, and let $\mu_j$ and $\sigma_j$ denote feature-wise means and standard deviations. The snapshot-mode transforms are
+\begin{align}
+  \text{min-max: } & \hat{x}_j = \frac{x_j - m_j}{M_j-m_j} ,\\
+  \text{standard: } & \hat{x}_j = \frac{x_j - \mu_j}{\sigma_j}.
+\end{align}
+Denominators are guarded against zero by replacing zeros with one. When \texttt{fit\_on\_train\_only=true}, statistics are computed on the training split and reused for validation/test; otherwise, separate statistics are computed per split and cached. In the current snapshot implementation, statistics are global over all non-mask features (the configuration flag \texttt{preprocessing.normalization.per\_asset} is not applied in snapshot mode).
+
+Training uses per-sample weights for each head. For a sample anchored at time $t_0$, a duty-cycle weight is computed as the fraction of observed frames in its visible window,
+\begin{equation}
+  w_{\mathrm{duty}}(t_0) \;=\; \frac{1}{T} \sum_{\tau=t_0-(T-1)\Delta}^{t_0} \mathbf{1}\{\text{frame at }\tau\text{ observed}\}.
+\end{equation}
+Optionally, a time-decay weight emphasizes recency using a half-life $\lambda$ (days),
+\begin{equation}
+  w_{\mathrm{decay}}(t_0) \;=\; \exp\Bigl(-\log(2)\,\frac{\mathrm{age\_days}(t_0)}{\lambda}\Bigr),
+\end{equation}
+and optional class weights map labels to scalars $w_{\mathrm{class}}^{\uparrow}(y^{\uparrow})$ and $w_{\mathrm{class}}^{\downarrow}(y^{\downarrow})$. The final per-head sample weights are the products
+\begin{equation}
+  w^{\uparrow}(t_0) = w_{\mathrm{duty}}(t_0)\,w_{\mathrm{decay}}(t_0)\,w_{\mathrm{class}}^{\uparrow}(y^{\uparrow}(t_0)),
+  \qquad
+  w^{\downarrow}(t_0) = w_{\mathrm{duty}}(t_0)\,w_{\mathrm{decay}}(t_0)\,w_{\mathrm{class}}^{\downarrow}(y^{\downarrow}(t_0)),
+\end{equation}
+matching the generator logic in \texttt{training/snapshot\_dataset.py}.
+
+\subsection{Model architecture and objective}
+
+The baseline model is a Keras CNN+LSTM network (\texttt{models/cnn\_lstm\_multiclass.py}) that applies a shared per-frame convolutional feature extractor, then an LSTM over time, then dense layers, and finally two softmax heads. Long-term context features can optionally add a second input branch whose output is concatenated with the short-term embedding.
+
+\MermaidFigure{figures/model_architecture.pdf}{Model architecture: short-term CNN+LSTM with optional long-term branch and two softmax heads.}{figures/model_architecture.mmd}{fig:model-architecture}
+
+Let $p^{\uparrow}(\cdot\mid x)$ and $p^{\downarrow}(\cdot\mid x)$ denote the predicted distributions, and let $y^{\uparrow},y^{\downarrow}$ be the class labels. The per-sample loss is the sum of cross-entropies,
+\begin{equation}
+  \ell(x) \;=\; -\log p^{\uparrow}(y^{\uparrow}\mid x) \, -\, \log p^{\downarrow}(y^{\downarrow}\mid x),
+\end{equation}
+and training minimizes the weighted empirical risk, using the per-head weights $(w^{\uparrow}, w^{\downarrow})$ when enabled.
+
+\subsection{Evaluation, calibration, and backtesting}
+
+Evaluation computes classification metrics per head and may perform calibration analysis. For a head with one-hot labels $Y\in\{0,1\}^{n\times K}$ and predicted probabilities $P\in[0,1]^{n\times K}$, the implemented Brier score is
+\begin{equation}
+  \mathrm{Brier}(P,Y) \;=\; \frac{1}{n} \sum_{i=1}^{n} \sum_{k=1}^{K} (P_{ik}-Y_{ik})^2,
+\end{equation}
+and the expected calibration error (ECE) is computed over bins on the flattened probabilities (not only on top-1 confidence). Temperature scaling optionally fits a scalar $T>0$ to logits $z_i\in\mathbb{R}^K$ by minimizing the negative log-likelihood
+\begin{equation}
+  T^{\star} \;=\; \arg\min_{T\in[T_{\min},T_{\max}]} \; -\frac{1}{n}\sum_{i=1}^{n} \log \mathrm{softmax}\bigl(z_i/T\bigr)_{y_i},
+\end{equation}
+which is solved by bounded scalar minimization.
+
+The evaluation pipeline can also compute temporal degradation metrics by slicing time into windows, and it can run a simplified backtest that converts two-head outputs into a trading signal according to a configured strategy (e.g., net intensity or thresholding).
+
+\MermaidFigure{figures/data_flow.pdf}{Data flow from GreptimeDB ingestion through snapshot materialization, training, evaluation, and optional calibration/backtesting.}{figures/data_flow.mmd}{fig:data-flow}
+
+\section{Functionalities}
+
+This section maps the system's major modules to concrete behaviors and, where appropriate, to their mathematical definitions.
+
+\subsection{Configuration loading, schema validation, and semantic constraints}
+
+The configuration loader (\texttt{utils/config\_loader.py}) enforces three invariants:
+\begin{itemize}
+  \item \textbf{Schema adherence:} required sections and required keys must be present; unknown keys are rejected (\texttt{strict\_unknown\_keys=true} in \texttt{config/validation\_schema.yaml}).
+  \item \textbf{Environment interpolation:} placeholders of the form \texttt{\$\{VAR\}} must resolve at load time; otherwise load fails with \texttt{ConfigError}.
+  \item \textbf{Semantic checks:} configuration must satisfy run-time constraints, including the two-head intensity contract (\texttt{targets.labeling.scheme} and \texttt{model.output.type}) and consistency checks such as \texttt{model.output.num\_classes = len(targets.price\_classes.boundaries)+1}.
+\end{itemize}
+
+In particular, automatic boundary selection (\texttt{targets.price\_classes.boundaries="auto"}) and automatic class count derivation (\texttt{model.output.num\_classes="auto"}) are only permitted under \texttt{two\_head\_intensity}.
+
+\subsection{Snapshot context, configuration hash, and directory resolution}
+
+Snapshots are derived datasets stored on disk under \texttt{snapshot.directory}. Their purpose is to make training restartable and reproducible without re-querying the database.
+
+Let $\mathcal{C}$ be the resolved configuration. The snapshot store (\texttt{training/snapshot\_store.py}) defines a configuration subset operator $S(\mathcal{C})$ that retains only snapshot-relevant keys (data asset pairs, time range, order-book representation, temporal features, alignment; target horizon/window and labeling; preprocessing normalization + feature engineering; and model input/output descriptors). A deterministic hash is computed as
+\begin{equation}
+  h(\mathcal{C}) = \mathrm{SHA256}\bigl(\mathrm{JSON}(S(\mathcal{C}))\bigr),
+\end{equation}
+where JSON serialization uses sorted keys and compact separators.
+
+Snapshot name resolution follows \texttt{snapshot.name}:
+\begin{itemize}
+  \item If \texttt{name="auto"}, the resolved name is \texttt{<root\_name>\_<hash8>\_<target\_asset>\_<start\_date>\_<end\_date>} with non-alphanumeric characters sanitized to \texttt{-}.
+  \item Otherwise, \texttt{name} is used verbatim.
+\end{itemize}
+
+On configuration mismatch, \texttt{snapshot.on\_config\_mismatch} admits only two policies (enforced by \texttt{ConfigError}):
+\begin{itemize}
+  \item \texttt{"error"}: refuse to reuse an existing snapshot directory whose manifest hash differs from $h(\mathcal{C})$.
+  \item \texttt{"create\_new"}: create a new sibling snapshot by suffixing the resolved name with \texttt{\_<hash8>}.
+\end{itemize}
+
+\subsection{Snapshot eviction policy}
+
+To bound disk usage, \texttt{training/snapshot\_store.py:maybe\_evict\_snapshots} removes old snapshot directories beyond \texttt{snapshot.max\_snapshots} by sorting candidates by \texttt{created\_at} (falling back to manifest modification time) and deleting the oldest, never deleting the currently resolved snapshot.
+
+\subsection{Snapshot manifest schema and invariants}
+
+Each snapshot directory contains a \texttt{manifest.json} written atomically (write-then-\texttt{os.replace}). The manifest is a JSON object with stable top-level keys:
+\begin{itemize}
+  \item \texttt{version}: manifest schema version (currently 1).
+  \item \texttt{snapshot\_name}, \texttt{root\_name}, \texttt{created\_at} (UTC ISO8601).
+  \item \texttt{config\_hash} (equals $h(\mathcal{C})$) and \texttt{config\_snapshot} (equals $S(\mathcal{C})$).
+  \item \texttt{time\_range} and \texttt{assets}.
+  \item \texttt{chunks}: list of chunk entries (see below).
+  \item \texttt{series}: metadata and chunked target-asset series files (timestamps, mid-prices, volumes) used by long-term features and auto boundary fitting.
+  \item \texttt{normalization\_stats}: cached normalization-stat descriptors written by the training pipeline.
+  \item \texttt{complete}: boolean indicating whether the chunk build finished.
+\end{itemize}
+
+\subsection{Chunk boundaries and ingestion semantics}
+
+Order-book rows are streamed in physical time chunks of \texttt{data.ingestion.chunk\_hours} (\texttt{data/greptime\_client.py}). For a given date interval, \texttt{\_generate\_time\_chunks} emits non-overlapping chunks whose endpoints are expressed as \texttt{YYYY-MM-DD HH:MM:SS} strings; the final chunk uses an inclusive end-of-day boundary. If multi-database ingestion is enabled (\texttt{data.multi\_database.enabled=true}), non-overlapping per-connection date ranges are intersected with the global range and processed sequentially (``time split'').
+
+\subsection{Snapshot chunk storage formats}
+
+The snapshot loader supports three chunk storage formats for backward compatibility, identified by \texttt{entry["format"]} in the manifest:
+\begin{itemize}
+  \item \texttt{npz}: a single \texttt{.npz} containing \texttt{x}, \texttt{y\_up}, \texttt{y\_down}, \texttt{anchor\_ts}, and \texttt{duty\_cycle}.
+  \item \texttt{npy\_shards\_v1}: separate \texttt{.npy} arrays for \texttt{x}, \texttt{y\_up}, \texttt{y\_down}, \texttt{anchor\_ts}, \texttt{duty\_cycle}.
+  \item \texttt{frame\_store\_v1}: a ``frames once, anchors many'' representation that stores per-frame arrays and per-sample metadata.
+\end{itemize}
+
+The current snapshot builder (\texttt{training/snapshot\_dataset.py:\_build\_snapshot\_chunks}) writes \texttt{frame\_store\_v1}.
+
+\subsubsection{Frame store format: \texttt{frame\_store\_v1}}
+
+For a chunk with $A$ assets, visible window length $T$ (\texttt{window\_steps}), spatial dimensions $(H,W)$, and auxiliary dimension $d_{\mathrm{aux}}$, the persisted arrays are:
+\begin{align}
+  &\texttt{frames\_base} \in \mathbb{R}^{N_{\mathrm{frames}}\times H\times W\times A}, \\
+  &\texttt{frames\_confidence} \in [0,1]^{N_{\mathrm{frames}}\times A}, \qquad \texttt{frames\_observed} \in \{0,1\}^{N_{\mathrm{frames}}\times A}, \\
+  &\texttt{frames\_ts} \in \mathbb{Z}^{N_{\mathrm{frames}}}, \\
+  &\texttt{anchor\_local\_idx} \in \mathbb{Z}^{N_{\mathrm{samples}}}, \qquad \texttt{aux} \in \mathbb{R}^{N_{\mathrm{samples}}\times d_{\mathrm{aux}}}, \\
+  &\texttt{y\_up},\ \texttt{y\_down} \in \{0,\ldots,K-1\}^{N_{\mathrm{samples}}}, \qquad \texttt{anchor\_ts} \in \mathbb{Z}^{N_{\mathrm{samples}}}, \\
+  &\texttt{duty\_cycle} \in [0,1]^{N_{\mathrm{samples}}}.
+\end{align}
+
+The reconstructed model input has shape \texttt{(N\_samples, T, H, W, C)} with
+\begin{equation}
+  C = A + \mathbf{1}\{\texttt{include\_mask\_channel}\}\,A + d_{\mathrm{aux}}.
+\end{equation}
+The per-sample base window is sliced from \texttt{frames\_base} using \texttt{anchor\_local\_idx}:
+\begin{equation}
+  X^{(i)}_{\mathrm{base}}[\tau] = \texttt{frames\_base}[s_i-(T-1)+\tau], \qquad s_i = \texttt{anchor\_local\_idx}[i],\ \tau=0,\ldots,T-1.
+\end{equation}
+If mask channels are enabled, the corresponding mask tensor is built by broadcasting per-frame confidence values across spatial dimensions and concatenating along the channel axis. Auxiliary features are broadcast analogously (\texttt{training/snapshot\_dataset.py:\_materialize\_frame\_store\_v1\_x}).
+
+\subsubsection{Chunk overlap frames and anchor mapping}
+
+To permit samples whose visible window crosses a chunk boundary, each \texttt{frame\_store\_v1} chunk stores a prefix of up to $T-1$ tail frames from the previous chunk. Let $\tilde{N}$ be the number of ``core'' frames derived from the current chunk's streamed rows; the stored frame count is
+\begin{equation}
+  N_{\mathrm{frames}} = \tilde{N} + N_{\mathrm{overlap}}, \qquad N_{\mathrm{overlap}} = \min(T-1,\ \text{available previous-tail frames}).
+\end{equation}
+Anchor timestamps are mapped to local indices only for core frames; the mapping is stored implicitly via \texttt{anchor\_local\_idx} constructed from \texttt{anchor\_local\_idx\_by\_ts}. This implies the invariant that for every sample $i$, the slice start index $s_i-(T-1)$ must be non-negative and the end index $s_i$ must be strictly less than $N_{\mathrm{frames}}$; violations raise \texttt{ConfigError} during materialization.
+
+\subsection{Gap handling, alignment, and confidence semantics}
+
+Streaming snapshot construction uses a two-stage missing-data policy.
+\begin{itemize}
+  \item \textbf{Per-asset gap handling (\texttt{GapHandler}):} within each asset stream, observed snapshots are optionally augmented with synthetic snapshots when gaps are between one cadence step and \texttt{alignment.max\_gap\_seconds}. Under \texttt{handle\_gaps="forward\_fill"}, features are copied from the previous observed snapshot; under \texttt{handle\_gaps="interpolate"}, features are linearly interpolated between surrounding observations. Synthetic snapshots are marked \texttt{observed=false}.
+  \item \textbf{Multi-asset alignment:} correlated assets are aligned to the target asset's grid using either linear interpolation or bucket selection (\texttt{data.asset\_pairs.alignment.method}). When \texttt{include\_mask\_channel=true}, a per-asset confidence scalar is propagated and later broadcast into mask channels.
+\end{itemize}
+
+Confidence is a scalar $c\in[0,1]$ derived from gap size $g$ and the configured maximum gap $G$ as $c = \max\{0, 1 - g/G\}$ (with additional decay inside a multi-step gap), ensuring that synthetic frames are down-weighted by the model.
+
+The per-sample duty cycle stored in \texttt{duty\_cycle} is defined on the target asset only:
+\begin{equation}
+  w_{\mathrm{duty}}(t_0) = \frac{1}{T}\sum_{\tau=0}^{T-1} \mathbf{1}\{\text{target frame at }t_0-(T-1-\tau)\Delta\text{ is observed}\}.
+\end{equation}
+
+\subsection{Split semantics, cached normalization statistics, and transform application}
+
+Snapshot training uses chronological splitting by global sample index (\texttt{training/pipeline.py}). Normalization statistics are cached as \texttt{normalization\_stats\_<split>.npz} under the snapshot directory and recorded in the manifest under \texttt{normalization\_stats[split]}. Statistics are computed by streaming over the corresponding index range and flattening all non-mask channels; mask channels are excluded and left unchanged.
+
+In snapshot mode, normalization statistics support only \texttt{min\_max} and \texttt{standard} methods (\texttt{training/snapshot\_dataset.py:compute\_normalization\_stats}). The configuration flag \texttt{preprocessing.normalization.per\_asset} is not applied in snapshot mode; statistics are global over all non-mask features.
+
+\subsection{Coarse class balancing (undersampling) and class weights}
+
+Two orthogonal mechanisms address imbalance:
+\begin{itemize}
+  \item \textbf{Undersampling (pre-training filter):} when enabled, \texttt{training/sample\_balancing.py} selects a subset of training indices to match a target class distribution. A single balancing label $y_{\mathrm{bal}}$ is derived from the two-head labels via
+  \begin{equation}
+    y_{\mathrm{bal}} = \max(y^{\uparrow}, y^{\downarrow})\ \text{(max intensity)};\quad y_{\mathrm{bal}} = y^{\uparrow}\ \text{(up)};\quad y_{\mathrm{bal}} = y^{\downarrow}\ \text{(down)},
+  \end{equation}
+  depending on \texttt{labeling\_criteria}. Per-class keep counts are computed by scaling the target distribution to the largest feasible total under availability constraints, then selecting samples by \texttt{selection\_policy} (uniform time, random, or k-means). Hard safeguards enforce \texttt{min\_samples\_after\_balance} and \texttt{min\_fraction\_after\_balance}.
+  \item \textbf{Class weights (loss reweighting):} \texttt{training/class\_weights.py} computes inverse-frequency weights
+  \begin{equation}
+    w_{\mathrm{class}}[c] = \frac{n}{K\,\mathrm{count}[c]},
+  \end{equation}
+  with zero-count classes assigned the maximum weight among non-zero classes.
+\end{itemize}
+
+The training generator always applies duty-cycle weights and optionally multiplies exponential time-decay and per-head class weights (\texttt{training/snapshot\_dataset.py:build\_training\_generator}).
+
+\subsection{Long-term context features (optional) and dual-input contract}
+
+When \texttt{model.long\_term.enabled=true}, the pipeline computes long-term features for every sample from the snapshot series files (\texttt{training/long\_term\_context.py}). The computation is cached under the snapshot directory as \texttt{anchor\_timestamps.npy} (concatenated per-chunk \texttt{anchor\_ts}) and \texttt{long\_term\_features.npz} with a cache hash that includes the snapshot config hash, cadence, and long-term feature configuration.
+
+Long-term feature definitions are implemented in \texttt{preprocessing/long\_term\_features.py} and explicitly exclude the anchor day from the lookback window to avoid lookahead. The training pipeline enforces a dual-input contract: long-term enabled implies the model must accept exactly two inputs, and long-term disabled implies the model must not expect a second input.
+
+\subsection{Sequential training over rolling windows (optional)}
+
+Sequential training partitions the configured date interval into consecutive windows of \texttt{training.sequential\_training.window\_days} (inclusive, day-granularity). Resume state is stored under \texttt{<snapshot.directory>/\_sequential\_resume/} as a JSON state file and a Keras model file keyed by a hash of the window list plus run identifiers (\texttt{training/pipeline.py}). Completed window snapshots can be cleaned up when configured.
+
+\subsection{Runtime device selection, mixed precision, and distributed training}
+
+Runtime configuration (\texttt{main.py}) selects \texttt{cpu} vs \texttt{gpu} execution, sets \texttt{CUDA\_VISIBLE\_DEVICES} when pinning GPUs, optionally configures \texttt{TF\_GPU\_ALLOCATOR=cuda\_malloc\_async}, and can enable mixed precision.
+
+Distributed training is opt-in via \texttt{training.runtime.distributed} and currently supports \texttt{tf.distribute.MirroredStrategy} (\texttt{training/distributed.py}). If enabled, the global batch size equals the configured per-replica batch size times the number of replicas, and the Python generator is wrapped as a \texttt{tf.data.Dataset} with an explicit output signature (with or without long-term features).
+
+\subsection{Hyperparameter optimization (Optuna) and regime safeguards}
+
+Optuna-based HPO (\texttt{models/hyperparameter\_tuning.py}) samples:
+\begin{itemize}
+  \item CNN per-layer filter counts (\texttt{search\_space.cnn[*].filters}).
+  \item LSTM per-layer unit counts (\texttt{search\_space.lstm[*].units}).
+  \item Learning rate (\texttt{search\_space.learning\_rate}, optionally log-scaled).
+  \item Batch size (\texttt{search\_space.batch\_size} as integer range or categorical set).
+\end{itemize}
+Sampled parameters are applied directly into the configuration tree before invoking the training pipeline.
+
+Parallel HPO runs independent worker processes pinned to resources \texttt{"cpu"} or \texttt{"gpu:<id>"}. Each worker disables distributed training and sets GPU visibility to isolate resource usage. ``Regime'' safeguards optionally retry on OOM with batch-size backoff to a configured floor, clamp requested batch sizes to a persisted ``safe envelope'' learned from past successful trials, and run an RSS watchdog that can terminate or fall back to fewer workers if memory usage exceeds a configured limit.
+
+\subsection{Evaluation, calibration, and backtesting definitions}
+
+Evaluation (\texttt{evaluation/evaluator.py}) computes per-head accuracy and macro-averaged precision/recall/F1 from the confusion matrix.
+
+Calibration analysis uses \texttt{evaluation/calibration.py}. ECE is computed on flattened probabilities (not top-1 confidence): for bins $B_b\subset[0,1]$ and flattened vectors $p\in[0,1]^{nK}$, $y\in\{0,1\}^{nK}$,
+\begin{equation}
+  \mathrm{ECE} = \sum_{b} \frac{|B_b|}{nK}\,\bigl|\mathbb{E}[p\mid p\in B_b] - \mathbb{E}[y\mid p\in B_b]\bigr|.
+\end{equation}
+Post-hoc temperature scaling fits separate temperatures for up and down heads by minimizing the negative log-likelihood over a configured fit range; when the model emits probabilities rather than logits, the implementation uses a log-probability ``logit proxy'' $z=\log p$ so that \texttt{softmax}$(z/T)$ remains a valid calibrated distribution.
+
+Backtesting (\texttt{evaluation/backtesting.py}) converts head probabilities into signals. For an intensity threshold $k_0$,
+\begin{equation}
+  p_{\uparrow} = \sum_{k\ge k_0} p^{\uparrow}_k,\qquad p_{\downarrow} = \sum_{k\ge k_0} p^{\downarrow}_k.
+\end{equation}
+The \texttt{net\_intensity} strategy goes long if $p_{\uparrow}>p_{\downarrow}$ and short if $p_{\downarrow}>p_{\uparrow}$, with confidence $|p_{\uparrow}-p_{\downarrow}|$. The \texttt{threshold} strategy trades only if \emph{either} probability exceeds a configured threshold, breaking ties by choosing the larger. Trades are entered at time $t$ and exited after $H$ steps; PnL is computed in percent with a round-trip transaction cost of \texttt{2 * transaction\_cost\_pct}.
+
+\subsection{Observability server and run-state semantics}
+
+The observability server (\texttt{observability/server.py}) is a stdlib \texttt{http.server}-based process that serves an HTMX dashboard and JSON APIs, guarded by Basic Auth (credentials provided via environment variables). Run state is recorded by the pipeline into a SQLite-backed run-state file (\texttt{observability/run\_state.py}) with monotone stage progression (\texttt{idle} $\rightarrow$ \texttt{initializing} $\rightarrow$ \texttt{diagnostics} $\rightarrow$ \texttt{snapshot\_build} $\rightarrow$ \texttt{trial} $\rightarrow$ \texttt{training} $\rightarrow$ \texttt{evaluation}). The server exposes:
+\begin{itemize}
+  \item health checks (\texttt{/healthz}),
+  \item UI pages (\texttt{/ui*}) and configuration browsing/editing (\texttt{/ui/config} and JSON config APIs),
+  \item run state and history APIs (\texttt{/api/run\_state}, \texttt{/api/history}, \texttt{/api/hpo}),
+  \item logs (\texttt{/api/logs}, \texttt{/ui/logs}),
+  \item Prometheus-style metrics (\texttt{/metrics}),
+  \item run control endpoints that start/stop \texttt{main.py} under the server with \texttt{RUN\_STATE\_PATH} and \texttt{RUN\_LOG\_PATH} exported.
+\end{itemize}
+
+\section{Build and Rendering Instructions}
+
+This document is self-contained and can be rendered from \texttt{Notes/tex/}.
+\begin{itemize}
+  \item \textbf{LaTeX build (pdflatex):} run \texttt{pdflatex cnn\_lstm\_feature\_representation.tex} twice to resolve references.
+  \item \textbf{LaTeX build (tectonic):} run \texttt{tectonic -X compile cnn\_lstm\_feature\_representation.tex} (it automatically reruns as needed).
+  \item \textbf{Mermaid figures (optional):} if \texttt{figures/*.pdf} are present, they are included; otherwise the build falls back to embedding the Mermaid source (\texttt{figures/*.mmd}) via the \texttt{\textbackslash MermaidFigure} macro.
+  \item \textbf{Optional render step:} with Node.js installed, install \texttt{@mermaid-js/mermaid-cli} and render each \texttt{.mmd} to \texttt{.pdf} under \texttt{Notes/tex/figures/} (e.g. \texttt{mmdc -i pipeline\_flow.mmd -o pipeline\_flow.pdf}).
+\end{itemize}
 
 \end{document}

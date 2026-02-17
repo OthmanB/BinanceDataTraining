@@ -1,0 +1,20 @@
+flowchart TD
+  A[main.py\n(entry point)] --> B[load_config\n(YAML + schema + env)]
+  A --> C[setup_logging\n(colored or JSON)]
+  A --> D[validate_environment\n(env var checks)]
+
+  B --> E[MLflow start_run]
+  E --> F{Diagnostics enabled?}
+  F -->|yes| G[run_snapshot_diagnostics]
+  F -->|no| H{HPO enabled?}
+  G --> H
+
+  H -->|yes| I[run_hyperparameter_search\n(Optuna)]
+  H -->|no| J[run_training_pipeline]
+
+  I --> K{run_mode == trial?}
+  K -->|yes| L[exit]
+  K -->|no| J
+
+  J --> M[evaluate_snapshot_model]
+  M --> N[MLflow end_run]

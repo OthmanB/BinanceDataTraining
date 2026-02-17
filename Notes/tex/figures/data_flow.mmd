@@ -1,0 +1,17 @@
+flowchart TD
+  DB[(GreptimeDB\nHTTP SQL API)] --> S[stream_order_book_chunks_by_time\n(data/greptime_client.py)]
+  S --> GH[GapHandler.iter_gap_handled\n(training/snapshot_dataset.py)]
+  GH --> SS[Snapshot store\n(chunk arrays + manifest)\n(training/snapshot_store.py)]
+  SS --> PSD[prepare_snapshot_dataset\n(training/snapshot_dataset.py)]
+
+  PSD --> NS[NormalizationStats\n(fit on train only)\n(preprocessing/normalizer.py)]
+  PSD --> FE[FeatureEngineer\n(order book + momentum)\n(preprocessing/feature_engineering.py)]
+  PSD --> LT[Long-term context (optional)\n(training/long_term_context.py)]
+
+  PSD --> TG[build_training_generator\n(training/snapshot_dataset.py)]
+  TG --> FIT[model.fit\n(models/cnn_lstm_multiclass.py)]
+  FIT --> EV[evaluate_snapshot_model\n(evaluation/evaluator.py)]
+
+  EV --> CAL[Calibration\n(ECE/Brier + temperature scaling)\n(evaluation/calibration.py)]
+  EV --> TDG[Temporal degradation (optional)\n(evaluation/temporal_degradation.py)]
+  EV --> BT[Backtesting (optional)\n(evaluation/backtesting.py)]
