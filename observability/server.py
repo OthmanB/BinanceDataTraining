@@ -568,13 +568,15 @@ _MISSING = object()
 _SELECT_OPTIONS: Dict[str, List[str]] = {
     "run_mode.mode": ["production", "trial"],
     "data.source_type": ["database", "file"],
-    "data.multi_database.strategy": ["round_robin", "failover", "merge"],
+    # GreptimeDB multi-database mode currently supports time-splitting only.
+    "data.multi_database.strategy": ["time_split"],
     "data.asset_pairs.alignment.method": ["interpolate", "bucket"],
     "data.asset_pairs.alignment.missing_policy": ["forward_fill", "skip", "error"],
     "data.order_book.representation": ["full", "aggregated", "hybrid"],
     "data.order_book.hybrid.bin_strategy": ["equal_width", "log_spaced"],
-    "targets.price_classes.definition_type": ["fixed", "quantile"],
-    "targets.labeling.scheme": ["threshold", "triple_barrier", "fixed_horizon"],
+    # The current pipeline supports percentage-based bins and two-head intensity labels.
+    "targets.price_classes.definition_type": ["percentage"],
+    "targets.labeling.scheme": ["two_head_intensity"],
     "targets.labeling.handle_gaps": ["skip", "interpolate", "error"],
     "preprocessing.normalization.method": ["min_max", "standard", "robust"],
     "preprocessing.feature_engineering.volume_proxy_method": ["top_of_book", "total_depth"],
@@ -597,7 +599,7 @@ _SELECT_OPTIONS: Dict[str, List[str]] = {
     "model.input_representation.strategy": ["stacked_channels"],
     "model.input_representation.temporal_features.integration_mode": ["concat_channels"],
     "model.cnn.activation": ["relu", "elu", "selu", "leaky_relu", "swish", "tanh", "sigmoid"],
-    "model.output.type": ["classification", "regression"],
+    "model.output.type": ["two_head_intensity"],
     "model.output.activation": ["softmax", "sigmoid", "linear"],
     "model.compilation.optimizer": ["adam", "sgd", "rmsprop", "adamw"],
     "model.compilation.loss": [
@@ -611,13 +613,13 @@ _SELECT_OPTIONS: Dict[str, List[str]] = {
     "training.sample_weighting.method": ["exponential_decay"],
     "training.sample_weighting.apply_to": ["loss_function"],
     "training.fine_tuning.freeze_layers": ["none", "cnn", "cnn_lstm", "all_but_output"],
-    "snapshot.on_config_mismatch": ["error", "warn", "ignore", "rebuild"],
+    "snapshot.on_config_mismatch": ["create_new", "error"],
     "hyperparameter_optimization.framework": ["optuna"],
     "hyperparameter_optimization.direction": ["minimize", "maximize"],
     "hyperparameter_optimization.metric": [
         "val_loss", "val_accuracy", "val_f1_score", "val_precision", "val_recall",
     ],
-    "evaluation.post_hoc_calibration.method": ["temperature_scaling", "isotonic"],
+    "evaluation.post_hoc_calibration.method": ["temperature_scaling"],
     "evaluation.backtesting.signal_strategy": ["net_intensity", "threshold"],
     "evaluation.backtesting.position_sizing": ["equal", "confidence"],
     "evaluation.missing_snapshot_strategy": ["fail", "skip", "synthetic"],
@@ -706,6 +708,16 @@ _LIST_FIELD_OPTIONS: Dict[str, List[str]] = {
 }
 
 
+_PRICE_CLASS_AUTO_UI_FIELDS: Dict[str, str] = {
+    "targets.price_classes.auto.method": "string",
+    "targets.price_classes.auto.per_window": "boolean",
+    "targets.price_classes.auto.fit_on": "string",
+    "targets.price_classes.auto.labeling_criteria": "string",
+    "targets.price_classes.auto.max_samples": "integer",
+    "targets.price_classes.auto.random_seed": "integer",
+}
+
+
 @dataclass(frozen=True)
 class SchemaField:
     section: str
@@ -718,6 +730,27 @@ def _escape_text(value: Any) -> str:
     if value is None:
         return ""
     return html.escape(str(value))
+
+
+def _safe_yaml_load(value: Any) -> Any:
+    """Best-effort YAML parse for form-rendered scalar/collection values."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float, bool, list, dict)):
+        return value
+    if not isinstance(value, str):
+        return value
+    raw = value.strip()
+    if raw == "":
+        return ""
+    try:
+        import yaml  # type: ignore[import]
+    except Exception:  # noqa: BLE001
+        return raw
+    try:
+        return yaml.safe_load(raw)
+    except Exception:  # noqa: BLE001
+        return raw
 
 
 def _load_yaml_file(path: Path) -> Dict[str, Any]:
@@ -1035,6 +1068,13 @@ def _build_render_values_from_config(
         if value is _MISSING:
             continue
         values[field.full_key] = _render_value(value, field.field_type)
+
+    # Optional UI fields (not part of required schema fields).
+    for full_key, field_type in _PRICE_CLASS_AUTO_UI_FIELDS.items():
+        value = _get_nested_value(config, full_key)
+        if value is _MISSING:
+            continue
+        values[full_key] = _render_value(value, field_type)
     return values
 
 
@@ -1048,7 +1088,106 @@ def _build_render_values_from_params(
             values[field.full_key] = field.full_key in params
         else:
             values[field.full_key] = params.get(field.full_key, [""])[0]
+
+    # Optional UI fields (not part of required schema fields).
+    for full_key, field_type in _PRICE_CLASS_AUTO_UI_FIELDS.items():
+        if field_type == "boolean":
+            values[full_key] = full_key in params
+        else:
+            values[full_key] = params.get(full_key, [""])[0]
     return values
+
+
+def _render_price_class_boundaries_widget(values: Dict[str, Any]) -> str:
+    """Render targets.price_classes.boundaries as manual list or 'auto'."""
+
+    full_key = "targets.price_classes.boundaries"
+    uid = full_key.replace(".", "_")
+    escaped_key = _escape_text(full_key)
+
+    raw_value = values.get(full_key, "")
+    parsed = _safe_yaml_load(raw_value)
+
+    mode = "manual"
+    if isinstance(parsed, str):
+        first_line = parsed.strip().splitlines()[0].strip() if parsed.strip() else ""
+        if first_line.strip("\"'") == "auto":
+            mode = "auto"
+
+    current_items: List[str] = []
+    if mode == "manual" and isinstance(parsed, list):
+        current_items = [str(v) for v in parsed]
+
+    items_html = ""
+    for idx, item in enumerate(current_items):
+        items_html += (
+            f'<div class="list-item" data-list="{uid}">'
+            f'<span class="list-item-text">{_escape_text(item)}</span>'
+            f'<button type="button" class="list-btn-sm danger" '
+            f'onclick="removeListItem(this,\'{uid}\')">-</button>'
+            f"</div>"
+        )
+
+    manual_style = "" if mode == "manual" else "display:none"
+    auto_style = "" if mode == "auto" else "display:none"
+
+    ta_val = "auto" if mode == "auto" else _list_to_yaml(current_items)
+
+    auto_fields_html = ""
+    for auto_key, auto_type in _PRICE_CLASS_AUTO_UI_FIELDS.items():
+        label = auto_key.split(".")[-1]
+        val = values.get(auto_key, "")
+        if auto_type == "boolean":
+            checked = "checked" if bool(val) else ""
+            auto_fields_html += (
+                f'<div class="pc-auto-field">'
+                f'<label>{_escape_text(label)}</label>'
+                f'<input type="checkbox" name="{_escape_text(auto_key)}" value="true" {checked} />'
+                f"</div>"
+            )
+        else:
+            step = "1" if auto_type == "integer" else "any"
+            input_type = "number" if auto_type in {"integer", "number"} else "text"
+            auto_fields_html += (
+                f'<div class="pc-auto-field">'
+                f'<label>{_escape_text(label)}</label>'
+                f'<input type="{input_type}" name="{_escape_text(auto_key)}" step="{step}" '
+                f'value="{_escape_text(val)}" />'
+                f"</div>"
+            )
+
+    sel_manual = "selected" if mode == "manual" else ""
+    sel_auto = "selected" if mode == "auto" else ""
+
+    return (
+        '<div class="pc-boundaries-wrap">'
+        '<div class="pc-boundaries-head">'
+        '<span class="muted" style="font-size:0.75rem">Mode</span>'
+        f'<select id="pc_boundaries_mode" onchange="setPriceBoundariesMode(this.value)">'
+        f'<option value="manual" {sel_manual}>Manual list</option>'
+        f'<option value="auto" {sel_auto}>Auto</option>'
+        '</select>'
+        '</div>'
+        f'<div id="pc_boundaries_manual" style="{manual_style}">'
+        f'<div class="list-field-wrap" id="lf_{uid}">'
+        f'<div class="list-items" id="items_{uid}">{items_html}</div>'
+        f'<div class="list-add-row">'
+        f'<input type="text" id="inp_{uid}" class="list-add-input" placeholder="value" />'
+        f'<button type="button" class="list-btn-sm primary" onclick="addListItemFromInput(\'{uid}\')">+</button>'
+        f'</div>'
+        f"</div>"
+        f"</div>"
+        f'<div id="pc_boundaries_auto" style="{auto_style}">'
+        '<div class="pc-auto-grid">'
+        f"{auto_fields_html}"
+        '</div>'
+        '<div class="muted" style="font-size:0.72rem;line-height:1.3;margin-top:4px">'
+        'Uses <code>targets.price_classes.auto.*</code> when boundaries is <code>auto</code>.'
+        '</div>'
+        '</div>'
+        f'<textarea name="{escaped_key}" class="list-hidden-ta" id="ta_{uid}" rows="1">{_escape_text(ta_val)}</textarea>'
+        '</div>'
+    )
 
 
 def _parse_training_form(
@@ -1088,6 +1227,40 @@ def _parse_training_form(
         except ValueError as exc:
             errors.append(f"{field.full_key}: {exc}")
     return config, missing, errors
+
+
+def _apply_price_class_auto_params(
+    *,
+    config: Dict[str, Any],
+    params: Dict[str, List[str]],
+    errors: List[str],
+) -> None:
+    """Apply optional targets.price_classes.auto.* params when boundaries == 'auto'."""
+
+    boundaries = _get_nested_value(config, "targets.price_classes.boundaries")
+    if boundaries is _MISSING:
+        return
+    if not isinstance(boundaries, str) or boundaries.strip().lower().strip('"\'') != "auto":
+        return
+
+    for full_key, field_type in _PRICE_CLASS_AUTO_UI_FIELDS.items():
+        if field_type == "boolean":
+            _set_nested_value(config, full_key, full_key in params)
+            continue
+
+        raw = params.get(full_key, [""])[0].strip()
+        if raw == "":
+            continue
+        try:
+            if field_type == "integer":
+                value: Any = int(raw)
+            elif field_type == "number":
+                value = float(raw)
+            else:
+                value = raw
+            _set_nested_value(config, full_key, value)
+        except ValueError as exc:
+            errors.append(f"{full_key}: {exc}")
 
 
 def _write_training_config(path: Path, config: Dict[str, Any]) -> None:
@@ -1498,6 +1671,8 @@ def _render_config_fields(
                     )
                 elif field.full_key == "data.multi_database.connections":
                     input_html = _render_connections_table(value)
+                elif field.full_key == "targets.price_classes.boundaries":
+                    input_html = _render_price_class_boundaries_widget(values)
                 elif field.field_type in {"list"} and field.full_key in _LIST_FIELD_OPTIONS:
                     input_html = _render_list_field(field.full_key, value)
                 elif field.field_type in {"list", "dict", "any"}:
@@ -2154,6 +2329,21 @@ def _render_ui_page(_config: ServerConfig) -> str:
       .list-add-row {{ display: flex; gap: 4px; align-items: center; }}
       .list-add-select, .list-add-input {{ font-size: 0.75rem; padding: 3px 6px; flex: 1; min-width: 0; }}
       .list-hidden-ta {{ display: none; }}
+      .pc-boundaries-wrap {{ display: flex; flex-direction: column; gap: 6px; }}
+      .pc-boundaries-head {{ display: flex; align-items: center; gap: 8px; }}
+      .pc-boundaries-head select {{ font-size: 0.75rem; padding: 3px 6px; }}
+      .pc-auto-grid {{
+        display: grid;
+        grid-template-columns: repeat(2, minmax(120px, 1fr));
+        gap: 6px 10px;
+        align-items: center;
+      }}
+      .pc-auto-field {{ display: grid; grid-template-columns: 1fr 1.2fr; gap: 6px; align-items: center; }}
+      .pc-auto-field label {{ font-size: 0.75rem; color: var(--ink-2); }}
+      @media (max-width: 720px) {{
+        .pc-auto-grid {{ grid-template-columns: 1fr; }}
+        .pc-auto-field {{ grid-template-columns: 1fr 1.4fr; }}
+      }}
       .asset-select-wrap {{ display: flex; gap: 4px; align-items: center; }}
       .asset-select {{ flex: 1; min-width: 0; }}
       .asset-list-wrap {{ display: flex; flex-direction: column; gap: 4px; }}
@@ -2303,12 +2493,31 @@ def _render_ui_page(_config: ServerConfig) -> str:
       document.addEventListener('change',function(e){{if(e.target.classList.contains('conn-f'))_syncConnTA();}});
       function loadAssets(fieldKey){{fetch('/api/config/assets').then(function(r){{return r.json()}}).then(function(d){{var sel=document.getElementById('asset_sel_'+fieldKey);if(!sel)return;var cur=sel.value;var opts='';(d.assets||[]).forEach(function(a){{var s=(a===cur)?'selected':'';opts+='<option value="'+a+'" '+s+'>'+a+'</option>';}});if(opts)sel.innerHTML=opts;else sel.innerHTML='<option value="">No assets found</option>';}}).catch(function(e){{alert('Failed to load assets: '+e);}});}}
       function loadAssetsForList(uid){{fetch('/api/config/assets').then(function(r){{return r.json()}}).then(function(d){{var sel=document.getElementById('sel_'+uid);if(!sel)return;var opts='<option value="">Add...</option>';(d.assets||[]).forEach(function(a){{opts+='<option value="'+a+'">'+a+'</option>';}});sel.innerHTML=opts;}}).catch(function(e){{alert('Failed to load assets: '+e);}});}}
+      function setPriceBoundariesMode(mode){{
+        var manual=document.getElementById('pc_boundaries_manual');
+        var auto=document.getElementById('pc_boundaries_auto');
+        var ta=document.getElementById('ta_targets_price_classes_boundaries');
+        if(!manual||!auto||!ta)return;
+        if(mode==='auto'){{
+          manual.style.display='none';
+          auto.style.display='';
+          ta.value='auto';
+        }}else{{
+          manual.style.display='';
+          auto.style.display='none';
+          _syncListTA('targets_price_classes_boundaries');
+        }}
+      }}
       var _nnParams={{"cnn":[{{"name":"filters","type":"number","default":"32"}},{{"name":"kernel_size","type":"text","default":"[3,3]"}},{{"name":"pool_size","type":"text","default":"[2,2]"}},{{"name":"normalization","type":"select","default":"null","options":"null,batch,group,layer"}},{{"name":"dropout","type":"number","default":"0.0"}}],"lstm":[{{"name":"units","type":"number","default":"64"}},{{"name":"dropout","type":"number","default":"0.0"}},{{"name":"recurrent_dropout","type":"number","default":"0.0"}},{{"name":"post_dropout","type":"number","default":"0.0"}}],"dense":[{{"name":"units","type":"number","default":"64"}},{{"name":"dropout","type":"number","default":"0.0"}}]}};
       function _syncNNTA(){{var row=document.getElementById('nn-cards-row');if(!row)return;['cnn','lstm','dense'].forEach(function(lt){{var cards=row.querySelectorAll('.nn-card[data-layer-type="'+lt+'"]');var layers=[];cards.forEach(function(c){{var l={{}};c.querySelectorAll('.nn-p').forEach(function(f){{var k=f.getAttribute('data-param');var v=f.value;if(/^\\d+$/.test(v))l[k]=parseInt(v,10);else if(/^\\d+\\.\\d*$/.test(v)||/^\\d*\\.\\d+$/.test(v))l[k]=parseFloat(v);else if(v==='null')l[k]=null;else if(v.startsWith('[')){{try{{l[k]=JSON.parse(v)}}catch(e){{l[k]=v}}}}else l[k]=v;}});layers.push(l);}});var ta=document.getElementById('ta_nn_'+lt);if(ta){{try{{ta.value=JSON.stringify(layers)}}catch(e){{ta.value='[]'}}}}}});}}
       function removeNNCard(btn){{btn.closest('.nn-card').remove();_syncNNTA();}}
       function addNNCard(lt){{var row=document.getElementById('nn-cards-row');if(!row)return;var params=_nnParams[lt]||[];var html='';params.forEach(function(p){{if(p.type==='select'){{var opts='';p.options.split(',').forEach(function(o){{var s=(o===p.default)?'selected':'';opts+='<option value="'+o+'" '+s+'>'+o+'</option>';}});html+='<div class="nn-param"><label>'+p.name+'</label><select class="nn-p" data-param="'+p.name+'">'+opts+'</select></div>';}}else{{var it=p.type==='number'?'number':'text';var st=p.type==='number'?' step="any"':'';html+='<div class="nn-param"><label>'+p.name+'</label><input type="'+it+'"'+st+' class="nn-p" data-param="'+p.name+'" value="'+p.default+'" /></div>';}}}});var idx=row.querySelectorAll('.nn-card[data-layer-type="'+lt+'"]').length;var card=document.createElement('div');card.className='nn-card';card.setAttribute('data-layer-type',lt);card.setAttribute('data-idx',idx);card.innerHTML='<div class="nn-card-header"><span class="nn-card-type">'+lt.toUpperCase()+' '+(idx+1)+'</span><button type="button" class="list-btn-sm danger" onclick="removeNNCard(this)">-</button></div><div class="nn-card-body">'+html+'</div>';var output=row.querySelector('.nn-fixed-card.output');if(output)row.insertBefore(card,output);else row.appendChild(card);_syncNNTA();}}
       document.addEventListener('change',function(e){{if(e.target.classList.contains('nn-p'))_syncNNTA();}});
-      document.addEventListener('DOMContentLoaded',function(){{_syncNNTA();}});
+      document.addEventListener('DOMContentLoaded',function(){{
+        _syncNNTA();
+        var sel=document.getElementById('pc_boundaries_mode');
+        if(sel){{setPriceBoundariesMode(sel.value);}}
+      }});
     </script>
   </body>
 </html>
@@ -3395,6 +3604,7 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
                 self._send_html(body_html)
                 return
             config_data, missing, errors = _parse_training_form(params, schema_fields)
+            _apply_price_class_auto_params(config=config_data, params=params, errors=errors)
             values = _build_render_values_from_params(params, schema_fields)
             if missing or errors:
                 body_html = _render_training_config_panel(

@@ -128,7 +128,7 @@ targets:  # Defines what future event the model predicts and how labels are cons
 
   price_classes:
     definition_type: "percentage"  # How price-move bins are defined: by percentage, absolute size, or adaptive rules.
-    boundaries: [0.1, 0.2, 0.4, 0.6, 1.5]    # Ordered boundaries (in percent) that split price moves into intensity classes.
+    boundaries: [0.15, 0.35, 0.55, 1.5]    # Ordered boundaries (in percent) that split price moves into intensity classes.
 
   labeling:
     scheme: "two_head_intensity"   # Label scheme: separate up/down intensity heads with discretised classes.
@@ -305,6 +305,9 @@ training:  # Controls how the model is fit on the prepared dataset.
       factor: 0.5             # Multiplicative factor for reducing the learning rate.
       patience: 5             # Number of epochs with no improvement before reducing the learning rate.
       min_lr: 0.00001         # Lower bound on the learning rate.
+
+    terminate_on_nan:
+      enabled: false  # When true, stop training immediately if loss becomes NaN.
 
   class_weights:
     compute_from_train: false  # When true, compute class weights from the training labels and apply them in snapshot training.

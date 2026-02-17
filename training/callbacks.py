@@ -16,6 +16,7 @@ def create_callbacks(config: Dict[str, Any]) -> List[Any]:
     callbacks_cfg = config["training"]["callbacks"]
     es_cfg = callbacks_cfg["early_stopping"]
     rl_cfg = callbacks_cfg["reduce_lr"]
+    nan_cfg = callbacks_cfg.get("terminate_on_nan") or {}
 
     logger.info(
         "Creating callbacks. early_stopping.enabled=%s, reduce_lr.enabled=%s",
@@ -31,6 +32,14 @@ def create_callbacks(config: Dict[str, Any]) -> List[Any]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to import Keras callbacks: %s", exc)
         return []
+
+    TerminateOnNaN = None
+    try:
+        from tensorflow.keras.callbacks import TerminateOnNaN as _TerminateOnNaN  # type: ignore[import]
+
+        TerminateOnNaN = _TerminateOnNaN
+    except Exception:
+        TerminateOnNaN = None
 
     created_callbacks: List[Any] = []
 
@@ -74,6 +83,14 @@ def create_callbacks(config: Dict[str, Any]) -> List[Any]:
             rl_patience,
             rl_min_lr,
         )
+
+    # TerminateOnNaN callback (fail-fast on numerical instability)
+    if bool(nan_cfg.get("enabled", False)):
+        if TerminateOnNaN is None:
+            logger.warning("TerminateOnNaN requested but callback not available in this TensorFlow build.")
+        else:
+            created_callbacks.append(TerminateOnNaN())
+            logger.info("Created TerminateOnNaN callback.")
 
     return created_callbacks
 

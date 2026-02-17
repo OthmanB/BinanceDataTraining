@@ -117,13 +117,29 @@ sections:
       price_classes.definition_type:
         type: string
       price_classes.boundaries:
-        type: list
+        # Can be a numeric list (manual boundaries) or the string "auto".
+        type: any
       labeling.scheme:
         type: string
       labeling.use_midpoint:
         type: boolean
       labeling.handle_gaps:
         type: string
+
+    optional_keys:
+      # Only used when targets.price_classes.boundaries == "auto".
+      price_classes.auto.method:
+        type: string
+      price_classes.auto.per_window:
+        type: boolean
+      price_classes.auto.fit_on:
+        type: string
+      price_classes.auto.labeling_criteria:
+        type: string
+      price_classes.auto.max_samples:
+        type: integer
+      price_classes.auto.random_seed:
+        type: integer
 
   preprocessing:
     type: dict
@@ -311,6 +327,8 @@ sections:
         type: string
       runtime.distributed.resources:
         type: list
+      callbacks.terminate_on_nan.enabled:
+        type: boolean
       sequential_training.enabled:
         type: boolean
       sequential_training.window_days:

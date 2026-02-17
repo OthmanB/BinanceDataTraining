@@ -6,7 +6,7 @@ run_mode:
 data:
   time_range:
     start_date: "2024-01-01"
-    end_date: "2024-01-10"
+    end_date: "2024-01-20"
   asset_pairs:
     alignment:
       missing_policy: "forward_fill"
@@ -18,10 +18,13 @@ training:
   debug_max_samples: 100000000
   sequential_training:
     enabled: true
-    window_days: 4
+    window_days: 10
     cleanup_completed_windows: false
     cleanup_keep_last_windows: 0
     resume_enabled: true
+  callbacks:
+    terminate_on_nan:
+      enabled: true
 #  runtime:
 #    gpu_memory_growth: true
 #    gpu_allocator: "cuda_malloc_async"

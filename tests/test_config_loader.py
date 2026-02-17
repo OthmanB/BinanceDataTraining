@@ -190,6 +190,9 @@ base_config: "{base_config_path}"
 targets:
   price_classes:
     boundaries: [0.1, 0.2, 0.4, 0.6]
+model:
+  output:
+    num_classes: 4
 """
 
         with tempfile.TemporaryDirectory() as tmpdir:

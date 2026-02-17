@@ -257,6 +257,134 @@ def _validate_two_head_intensity_num_classes(config: Dict[str, Any]) -> None:
         )
 
 
+def _resolve_price_class_boundaries(config: Dict[str, Any]) -> None:
+    """Resolve targets.price_classes.boundaries.
+
+    Supports:
+    - list[float]: explicit boundaries in percent
+    - "auto": fit boundaries from snapshot series mid-price moves
+
+    This function mutates config in-place so downstream validation and snapshot
+    hashing see an explicit numeric list.
+    """
+
+    targets_cfg = config.get("targets")
+    if not isinstance(targets_cfg, dict):
+        raise ConfigError("targets must be a dict")
+    price_classes_cfg = targets_cfg.get("price_classes")
+    if not isinstance(price_classes_cfg, dict):
+        raise ConfigError("targets.price_classes must be a dict")
+
+    boundaries_raw = price_classes_cfg.get("boundaries")
+    if isinstance(boundaries_raw, list):
+        if not boundaries_raw:
+            raise ConfigError("targets.price_classes.boundaries must be a non-empty list")
+        try:
+            boundaries = [float(b) for b in boundaries_raw]
+        except (TypeError, ValueError) as exc:
+            raise ConfigError("targets.price_classes.boundaries must be numeric") from exc
+        if any(v <= 0.0 for v in boundaries):
+            raise ConfigError("targets.price_classes.boundaries must be > 0")
+        if any(boundaries[i] >= boundaries[i + 1] for i in range(len(boundaries) - 1)):
+            raise ConfigError("targets.price_classes.boundaries must be strictly increasing")
+        price_classes_cfg["boundaries"] = boundaries
+        return
+
+    if isinstance(boundaries_raw, str) and boundaries_raw.strip().lower() == "auto":
+        auto_cfg = price_classes_cfg.get("auto")
+        if not isinstance(auto_cfg, dict):
+            raise ConfigError(
+                "targets.price_classes.auto must be a dict when targets.price_classes.boundaries='auto'"
+            )
+
+        method = str(auto_cfg.get("method") or "quantile").strip().lower()
+        if method not in {"quantile"}:
+            raise ConfigError("targets.price_classes.auto.method must be 'quantile'")
+
+        per_window = bool(auto_cfg.get("per_window", True))
+        if per_window is not True:
+            # The pipeline can still fit once globally, but the current
+            # implementation only fits for the active window config.
+            raise ConfigError("targets.price_classes.auto.per_window must be true (global fit not implemented yet)")
+
+        fit_on = str(auto_cfg.get("fit_on") or "train").strip().lower()
+        if fit_on not in {"train", "full"}:
+            raise ConfigError("targets.price_classes.auto.fit_on must be 'train' or 'full'")
+
+        labeling_criteria = str(auto_cfg.get("labeling_criteria") or "max_intensity").strip().lower()
+        if labeling_criteria not in {"max_intensity", "up_intensity", "down_intensity"}:
+            raise ConfigError(
+                "targets.price_classes.auto.labeling_criteria must be one of: max_intensity, up_intensity, down_intensity"
+            )
+
+        max_samples_raw = auto_cfg.get("max_samples", 500_000)
+        try:
+            max_samples = int(max_samples_raw)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError("targets.price_classes.auto.max_samples must be an integer") from exc
+        if max_samples <= 0:
+            raise ConfigError("targets.price_classes.auto.max_samples must be positive")
+
+        random_seed_raw = auto_cfg.get("random_seed", 0)
+        try:
+            random_seed = int(random_seed_raw)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError("targets.price_classes.auto.random_seed must be an integer") from exc
+        if random_seed < 0:
+            raise ConfigError("targets.price_classes.auto.random_seed must be >= 0")
+
+        # Determine num_classes (may be 'auto' and will be resolved after we set boundaries).
+        model_cfg = config.get("model")
+        output_cfg = model_cfg.get("output") if isinstance(model_cfg, dict) else None
+        if not isinstance(output_cfg, dict):
+            raise ConfigError("model.output must be a dict")
+        output_type = str(output_cfg.get("type") or "")
+        if output_type != "two_head_intensity":
+            raise ConfigError(
+                "targets.price_classes.boundaries='auto' is only supported for model.output.type='two_head_intensity'"
+            )
+
+        num_classes_raw = output_cfg.get("num_classes")
+        if num_classes_raw is None:
+            raise ConfigError("model.output.num_classes is required for auto boundaries")
+        if isinstance(num_classes_raw, str) and num_classes_raw.strip().lower() == "auto":
+            raise ConfigError(
+                "model.output.num_classes cannot be 'auto' when targets.price_classes.boundaries='auto'. "
+                "Set model.output.num_classes to an integer."
+            )
+        try:
+            num_classes = int(num_classes_raw)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError("model.output.num_classes must be an integer for auto boundaries") from exc
+        if num_classes < 2:
+            raise ConfigError("model.output.num_classes must be >= 2")
+
+        # Fit boundaries from series-only cache (requires snapshot.enabled for directory settings).
+        snapshot_cfg = config.get("snapshot")
+        if not isinstance(snapshot_cfg, dict) or not bool(snapshot_cfg.get("enabled")):
+            raise ConfigError(
+                "targets.price_classes.boundaries='auto' requires snapshot.enabled=true (series-cache fitting)"
+            )
+
+        try:
+            from training.auto_boundaries import fit_price_class_boundaries_from_series_cache
+        except Exception as exc:  # noqa: BLE001
+            raise ConfigError(f"Failed to import auto boundary fitter: {exc}") from exc
+
+        boundaries = fit_price_class_boundaries_from_series_cache(
+            config,
+            num_classes=num_classes,
+            fit_on=fit_on,
+            labeling_criteria=labeling_criteria,
+            max_samples=max_samples,
+            random_seed=random_seed,
+        )
+        price_classes_cfg["boundaries"] = boundaries
+        return
+
+    raise ConfigError("targets.price_classes.boundaries must be a non-empty list or the string 'auto'")
+
+
 def _resolve_output_num_classes(config: Dict[str, Any]) -> int:
     model_cfg = config.get("model")
     if not isinstance(model_cfg, dict):
@@ -946,6 +1074,9 @@ def load_config(
     resolved_config = _resolve_env_placeholders(copy.deepcopy(raw_config))
 
     _validate_config_schema(resolved_config, schema)
+
+    # Resolve dynamic target boundaries before enforcing num_classes invariants.
+    _resolve_price_class_boundaries(resolved_config)
 
     _validate_two_head_intensity_num_classes(resolved_config)
     _validate_class_balancing_config(resolved_config)
