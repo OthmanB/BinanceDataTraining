@@ -2449,17 +2449,17 @@ def _render_ui_page(_config: ServerConfig) -> str:
       function applyTheme(t){{document.documentElement.setAttribute('data-theme',t);document.getElementById('theme-icon').textContent=t==='dark'?'\u2600\uFE0F':'\uD83C\uDF19';localStorage.setItem('obs-theme',t);}}
       function toggleTheme(){{var c=document.documentElement.getAttribute('data-theme')||'light';applyTheme(c==='dark'?'light':'dark');}}
       applyTheme(getPreferredTheme());
-      function switchTab(btn,name){{document.querySelectorAll('.tab-panel').forEach(function(p){{p.classList.remove('active')}});document.querySelectorAll('.tab-btn').forEach(function(t){{t.classList.remove('active')}});document.getElementById('tab-'+name).classList.add('active');btn.classList.add('active');}}
+       function switchTab(btn,name){{document.querySelectorAll('.tab-panel').forEach(function(p){{p.classList.remove('active')}});document.querySelectorAll('.tab-btn').forEach(function(t){{t.classList.remove('active')}});var panel=document.getElementById('tab-'+name);if(panel){{panel.classList.add('active');btn.classList.add('active');}}}}
       function filterLogs(){{var q=document.getElementById('log-filter').value.toLowerCase();document.querySelectorAll('#logs-panel .log-line').forEach(function(l){{l.style.display=(!q||l.textContent.toLowerCase().indexOf(q)!==-1)?'':'none'}});}}
       window._autoScroll=true;
-      function toggleAutoScroll(){{window._autoScroll=!window._autoScroll;document.getElementById('autoscroll-btn').textContent='Auto-scroll: '+(window._autoScroll?'ON':'OFF');}}
+       function toggleAutoScroll(){{window._autoScroll=!window._autoScroll;var btn=document.getElementById('autoscroll-btn');if(btn)btn.textContent='Auto-scroll: '+(window._autoScroll?'ON':'OFF');}}
       document.addEventListener('click',function(e){{if(e.target.classList.contains('section-title')){{e.target.classList.toggle('collapsed');var el=e.target.nextElementSibling;while(el&&!el.classList.contains('section-title')){{el.style.display=e.target.classList.contains('collapsed')?'none':'';el=el.nextElementSibling;}}}}}});
       function exportRunState(){{fetch('/api/run-state').then(function(r){{return r.json()}}).then(function(d){{var blob=new Blob([JSON.stringify(d,null,2)],{{type:'application/json'}});var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='run_state_'+new Date().toISOString().slice(0,19).replace(/:/g,'-')+'.json';a.click();}}).catch(function(e){{alert('Export failed: '+e);}});}}
       function setRefreshRate(sec){{var val=parseInt(sec,10)||5;document.querySelectorAll('[hx-trigger*="every"]').forEach(function(el){{var t=el.getAttribute('hx-trigger');if(t){{var newT=t.replace(/every \\d+s/g,'every '+val+'s');el.setAttribute('hx-trigger',newT);if(window.htmx)htmx.process(el);}}}});}}
       function _syncListTA(uid){{var c=document.getElementById('items_'+uid);if(!c)return;var items=[];c.querySelectorAll('.list-item-text').forEach(function(s){{items.push(s.textContent)}});var ta=document.getElementById('ta_'+uid);if(ta)ta.value=items.length?'['+items.map(function(v){{return /^\\d+(\\.\\d+)?$/.test(v)?v:'"'+v.replace(/"/g,'\\\\"')+'"'}}).join(', ')+']':'[]';}}
-      function removeListItem(btn,uid){{btn.parentElement.remove();_syncListTA(uid);}}
-      function addListItemFromSelect(uid){{var sel=document.getElementById('sel_'+uid);if(!sel||!sel.value)return;var v=sel.value;var c=document.getElementById('items_'+uid);var existing=[];c.querySelectorAll('.list-item-text').forEach(function(s){{existing.push(s.textContent)}});if(existing.indexOf(v)!==-1){{sel.value='';return;}}var d=document.createElement('div');d.className='list-item';d.setAttribute('data-list',uid);d.innerHTML='<span class="list-item-text">'+v+'</span><button type="button" class="list-btn-sm danger" onclick="removeListItem(this,\\''+uid+'\\')">-</button>';c.appendChild(d);sel.value='';_syncListTA(uid);}}
-      function addListItemFromInput(uid){{var inp=document.getElementById('inp_'+uid);if(!inp||!inp.value.trim())return;var v=inp.value.trim();var c=document.getElementById('items_'+uid);var d=document.createElement('div');d.className='list-item';d.setAttribute('data-list',uid);d.innerHTML='<span class="list-item-text">'+v+'</span><button type="button" class="list-btn-sm danger" onclick="removeListItem(this,\\''+uid+'\\')">-</button>';c.appendChild(d);inp.value='';_syncListTA(uid);}}
+       function removeListItem(btn,uid){{var parent=btn.parentElement;if(parent){{parent.remove();_syncListTA(uid);}}}}
+      function addListItemFromSelect(uid){{var sel=document.getElementById('sel_'+uid);if(!sel||!sel.value)return;var v=sel.value;var c=document.getElementById('items_'+uid);if(!c)return;var existing=[];c.querySelectorAll('.list-item-text').forEach(function(s){{existing.push(s.textContent)}});if(existing.indexOf(v)!==-1){{sel.value='';return;}}var d=document.createElement('div');d.className='list-item';d.setAttribute('data-list',uid);d.innerHTML='<span class="list-item-text">'+v+'</span><button type="button" class="list-btn-sm danger" onclick="removeListItem(this,\\''+uid+'\\')">-</button>';c.appendChild(d);sel.value='';_syncListTA(uid);}}
+      function addListItemFromInput(uid){{var inp=document.getElementById('inp_'+uid);if(!inp||!inp.value.trim())return;var v=inp.value.trim();var c=document.getElementById('items_'+uid);if(!c)return;var d=document.createElement('div');d.className='list-item';d.setAttribute('data-list',uid);d.innerHTML='<span class="list-item-text">'+v+'</span><button type="button" class="list-btn-sm danger" onclick="removeListItem(this,\\''+uid+'\\')">-</button>';c.appendChild(d);inp.value='';_syncListTA(uid);}}
       function _syncConnTA(){{
         var rows=document.querySelectorAll('#conn-tbody .conn-row');
         var conns=[];
@@ -2494,7 +2494,7 @@ def _render_ui_page(_config: ServerConfig) -> str:
         }});
         ta.value=lines.length?lines.join('\\n'):'[]';
       }}
-      function removeConnRow(btn){{btn.closest('tr').remove();_syncConnTA();}}
+      function removeConnRow(btn){{var row=btn.closest('tr');if(row){{row.remove();_syncConnTA();}}}}
       function addConnRow(){{var tb=document.getElementById('conn-tbody');if(!tb)return;var tr=document.createElement('tr');tr.className='conn-row';tr.innerHTML='<td><input type="text" class="conn-f" data-field="name" value="" /></td><td><input type="text" class="conn-f" data-field="database_uri" value="" /></td><td><input type="text" class="conn-f" data-field="table_prefix" value="orderbook_" /></td><td><input type="date" class="conn-f" data-field="start_date" value="" /></td><td><input type="date" class="conn-f" data-field="end_date" value="" /></td><td><button type="button" class="list-btn-sm danger" onclick="removeConnRow(this)">-</button></td>';tb.appendChild(tr);tr.querySelectorAll('.conn-f').forEach(function(f){{f.addEventListener('change',_syncConnTA);}});_syncConnTA();}}
       document.addEventListener('change',function(e){{if(e.target.classList.contains('conn-f'))_syncConnTA();}});
       function loadAssets(fieldKey){{fetch('/api/config/assets').then(function(r){{return r.json()}}).then(function(d){{var sel=document.getElementById('asset_sel_'+fieldKey);if(!sel)return;var cur=sel.value;var opts='';(d.assets||[]).forEach(function(a){{var s=(a===cur)?'selected':'';opts+='<option value="'+a+'" '+s+'>'+a+'</option>';}});if(opts)sel.innerHTML=opts;else sel.innerHTML='<option value="">No assets found</option>';}}).catch(function(e){{alert('Failed to load assets: '+e);}});}}
@@ -2516,15 +2516,16 @@ def _render_ui_page(_config: ServerConfig) -> str:
       }}
       var _nnParams={{"cnn":[{{"name":"filters","type":"number","default":"32"}},{{"name":"kernel_size","type":"text","default":"[3,3]"}},{{"name":"pool_size","type":"text","default":"[2,2]"}},{{"name":"normalization","type":"select","default":"null","options":"null,batch,group,layer"}},{{"name":"dropout","type":"number","default":"0.0"}}],"lstm":[{{"name":"units","type":"number","default":"64"}},{{"name":"dropout","type":"number","default":"0.0"}},{{"name":"recurrent_dropout","type":"number","default":"0.0"}},{{"name":"post_dropout","type":"number","default":"0.0"}}],"dense":[{{"name":"units","type":"number","default":"64"}},{{"name":"dropout","type":"number","default":"0.0"}}]}};
       function _syncNNTA(){{var row=document.getElementById('nn-cards-row');if(!row)return;['cnn','lstm','dense'].forEach(function(lt){{var cards=row.querySelectorAll('.nn-card[data-layer-type="'+lt+'"]');var layers=[];cards.forEach(function(c){{var l={{}};c.querySelectorAll('.nn-p').forEach(function(f){{var k=f.getAttribute('data-param');var v=f.value;if(/^\\d+$/.test(v))l[k]=parseInt(v,10);else if(/^\\d+\\.\\d*$/.test(v)||/^\\d*\\.\\d+$/.test(v))l[k]=parseFloat(v);else if(v==='null')l[k]=null;else if(v.startsWith('[')){{try{{l[k]=JSON.parse(v)}}catch(e){{l[k]=v}}}}else l[k]=v;}});layers.push(l);}});var ta=document.getElementById('ta_nn_'+lt);if(ta){{try{{ta.value=JSON.stringify(layers)}}catch(e){{ta.value='[]'}}}}}});}}
-      function removeNNCard(btn){{btn.closest('.nn-card').remove();_syncNNTA();}}
+      function removeNNCard(btn){{var card=btn.closest('.nn-card');if(card){{card.remove();_syncNNTA();}}}}
       function addNNCard(lt){{var row=document.getElementById('nn-cards-row');if(!row)return;var params=_nnParams[lt]||[];var html='';params.forEach(function(p){{if(p.type==='select'){{var opts='';p.options.split(',').forEach(function(o){{var s=(o===p.default)?'selected':'';opts+='<option value="'+o+'" '+s+'>'+o+'</option>';}});html+='<div class="nn-param"><label>'+p.name+'</label><select class="nn-p" data-param="'+p.name+'">'+opts+'</select></div>';}}else{{var it=p.type==='number'?'number':'text';var st=p.type==='number'?' step="any"':'';html+='<div class="nn-param"><label>'+p.name+'</label><input type="'+it+'"'+st+' class="nn-p" data-param="'+p.name+'" value="'+p.default+'" /></div>';}}}});var idx=row.querySelectorAll('.nn-card[data-layer-type="'+lt+'"]').length;var card=document.createElement('div');card.className='nn-card';card.setAttribute('data-layer-type',lt);card.setAttribute('data-idx',idx);card.innerHTML='<div class="nn-card-header"><span class="nn-card-type">'+lt.toUpperCase()+' '+(idx+1)+'</span><button type="button" class="list-btn-sm danger" onclick="removeNNCard(this)">-</button></div><div class="nn-card-body">'+html+'</div>';var output=row.querySelector('.nn-fixed-card.output');if(output)row.insertBefore(card,output);else row.appendChild(card);_syncNNTA();}}
       document.addEventListener('change',function(e){{if(e.target.classList.contains('nn-p'))_syncNNTA();}});
-      document.addEventListener('DOMContentLoaded',function(){{
-        _syncNNTA();
-        var sel=document.getElementById('pc_boundaries_mode');
-        if(sel){{setPriceBoundariesMode(sel.value);}}
-      }});
-    </script>
+       document.addEventListener('DOMContentLoaded',function(){{
+         _syncNNTA();
+         var sel=document.getElementById('pc_boundaries_mode');
+         if(sel){{setPriceBoundariesMode(sel.value);}}
+       }});
+       document.body.addEventListener('htmx:beforeSwap',function(e){{if(e.detail.xhr.status===409){{e.detail.shouldSwap=true;e.detail.isError=false;}}}});
+     </script>
   </body>
 </html>
 """
@@ -2572,6 +2573,23 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
                 "run_status": run_status,
                 "run_state_stale": is_stale,
             })
+            return
+
+        # Static files — no auth required (for htmx.min.js, etc.)
+        if path.startswith("/static/"):
+            cfg = self.server_state.config
+            static_path = _safe_static_file_path(static_dir=cfg.static_dir, request_path=path)
+            if static_path is None or not static_path.exists() or not static_path.is_file():
+                self.send_response(404)
+                self.end_headers()
+                return
+            content = static_path.read_bytes()
+            self.send_response(200)
+            mime_type, _encoding = mimetypes.guess_type(str(static_path))
+            self.send_header("Content-Type", mime_type or "application/octet-stream")
+            self.send_header("Cache-Control", "public, max-age=3600")
+            self.end_headers()
+            self.wfile.write(content)
             return
 
         if not self._require_auth():
@@ -2721,6 +2739,7 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
                         f'var ctx=document.getElementById("{chart_id}");'
                         f'if(!ctx)return;'
                         f'if(ctx._chartInstance){{ctx._chartInstance.destroy();}}'
+                        f'if(typeof Chart==="undefined"){{console.warn("Chart.js not loaded");return;}}'
                         f'var isDark=document.documentElement.getAttribute("data-theme")==="dark";'
                         f'var gridColor=isDark?"rgba(255,255,255,0.08)":"rgba(0,0,0,0.06)";'
                         f'var tickColor=isDark?"#9499ad":"#5a6072";'
@@ -3124,10 +3143,11 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
                 f'<canvas id="{chart_id}" style="width:100%;max-height:320px"></canvas>'
                 '<script>'
                 f'(function(){{'
-                f'var ctx=document.getElementById("{chart_id}");'
-                f'if(!ctx)return;'
-                f'if(ctx._chartInstance){{ctx._chartInstance.destroy();}}'
-                f'var isDark=document.documentElement.getAttribute("data-theme")==="dark";'
+                 f'var ctx=document.getElementById("{chart_id}");'
+                 f'if(!ctx)return;'
+                 f'if(ctx._chartInstance){{ctx._chartInstance.destroy();}}'
+                 f'if(typeof Chart==="undefined"){{console.warn("Chart.js not loaded");return;}}'
+                 f'var isDark=document.documentElement.getAttribute("data-theme")==="dark";'
                 f'var gridColor=isDark?"rgba(255,255,255,0.08)":"rgba(0,0,0,0.06)";'
                 f'var tickColor=isDark?"#9499ad":"#5a6072";'
                 f'ctx._chartInstance=new Chart(ctx,{{'
@@ -3457,21 +3477,6 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": str(exc)}, status=500)
             return
 
-        if path.startswith("/static/"):
-            cfg = self.server_state.config
-            static_path = _safe_static_file_path(static_dir=cfg.static_dir, request_path=path)
-            if static_path is None or not static_path.exists() or not static_path.is_file():
-                self.send_response(404)
-                self.end_headers()
-                return
-            content = static_path.read_bytes()
-            self.send_response(200)
-            mime_type, _encoding = mimetypes.guess_type(str(static_path))
-            self.send_header("Content-Type", mime_type or "application/octet-stream")
-            self.end_headers()
-            self.wfile.write(content)
-            return
-
         self.send_response(404)
         self.end_headers()
 
@@ -3755,7 +3760,8 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
             ok, message = self.server_state.start_run(config_path)
             if path == "/ui/start":
                 status = 200 if ok else 409
-                self._send_html(f"<strong>{message}</strong>", status=status)
+                status_class = "status-ok" if ok else "status-error"
+                self._send_html(f'<div class="{status_class}"><strong>{message}</strong></div>', status=status)
             else:
                 status = 200 if ok else 409
                 self._send_json({"message": message}, status=status)
@@ -3769,7 +3775,8 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
             ok, message = self.server_state.stop_run()
             if path == "/ui/stop":
                 status = 200 if ok else 409
-                self._send_html(f"<strong>{message}</strong>", status=status)
+                status_class = "status-ok" if ok else "status-error"
+                self._send_html(f'<div class="{status_class}"><strong>{message}</strong></div>', status=status)
             else:
                 status = 200 if ok else 409
                 self._send_json({"message": message}, status=status)
