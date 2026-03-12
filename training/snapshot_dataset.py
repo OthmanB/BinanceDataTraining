@@ -14,13 +14,14 @@ import numpy as np
 
 from data.greptime_client import (
     OrderBookChunk,
-    _generate_time_chunks,
+    generate_time_chunks,
     stream_order_book_chunks_by_time,
 )
 from preprocessing.depth_aggregator import aggregate_snapshot_to_hybrid, get_hybrid_output_shape
 from preprocessing.feature_engineering import FeatureEngineer
 from preprocessing.time_utils import normalize_timestamp_array
 from utils.config_loader import ConfigError
+from utils.formatting import format_bytes
 from .snapshot_store import (
     SnapshotContext,
     load_or_create_manifest,
@@ -39,13 +40,7 @@ CHUNK_STORAGE_FRAME_STORE_V1 = "frame_store_v1"
 
 
 def _format_bytes(value: int) -> str:
-    size = float(max(int(value), 0))
-    units = ["B", "KiB", "MiB", "GiB", "TiB"]
-    idx = 0
-    while size >= 1024.0 and idx < len(units) - 1:
-        size /= 1024.0
-        idx += 1
-    return f"{size:.2f}{units[idx]}"
+    return format_bytes(int(value))
 
 
 def _safe_file_size(path: str) -> int:
@@ -53,6 +48,10 @@ def _safe_file_size(path: str) -> int:
         return int(os.path.getsize(path))
     except OSError:
         return 0
+
+
+def safe_file_size(path: str) -> int:
+    return _safe_file_size(path)
 
 
 def _snapshot_directory_size_bytes(snapshot_dir: str) -> int:
@@ -1408,6 +1407,10 @@ def _open_chunk_sample_reader(chunk: SnapshotChunk) -> _ChunkSampleReader:
     return _NpzSampleReader(chunk)
 
 
+def open_chunk_sample_reader(chunk: SnapshotChunk) -> _ChunkSampleReader:
+    return _open_chunk_sample_reader(chunk)
+
+
 def _iter_indices_by_chunk(
     dataset: SnapshotDataset,
     indices: np.ndarray,
@@ -2521,6 +2524,21 @@ def _populate_hybrid_snapshots(
         ).astype("float32")
 
 
+def populate_hybrid_snapshots(
+    records: List[SnapshotRecord],
+    config: Dict[str, Any],
+    *,
+    fail_on_invalid: bool,
+    asset_name: str,
+) -> None:
+    _populate_hybrid_snapshots(
+        records,
+        config,
+        fail_on_invalid=fail_on_invalid,
+        asset_name=asset_name,
+    )
+
+
 def _zero_pad_record(
     timestamp: np.datetime64,
     representation: str,
@@ -2697,11 +2715,7 @@ def _materialize_frame_store_core_arrays(
     return frames_base, frames_confidence, frames_observed, frames_ts
 
 
-def _build_snapshot_chunks(
-    config: Dict[str, Any],
-    context: SnapshotContext,
-    manifest: Dict[str, Any],
-) -> Dict[str, Any]:
+def _init_snapshot_build_writer() -> Optional[Any]:
     writer = None
     try:
         from observability.run_state import get_run_state_writer
@@ -2710,6 +2724,180 @@ def _build_snapshot_chunks(
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to initialize run-state writer for snapshot build: %s", exc)
         writer = None
+    return writer
+
+
+def _publish_snapshot_progress(writer: Optional[Any], *, processed: int, total: int, context_label: str) -> None:
+    if writer is None:
+        return
+    try:
+        writer.update_snapshot_progress(processed=processed, total=total)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to publish snapshot progress update (%s): %s", context_label, exc)
+
+
+def _publish_duty_cycle_summary(writer: Optional[Any], duty_cycle_stats: _DutyCycleAccumulator) -> None:
+    if writer is None:
+        return
+    summary = duty_cycle_stats.summary()
+    if summary is None:
+        return
+    try:
+        writer.update_duty_cycle_stats(*summary)
+    except Exception:  # noqa: BLE001
+        logger.warning("Failed to publish duty-cycle summary to run-state", exc_info=True)
+
+
+def _prepare_snapshot_manifest_and_dirs(
+    context: SnapshotContext,
+    manifest: Dict[str, Any],
+) -> None:
+    manifest["complete"] = False
+    save_manifest(context, manifest)
+    os.makedirs(os.path.join(context.snapshot_dir, "chunks"), exist_ok=True)
+    os.makedirs(os.path.join(context.snapshot_dir, "series"), exist_ok=True)
+
+
+def _mark_cached_output_boundaries(
+    output_boundaries: List[Dict[str, Any]],
+    existing_entries: Dict[Tuple[str, str], Dict[str, Any]],
+) -> None:
+    for boundary in output_boundaries:
+        key = (boundary["start_str"], boundary["end_str"])
+        if key in existing_entries:
+            boundary["cached"] = True
+
+
+def _build_frame_payload_from_multi_records(
+    multi_records: List[MultiAssetSnapshotRecord],
+    assets: List[str],
+    sample_builder: StreamingSampleBuilder,
+    config: Dict[str, Any],
+    *,
+    prefix_overlap_frames: int,
+    prev_tail_base: Optional[np.ndarray],
+    prev_tail_confidence: Optional[np.ndarray],
+    prev_tail_observed: Optional[np.ndarray],
+    prev_tail_ts: Optional[np.ndarray],
+    num_assets: int,
+    fail_on_invalid: bool,
+) -> Tuple[_FrameStoreChunkPayload, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+    core_base, core_confidence, core_observed, core_ts = _materialize_frame_store_core_arrays(
+        multi_records,
+        assets,
+        sample_builder,
+        config,
+        fail_on_invalid=fail_on_invalid,
+    )
+
+    overlap_frames = 0
+    if (
+        prefix_overlap_frames > 0
+        and prev_tail_base is not None
+        and prev_tail_confidence is not None
+        and prev_tail_observed is not None
+        and prev_tail_ts is not None
+        and prev_tail_base.shape[0] > 0
+    ):
+        overlap_frames = int(min(prefix_overlap_frames, prev_tail_base.shape[0]))
+        prefix_base = np.asarray(prev_tail_base[-overlap_frames:], dtype="float32")
+        prefix_confidence = np.asarray(prev_tail_confidence[-overlap_frames:], dtype="float32")
+        prefix_observed = np.asarray(prev_tail_observed[-overlap_frames:], dtype="uint8")
+        prefix_ts = np.asarray(prev_tail_ts[-overlap_frames:], dtype="int64")
+    else:
+        shape_base = (0,) + tuple(core_base.shape[1:])
+        prefix_base = np.zeros(shape_base, dtype="float32")
+        prefix_confidence = np.zeros((0, num_assets), dtype="float32")
+        prefix_observed = np.zeros((0, num_assets), dtype="uint8")
+        prefix_ts = np.zeros((0,), dtype="int64")
+
+    frames_base = np.concatenate([prefix_base, core_base], axis=0).astype("float32", copy=False)
+    frames_confidence = np.concatenate([prefix_confidence, core_confidence], axis=0).astype("float32", copy=False)
+    frames_observed = np.concatenate([prefix_observed, core_observed], axis=0).astype("uint8", copy=False)
+    frames_ts = np.concatenate([prefix_ts, core_ts], axis=0).astype("int64", copy=False)
+
+    anchor_local_idx_by_ts: Dict[int, int] = {}
+    for core_idx, ts_value in enumerate(core_ts):
+        anchor_local_idx_by_ts[int(ts_value)] = int(overlap_frames + core_idx)
+
+    next_tail_base = prev_tail_base
+    next_tail_confidence = prev_tail_confidence
+    next_tail_observed = prev_tail_observed
+    next_tail_ts = prev_tail_ts
+    if core_base.shape[0] > 0:
+        tail_len = int(min(prefix_overlap_frames, core_base.shape[0]))
+        next_tail_base = np.asarray(core_base[-tail_len:], dtype="float32")
+        next_tail_confidence = np.asarray(core_confidence[-tail_len:], dtype="float32")
+        next_tail_observed = np.asarray(core_observed[-tail_len:], dtype="uint8")
+        next_tail_ts = np.asarray(core_ts[-tail_len:], dtype="int64")
+
+    return (
+        _FrameStoreChunkPayload(
+            frames_base=frames_base,
+            frames_confidence=frames_confidence,
+            frames_observed=frames_observed,
+            frames_ts=frames_ts,
+            anchor_local_idx_by_ts=anchor_local_idx_by_ts,
+            num_core_frames=int(core_base.shape[0]),
+            overlap_frames=int(overlap_frames),
+        ),
+        next_tail_base,
+        next_tail_confidence,
+        next_tail_observed,
+        next_tail_ts,
+    )
+
+
+def _write_series_chunk(
+    context: SnapshotContext,
+    manifest: Dict[str, Any],
+    *,
+    chunk_key: Tuple[str, str],
+    series_timestamps: List[int],
+    series_mid_prices: List[float],
+    series_volumes: List[float],
+    existing_series_entries: Dict[Tuple[str, str], Dict[str, Any]],
+) -> None:
+    series_filename = _chunk_filename(chunk_key[0], chunk_key[1])
+    series_rel = os.path.join("series", series_filename)
+    series_path = os.path.join(context.snapshot_dir, series_rel)
+    series_key = (chunk_key[0], chunk_key[1])
+
+    if series_key not in existing_series_entries or not os.path.exists(series_path):
+        series_ts_arr = np.asarray(series_timestamps, dtype="int64")
+        series_mid_arr = np.asarray(series_mid_prices, dtype="float64")
+        series_vol_arr = np.asarray(series_volumes, dtype="float64")
+
+        np.savez_compressed(
+            series_path,
+            timestamps=series_ts_arr,
+            mid_prices=series_mid_arr,
+            volumes=series_vol_arr,
+        )
+        logger.debug(
+            "Snapshot series file written: path=%s size=%s snapshots=%s",
+            series_path,
+            _format_bytes(_safe_file_size(series_path)),
+            int(series_ts_arr.shape[0]),
+        )
+
+    series_entry = {
+        "start": chunk_key[0],
+        "end": chunk_key[1],
+        "file": series_rel,
+        "num_snapshots": int(len(series_timestamps)),
+        "created_at": datetime.utcnow().isoformat() + "Z",
+    }
+    _upsert_series_entry(manifest, series_entry)
+    save_manifest(context, manifest)
+
+
+def _build_snapshot_chunks(
+    config: Dict[str, Any],
+    context: SnapshotContext,
+    manifest: Dict[str, Any],
+) -> Dict[str, Any]:
+    writer = _init_snapshot_build_writer()
     data_cfg = config["data"]
     time_range_cfg = data_cfg["time_range"]
     start_date = str(time_range_cfg["start_date"])
@@ -2727,42 +2915,19 @@ def _build_snapshot_chunks(
     if not assets:
         raise ValueError("data.asset_pairs must define at least one asset for snapshot building")
 
-    output_chunks = _generate_time_chunks(start_date, end_date, chunk_hours)
+    output_chunks = generate_time_chunks(start_date, end_date, chunk_hours)
     output_boundaries = _build_output_boundaries(output_chunks)
     chunks_total = len(output_boundaries)
     chunks_processed = 0
 
-    if writer is not None:
-        try:
-            writer.update_snapshot_progress(processed=0, total=chunks_total)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to publish initial snapshot progress: %s", exc)
+    _publish_snapshot_progress(writer, processed=0, total=chunks_total, context_label="initial snapshot build")
 
     duty_cycle_stats = _DutyCycleAccumulator()
-
-    def _update_duty_cycle_writer() -> None:
-        if writer is None:
-            return
-        summary = duty_cycle_stats.summary()
-        if summary is None:
-            return
-        try:
-            writer.update_duty_cycle_stats(*summary)
-        except Exception:  # noqa: BLE001
-            logger.warning("Failed to publish duty-cycle summary to run-state", exc_info=True)
-
-    manifest["complete"] = False
-    save_manifest(context, manifest)
-
-    os.makedirs(os.path.join(context.snapshot_dir, "chunks"), exist_ok=True)
-    os.makedirs(os.path.join(context.snapshot_dir, "series"), exist_ok=True)
+    _prepare_snapshot_manifest_and_dirs(context, manifest)
 
     existing_entries = _existing_chunk_entries(context, manifest)
     existing_series_entries = _existing_series_entries(context, manifest)
-    for boundary in output_boundaries:
-        key = (boundary["start_str"], boundary["end_str"])
-        if key in existing_entries:
-            boundary["cached"] = True
+    _mark_cached_output_boundaries(output_boundaries, existing_entries)
 
     series_meta = manifest.get("series")
     if not isinstance(series_meta, dict):
@@ -2795,67 +2960,6 @@ def _build_snapshot_chunks(
     prev_tail_observed: Optional[np.ndarray] = None
     prev_tail_ts: Optional[np.ndarray] = None
 
-    def _build_frame_payload(multi_records: List[MultiAssetSnapshotRecord]) -> _FrameStoreChunkPayload:
-        nonlocal prev_tail_base
-        nonlocal prev_tail_confidence
-        nonlocal prev_tail_observed
-        nonlocal prev_tail_ts
-
-        core_base, core_confidence, core_observed, core_ts = _materialize_frame_store_core_arrays(
-            multi_records,
-            assets,
-            sample_builder,
-            config,
-            fail_on_invalid=fail_on_invalid,
-        )
-
-        overlap_frames = 0
-        if (
-            prefix_overlap_frames > 0
-            and prev_tail_base is not None
-            and prev_tail_confidence is not None
-            and prev_tail_observed is not None
-            and prev_tail_ts is not None
-            and prev_tail_base.shape[0] > 0
-        ):
-            overlap_frames = int(min(prefix_overlap_frames, prev_tail_base.shape[0]))
-            prefix_base = np.asarray(prev_tail_base[-overlap_frames:], dtype="float32")
-            prefix_confidence = np.asarray(prev_tail_confidence[-overlap_frames:], dtype="float32")
-            prefix_observed = np.asarray(prev_tail_observed[-overlap_frames:], dtype="uint8")
-            prefix_ts = np.asarray(prev_tail_ts[-overlap_frames:], dtype="int64")
-        else:
-            shape_base = (0,) + tuple(core_base.shape[1:])
-            prefix_base = np.zeros(shape_base, dtype="float32")
-            prefix_confidence = np.zeros((0, num_assets), dtype="float32")
-            prefix_observed = np.zeros((0, num_assets), dtype="uint8")
-            prefix_ts = np.zeros((0,), dtype="int64")
-
-        frames_base = np.concatenate([prefix_base, core_base], axis=0).astype("float32", copy=False)
-        frames_confidence = np.concatenate([prefix_confidence, core_confidence], axis=0).astype("float32", copy=False)
-        frames_observed = np.concatenate([prefix_observed, core_observed], axis=0).astype("uint8", copy=False)
-        frames_ts = np.concatenate([prefix_ts, core_ts], axis=0).astype("int64", copy=False)
-
-        anchor_local_idx_by_ts: Dict[int, int] = {}
-        for core_idx, ts_value in enumerate(core_ts):
-            anchor_local_idx_by_ts[int(ts_value)] = int(overlap_frames + core_idx)
-
-        if core_base.shape[0] > 0:
-            tail_len = int(min(prefix_overlap_frames, core_base.shape[0]))
-            prev_tail_base = np.asarray(core_base[-tail_len:], dtype="float32")
-            prev_tail_confidence = np.asarray(core_confidence[-tail_len:], dtype="float32")
-            prev_tail_observed = np.asarray(core_observed[-tail_len:], dtype="uint8")
-            prev_tail_ts = np.asarray(core_ts[-tail_len:], dtype="int64")
-
-        return _FrameStoreChunkPayload(
-            frames_base=frames_base,
-            frames_confidence=frames_confidence,
-            frames_observed=frames_observed,
-            frames_ts=frames_ts,
-            anchor_local_idx_by_ts=anchor_local_idx_by_ts,
-            num_core_frames=int(core_base.shape[0]),
-            overlap_frames=int(overlap_frames),
-        )
-
     def flush_chunk(index: int) -> None:
         nonlocal chunk_samples
         nonlocal chunks_processed
@@ -2887,28 +2991,30 @@ def _build_snapshot_chunks(
                     )
                     duty_cycle = _load_chunk_duty_cycle(chunk_for_stats)
                     duty_cycle_stats.add_values(duty_cycle)
-                    _update_duty_cycle_writer()
+                    _publish_duty_cycle_summary(writer, duty_cycle_stats)
             except Exception:  # noqa: BLE001
                 logger.warning("Failed to load duty_cycle from cached chunk for %s", key, exc_info=True)
             pending_frame_payloads.pop(index, None)
             chunk_samples = []
             chunks_processed += 1
-            if writer is not None:
-                try:
-                    writer.update_snapshot_progress(processed=chunks_processed, total=chunks_total)
-                except Exception:
-                    pass
+            _publish_snapshot_progress(
+                writer,
+                processed=chunks_processed,
+                total=chunks_total,
+                context_label="empty chunk path",
+            )
             return
 
         if not chunk_samples:
             pending_frame_payloads.pop(index, None)
             chunk_samples = []
             chunks_processed += 1
-            if writer is not None:
-                try:
-                    writer.update_snapshot_progress(processed=chunks_processed, total=chunks_total)
-                except Exception:
-                    pass
+            _publish_snapshot_progress(
+                writer,
+                processed=chunks_processed,
+                total=chunks_total,
+                context_label="no-sample chunk path",
+            )
             return
 
         chunk_start = boundary["start_str"]
@@ -2952,7 +3058,7 @@ def _build_snapshot_chunks(
             anchor_local_idx[sample_idx] = int(local_idx)
 
         duty_cycle_stats.add_values(duty_cycle)
-        _update_duty_cycle_writer()
+        _publish_duty_cycle_summary(writer, duty_cycle_stats)
 
         files_rel = {
             "frames_base": os.path.join(chunk_dir_rel, "frames_base.npy"),
@@ -3051,17 +3157,19 @@ def _build_snapshot_chunks(
         chunk_samples = []
 
         chunks_processed += 1
-        if writer is not None:
-            try:
-                writer.update_snapshot_progress(processed=chunks_processed, total=chunks_total)
-            except Exception:
-                pass
+        _publish_snapshot_progress(
+            writer,
+            processed=chunks_processed,
+            total=chunks_total,
+            context_label="materialized chunk path",
+        )
 
     current_chunk_key: Optional[Tuple[str, str]] = None
     chunk_rows: Dict[str, List[List[Any]]] = {}
 
     def process_chunk(chunk_key: Tuple[str, str], chunk_rows_by_asset: Dict[str, List[List[Any]]]) -> None:
         nonlocal current_chunk_idx
+        nonlocal prev_tail_base, prev_tail_confidence, prev_tail_observed, prev_tail_ts
         missing_assets = [asset for asset in assets if asset not in chunk_rows_by_asset]
         if missing_assets:
             message = f"Missing chunk data for assets={missing_assets} in chunk {chunk_key}"
@@ -3112,7 +3220,21 @@ def _build_snapshot_chunks(
 
         boundary_idx = boundary_index_by_key.get(chunk_key)
         if boundary_idx is not None:
-            frame_payload = _build_frame_payload(multi_records)
+            frame_payload, prev_tail_base, prev_tail_confidence, prev_tail_observed, prev_tail_ts = (
+                _build_frame_payload_from_multi_records(
+                    multi_records,
+                    assets,
+                    sample_builder,
+                    config,
+                    prefix_overlap_frames=prefix_overlap_frames,
+                    prev_tail_base=prev_tail_base,
+                    prev_tail_confidence=prev_tail_confidence,
+                    prev_tail_observed=prev_tail_observed,
+                    prev_tail_ts=prev_tail_ts,
+                    num_assets=num_assets,
+                    fail_on_invalid=fail_on_invalid,
+                )
+            )
             if not output_boundaries[boundary_idx]["cached"]:
                 pending_frame_payloads[boundary_idx] = frame_payload
 
@@ -3150,38 +3272,15 @@ def _build_snapshot_chunks(
 
                 chunk_samples.append(sample)
 
-        series_filename = _chunk_filename(chunk_key[0], chunk_key[1])
-        series_rel = os.path.join("series", series_filename)
-        series_path = os.path.join(context.snapshot_dir, series_rel)
-        series_key = (chunk_key[0], chunk_key[1])
-
-        if series_key not in existing_series_entries or not os.path.exists(series_path):
-            series_ts_arr = np.asarray(series_timestamps, dtype="int64")
-            series_mid_arr = np.asarray(series_mid_prices, dtype="float64")
-            series_vol_arr = np.asarray(series_volumes, dtype="float64")
-
-            np.savez_compressed(
-                series_path,
-                timestamps=series_ts_arr,
-                mid_prices=series_mid_arr,
-                volumes=series_vol_arr,
-            )
-            logger.debug(
-                "Snapshot series file written: path=%s size=%s snapshots=%s",
-                series_path,
-                _format_bytes(_safe_file_size(series_path)),
-                int(series_ts_arr.shape[0]),
-            )
-
-        series_entry = {
-            "start": chunk_key[0],
-            "end": chunk_key[1],
-            "file": series_rel,
-            "num_snapshots": int(len(series_timestamps)),
-            "created_at": datetime.utcnow().isoformat() + "Z",
-        }
-        _upsert_series_entry(manifest, series_entry)
-        save_manifest(context, manifest)
+        _write_series_chunk(
+            context,
+            manifest,
+            chunk_key=chunk_key,
+            series_timestamps=series_timestamps,
+            series_mid_prices=series_mid_prices,
+            series_volumes=series_volumes,
+            existing_series_entries=existing_series_entries,
+        )
 
     for chunk in stream_order_book_chunks_by_time(config, assets_override=assets):
         key = (chunk.chunk_start, chunk.chunk_end)
@@ -3274,6 +3373,10 @@ def _chunk_filename(start_str: str, end_str: str) -> str:
     safe_start = start_str.replace(" ", "_").replace(":", "-")
     safe_end = end_str.replace(" ", "_").replace(":", "-")
     return f"{safe_start}_{safe_end}.npz"
+
+
+def chunk_filename(start_str: str, end_str: str) -> str:
+    return _chunk_filename(start_str, end_str)
 
 
 def _chunk_storage_stem(start_str: str, end_str: str) -> str:
@@ -3534,6 +3637,19 @@ def _build_snapshots_from_rows(
     return records
 
 
+def build_snapshots_from_rows(
+    chunk: OrderBookChunk,
+    config: Dict[str, Any],
+    *,
+    compute_volume_proxy: bool,
+) -> List[SnapshotRecord]:
+    return _build_snapshots_from_rows(
+        chunk,
+        config,
+        compute_volume_proxy=compute_volume_proxy,
+    )
+
+
 def _compute_intensity_bins(boundaries: List[float], max_up: float, max_down: float) -> Tuple[int, int]:
     up_intensity = max(max_up, 0.0)
     down_intensity = max(-max_down, 0.0)
@@ -3741,8 +3857,10 @@ __all__ = [
     "NormalizationStats",
     "SnapshotChunk",
     "SnapshotDataset",
+    "build_snapshots_from_rows",
     "build_training_generator",
     "build_training_generator_for_indices",
+    "chunk_filename",
     "compute_label_distribution",
     "compute_label_distribution_for_indices",
     "compute_normalization_stats",
@@ -3754,7 +3872,10 @@ __all__ = [
     "load_label_stats_from_manifest",
     "load_normalization_stats",
     "load_snapshot_dataset",
+    "open_chunk_sample_reader",
+    "populate_hybrid_snapshots",
     "prepare_snapshot_dataset",
+    "safe_file_size",
     "save_label_stats_to_manifest",
     "save_normalization_stats",
 ]
