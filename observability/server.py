@@ -545,13 +545,19 @@ def _allowed_configs(glob_pattern: str) -> List[str]:
     return sorted(str(p) for p in Path().glob(glob_pattern))
 
 
+_MODULE_DIR = Path(__file__).resolve().parent  # observability/ directory
+
+
 def _safe_static_file_path(*, static_dir: str, request_path: str) -> Optional[Path]:
     if not request_path.startswith("/static/"):
         return None
     rel = request_path[len("/static/") :]
     if not rel or rel.startswith("/"):
         return None
-    base = Path(static_dir).resolve()
+    static_path = Path(static_dir)
+    if not static_path.is_absolute():
+        static_path = _MODULE_DIR.parent / static_path
+    base = static_path.resolve()
     candidate = (base / rel).resolve()
     try:
         candidate.relative_to(base)
