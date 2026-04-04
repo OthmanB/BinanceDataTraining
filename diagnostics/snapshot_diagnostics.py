@@ -13,7 +13,8 @@ import numpy as np
 from observability.run_state import get_run_state_writer
 from preprocessing.train_test_split import compute_split_boundaries
 from training.long_term_context import load_anchor_timestamps, load_snapshot_series
-from training.snapshot_dataset import _open_chunk_sample_reader, prepare_snapshot_dataset
+from training.snapshot_dataset import open_chunk_sample_reader, prepare_snapshot_dataset
+from utils.formatting import _format_bytes, format_bytes
 
 
 logger = logging.getLogger(__name__)
@@ -43,16 +44,6 @@ def resolve_diagnostics_execution_mode(config: Dict[str, Any]) -> str:
         "diagnostics.execution_mode must be 'standalone' or 'per_snapshot'; "
         f"got {raw_mode!r}",
     )
-
-
-def _format_bytes(value: float) -> str:
-    size = float(max(value, 0.0))
-    units = ["B", "KiB", "MiB", "GiB", "TiB"]
-    idx = 0
-    while size >= 1024.0 and idx < len(units) - 1:
-        size /= 1024.0
-        idx += 1
-    return f"{size:.2f}{units[idx]}"
 
 
 def _compute_directory_size_bytes(path: Path) -> int:
@@ -318,7 +309,7 @@ def run_snapshot_diagnostics_for_dataset(
         local_indices = np.asarray(indices[pos:end] - chunk_start, dtype="int64")
         pos = end
 
-        reader = _open_chunk_sample_reader(chunk)
+        reader = open_chunk_sample_reader(chunk)
         try:
             for local_idx in local_indices:
                 x_one, _, _, _, duty_one = reader.get_samples(np.asarray([int(local_idx)], dtype="int64"))
@@ -348,8 +339,8 @@ def run_snapshot_diagnostics_for_dataset(
         finally:
             try:
                 reader.close()
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to close snapshot chunk reader in diagnostics: %s", exc)
 
     if pos < total:
         raise ValueError("Sampled indices exceed snapshot dataset bounds")

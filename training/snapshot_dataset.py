@@ -21,7 +21,7 @@ from preprocessing.depth_aggregator import aggregate_snapshot_to_hybrid, get_hyb
 from preprocessing.feature_engineering import FeatureEngineer
 from preprocessing.time_utils import normalize_timestamp_array
 from utils.config_loader import ConfigError
-from utils.formatting import format_bytes
+from utils.formatting import _format_bytes, format_bytes
 from .snapshot_store import (
     SnapshotContext,
     load_or_create_manifest,
@@ -37,10 +37,6 @@ logger = logging.getLogger(__name__)
 CHUNK_STORAGE_NPZ = "npz"
 CHUNK_STORAGE_NPY_SHARDS_V1 = "npy_shards_v1"
 CHUNK_STORAGE_FRAME_STORE_V1 = "frame_store_v1"
-
-
-def _format_bytes(value: int) -> str:
-    return format_bytes(int(value))
 
 
 def _safe_file_size(path: str) -> int:
@@ -570,13 +566,11 @@ def prepare_snapshot_dataset(config: Dict[str, Any]) -> SnapshotDataset:
         complete = False
 
     if complete:
+        # Validate per-chunk file existence across all storage formats (WRF-8)
         for entry in chunk_entries:
-            file_rel = entry.get("file")
-            if not file_rel:
-                complete = False
-                break
-            file_path = os.path.join(context.snapshot_dir, file_rel)
-            if not os.path.exists(file_path):
+            resolved = _resolve_chunk_paths_from_entry(context, entry)
+            if resolved is None:
+                # Chunk files missing - manifest is incomplete
                 complete = False
                 break
     if not complete:
@@ -591,10 +585,23 @@ def load_snapshot_dataset(context: SnapshotContext, config: Dict[str, Any]) -> S
     if manifest.get("config_hash") != context.config_hash:
         raise ConfigError("Snapshot manifest config_hash does not match current configuration")
 
+    chunk_entries = manifest.get("chunks", []) or []
+    total_manifest_chunks = len(chunk_entries)
+    missing_chunks = []
     chunks_meta = []
-    for entry in manifest.get("chunks", []) or []:
+    for entry in chunk_entries:
         resolved = _resolve_chunk_paths_from_entry(context, entry)
         if resolved is None:
+            chunk_id = f"{entry.get('start', 'unknown')}-{entry.get('end', 'unknown')}"
+            missing_chunks.append({"id": chunk_id, "entry": entry})
+            logger.warning(
+                "Snapshot cache chunk missing: chunk_id=%s, format=%s, start=%s, end=%s, num_samples=%s",
+                chunk_id,
+                entry.get("format", "unknown"),
+                entry.get("start", "unknown"),
+                entry.get("end", "unknown"),
+                entry.get("num_samples", 0),
+            )
             continue
         file_path, array_paths, storage_format = resolved
         x_shape_raw = entry.get("x_shape")
@@ -667,11 +674,35 @@ def load_snapshot_dataset(context: SnapshotContext, config: Dict[str, Any]) -> S
         )
         start_idx += entry["num_samples"]
 
+    # Validate missing chunk threshold
+    missing_count = len(missing_chunks)
+    loaded_count = len(chunks)
+    if total_manifest_chunks > 0:
+        missing_ratio = float(missing_count) / float(total_manifest_chunks)
+        max_missing_ratio = 0.1  # Hardcoded 10% threshold
+        if missing_ratio > max_missing_ratio:
+            raise ConfigError(
+                f"Snapshot cache missing chunk ratio exceeds threshold: "
+                f"missing={missing_count}/{total_manifest_chunks} ({missing_ratio:.2%}), "
+                f"threshold={max_missing_ratio:.0%}. "
+                f"Rebuild snapshot dataset or check cache integrity."
+            )
+
+    # Summary logging
+    total_samples = start_idx
+    logger.info(
+        "Loaded snapshot dataset: chunks=%s/%s, samples=%s, missing_chunks=%s",
+        loaded_count,
+        total_manifest_chunks,
+        total_samples,
+        missing_count,
+    )
+
     return SnapshotDataset(
         snapshot_dir=context.snapshot_dir,
         manifest=manifest,
         chunks=chunks,
-        total_samples=start_idx,
+        total_samples=total_samples,
         config_hash=context.config_hash,
     )
 
@@ -837,10 +868,12 @@ def _materialize_frame_store_v1_x(
     w_dim = int(frames_base.shape[2])
     base_channels = int(frames_base.shape[3])
 
-    x_base = np.empty((sample_count, window_steps, h_dim, w_dim, base_channels), dtype="float32")
-    for idx, start_idx in enumerate(starts):
-        end_idx = int(start_idx) + window_steps
-        x_base[idx] = np.asarray(frames_base[int(start_idx):end_idx], dtype="float32")
+    base_windows = np.lib.stride_tricks.sliding_window_view(
+        frames_base,
+        window_shape=window_steps,
+        axis=0,
+    )
+    x_base = np.asarray(np.moveaxis(base_windows[starts], -1, 1), dtype="float32")
 
     x_out = x_base
 
@@ -849,11 +882,16 @@ def _materialize_frame_store_v1_x(
         if int(frames_confidence.shape[1]) != resolved_assets:
             raise ConfigError("Snapshot frame_store_v1 confidence width does not match num_assets")
 
-        mask = np.empty((sample_count, window_steps, h_dim, w_dim, resolved_assets), dtype="float32")
-        for idx, start_idx in enumerate(starts):
-            end_idx = int(start_idx) + window_steps
-            conf_window = np.asarray(frames_confidence[int(start_idx):end_idx], dtype="float32")
-            mask[idx] = conf_window[:, None, None, :]
+        confidence_windows = np.lib.stride_tricks.sliding_window_view(
+            frames_confidence,
+            window_shape=window_steps,
+            axis=0,
+        )
+        confidence_out = np.asarray(np.moveaxis(confidence_windows[starts], -1, 1), dtype="float32")
+        mask = np.broadcast_to(
+            confidence_out[:, :, None, None, :],
+            (sample_count, window_steps, h_dim, w_dim, resolved_assets),
+        )
         x_out = np.concatenate([x_out, mask], axis=-1)
 
     aux_dim = int(aux.shape[1])
@@ -1383,8 +1421,12 @@ class _NpzSampleReader(_ChunkSampleReader):
     def close(self) -> None:
         try:
             self._npz.close()
-        except Exception:
-            return
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to close NPZ chunk reader for %s: %s",
+                self.chunk.file_path,
+                exc,
+            )
 
     def get_samples(self, local_indices: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         x = np.asarray(self._npz["x"][local_indices], dtype="float32")
@@ -2659,58 +2701,93 @@ def _materialize_frame_store_core_arrays(
     frames_observed = np.zeros((num_records, num_assets), dtype="uint8")
     frames_ts = np.zeros((num_records,), dtype="int64")
 
-    for t_idx, rec in enumerate(records):
-        frames_ts[t_idx] = int(rec.timestamp.astype("datetime64[s]").astype("int64"))
-        for asset_idx, asset in enumerate(assets):
-            asset_rec = rec.asset_snapshots.get(asset)
-            if asset_rec is None:
-                message = f"Missing aligned asset snapshot for asset={asset} at timestamp={rec.timestamp}"
-                if fail_on_invalid:
-                    raise ValueError(message)
-                logger.warning(message)
-                continue
+    frames_ts[:] = np.fromiter(
+        (int(rec.timestamp.astype("datetime64[s]").astype("int64")) for rec in records),
+        dtype="int64",
+        count=num_records,
+    )
 
-            frames_confidence[t_idx, asset_idx] = float(asset_rec.confidence)
-            frames_observed[t_idx, asset_idx] = np.uint8(1 if bool(asset_rec.observed) else 0)
+    asset_record_matrix = np.asarray(
+        [[rec.asset_snapshots.get(asset) for asset in assets] for rec in records],
+        dtype=object,
+    )
+    missing_mask = asset_record_matrix == None  # noqa: E711
+    if np.any(missing_mask):
+        missing_positions = np.argwhere(missing_mask)
+        first_missing_t, first_missing_asset = missing_positions[0]
+        first_message = (
+            f"Missing aligned asset snapshot for asset={assets[int(first_missing_asset)]} "
+            f"at timestamp={records[int(first_missing_t)].timestamp}"
+        )
+        if fail_on_invalid:
+            raise ValueError(first_message)
+        for missing_t, missing_asset in missing_positions:
+            logger.warning(
+                "Missing aligned asset snapshot for asset=%s at timestamp=%s",
+                assets[int(missing_asset)],
+                records[int(missing_t)].timestamp,
+            )
 
-            if representation == "hybrid":
-                hybrid = asset_rec.hybrid_snapshot
-                if hybrid is None:
-                    if asset_rec.depth is not None:
-                        hybrid = aggregate_snapshot_to_hybrid(
-                            bid_prices=asset_rec.depth["bid_prices"],
-                            bid_quantities=asset_rec.depth["bid_quantities"],
-                            ask_prices=asset_rec.depth["ask_prices"],
-                            ask_quantities=asset_rec.depth["ask_quantities"],
-                            config=config,
-                        ).astype("float32")
-                    else:
-                        message = (
-                            f"Missing hybrid/depth data for asset={asset} at timestamp={rec.timestamp} "
-                            "while building frame_store_v1 chunk"
-                        )
-                        if fail_on_invalid:
-                            raise ValueError(message)
-                        logger.warning(message)
-                        hybrid = np.zeros((frames_base.shape[1], 4), dtype="float32")
-                        feats = asset_rec.snapshot_features
-                        if len(feats) >= 4:
-                            hybrid[0, 0] = float(feats[0])
-                            hybrid[0, 1] = float(feats[1])
-                            hybrid[0, 2] = float(feats[2])
-                            hybrid[0, 3] = float(feats[3])
-                frames_base[t_idx, :, :, asset_idx] = np.asarray(hybrid, dtype="float32")
-            else:
-                features = asset_rec.snapshot_features
-                if len(features) >= 4:
-                    bid_price, bid_qty, ask_price, ask_qty = features[:4]
-                    frames_base[t_idx, 0, 0, asset_idx] = float(bid_price)
-                    if sample_builder._width > 1:
-                        frames_base[t_idx, 0, 1, asset_idx] = float(bid_qty)
-                    if sample_builder._height > 1:
-                        frames_base[t_idx, 1, 0, asset_idx] = float(ask_price)
-                    if sample_builder._height > 1 and sample_builder._width > 1:
-                        frames_base[t_idx, 1, 1, asset_idx] = float(ask_qty)
+    valid_mask = ~missing_mask
+    if not np.any(valid_mask):
+        return frames_base, frames_confidence, frames_observed, frames_ts
+
+    t_idx_arr, asset_idx_arr = np.nonzero(valid_mask)
+    valid_asset_records: List[SnapshotRecord] = asset_record_matrix[valid_mask].tolist()
+    frames_confidence[t_idx_arr, asset_idx_arr] = np.asarray(
+        [float(asset_rec.confidence) for asset_rec in valid_asset_records],
+        dtype="float32",
+    )
+    frames_observed[t_idx_arr, asset_idx_arr] = np.asarray(
+        [1 if bool(asset_rec.observed) else 0 for asset_rec in valid_asset_records],
+        dtype="uint8",
+    )
+
+    if representation == "hybrid":
+        for t_idx, asset_idx, asset_rec in zip(t_idx_arr, asset_idx_arr, valid_asset_records):
+            hybrid = asset_rec.hybrid_snapshot
+            if hybrid is None:
+                if asset_rec.depth is not None:
+                    hybrid = aggregate_snapshot_to_hybrid(
+                        bid_prices=asset_rec.depth["bid_prices"],
+                        bid_quantities=asset_rec.depth["bid_quantities"],
+                        ask_prices=asset_rec.depth["ask_prices"],
+                        ask_quantities=asset_rec.depth["ask_quantities"],
+                        config=config,
+                    ).astype("float32")
+                else:
+                    message = (
+                        f"Missing hybrid/depth data for asset={assets[int(asset_idx)]} "
+                        f"at timestamp={records[int(t_idx)].timestamp} while building frame_store_v1 chunk"
+                    )
+                    if fail_on_invalid:
+                        raise ValueError(message)
+                    logger.warning(message)
+                    hybrid = np.zeros((frames_base.shape[1], 4), dtype="float32")
+                    feats = asset_rec.snapshot_features
+                    if len(feats) >= 4:
+                        hybrid[0, 0] = float(feats[0])
+                        hybrid[0, 1] = float(feats[1])
+                        hybrid[0, 2] = float(feats[2])
+                        hybrid[0, 3] = float(feats[3])
+            frames_base[int(t_idx), :, :, int(asset_idx)] = np.asarray(hybrid, dtype="float32")
+    else:
+        feature_rows = [asset_rec.snapshot_features for asset_rec in valid_asset_records]
+        has_features = np.asarray([len(features) >= 4 for features in feature_rows], dtype=bool)
+        if np.any(has_features):
+            feature_values = np.asarray(
+                [features[:4] for features, ok in zip(feature_rows, has_features) if ok],
+                dtype="float32",
+            )
+            t_valid = t_idx_arr[has_features]
+            asset_valid = asset_idx_arr[has_features]
+            frames_base[t_valid, 0, 0, asset_valid] = feature_values[:, 0]
+            if sample_builder._width > 1:
+                frames_base[t_valid, 0, 1, asset_valid] = feature_values[:, 1]
+            if sample_builder._height > 1:
+                frames_base[t_valid, 1, 0, asset_valid] = feature_values[:, 2]
+            if sample_builder._height > 1 and sample_builder._width > 1:
+                frames_base[t_valid, 1, 1, asset_valid] = feature_values[:, 3]
 
     return frames_base, frames_confidence, frames_observed, frames_ts
 
