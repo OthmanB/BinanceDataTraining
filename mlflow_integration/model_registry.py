@@ -12,7 +12,11 @@ logger = logging.getLogger(__name__)
 def _artifact_path_exists(client: object, run_id: str, artifact_path: str) -> bool:
     try:
         list_artifacts = getattr(client, "list_artifacts")
-    except Exception:
+    except AttributeError:
+        logger.debug("MlflowClient has no list_artifacts method; cannot verify artifact path.")
+        return False
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to access MlflowClient.list_artifacts: %s", exc)
         return False
 
     # Try listing the parent directory first.
@@ -20,21 +24,30 @@ def _artifact_path_exists(client: object, run_id: str, artifact_path: str) -> bo
     child = artifact_path
     try:
         infos = list_artifacts(run_id, path=parent)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "Failed listing MLFlow artifacts at parent path while validating artifact path. run_id=%s path=%s error=%s",
+            run_id,
+            parent,
+            exc,
+        )
         infos = None
 
     if infos:
         for info in infos:
-            try:
-                if str(getattr(info, "path", "")) == child:
-                    return True
-            except Exception:  # noqa: BLE001
-                continue
+            if str(getattr(info, "path", "")) == child:
+                return True
 
     # Fall back to trying to list the child path.
     try:
         infos_child = list_artifacts(run_id, path=child)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "Failed listing MLFlow artifacts at child path while validating artifact path. run_id=%s path=%s error=%s",
+            run_id,
+            child,
+            exc,
+        )
         infos_child = None
     return bool(infos_child)
 
@@ -49,14 +62,31 @@ def register_model(name: str, *, run_id: Optional[str] = None, artifact_path: st
 
     try:
         import mlflow  # type: ignore[import]
+    except ImportError as exc:
+        logger.debug(
+            "MLFlow import unavailable; skipping model registry registration. name=%s error=%s",
+            name,
+            exc,
+        )
+        return
     except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "MLFlow is required for model registry operations but could not be imported: %s",
+            "Unexpected failure importing MLFlow while registering model. name=%s error=%s",
+            name,
             exc,
         )
         return
 
-    active_run = mlflow.active_run()
+    try:
+        active_run = mlflow.active_run()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Failed to query active MLFlow run; skipping model registry registration. name=%s error=%s",
+            name,
+            exc,
+        )
+        return
+
     if active_run is None and not run_id:
         logger.warning(
             "No active MLFlow run detected; skipping model registry registration for name=%s",
@@ -64,12 +94,25 @@ def register_model(name: str, *, run_id: Optional[str] = None, artifact_path: st
         )
         return
 
-    resolved_run_id = str(run_id) if run_id else str(active_run.info.run_id)
+    if run_id:
+        resolved_run_id = str(run_id)
+    else:
+        if active_run is None:
+            logger.warning("No run_id resolved for model registry registration. name=%s", name)
+            return
+        assert active_run is not None
+        resolved_run_id = str(getattr(getattr(active_run, "info", None), "run_id", ""))
+        if not resolved_run_id:
+            logger.warning("Active MLFlow run did not expose a run_id; skipping registration. name=%s", name)
+            return
 
     try:
         from mlflow.tracking import MlflowClient  # type: ignore[import]
+    except ImportError as exc:
+        logger.debug("MlflowClient import unavailable; skipping model registry registration: %s", exc)
+        return
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to import MlflowClient for artifact checks: %s", exc)
+        logger.warning("Unexpected failure importing MlflowClient for artifact checks: %s", exc)
         return
 
     client = MlflowClient()

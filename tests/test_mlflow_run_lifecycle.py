@@ -50,7 +50,7 @@ class TestMlflowRunLifecycle(unittest.TestCase):
     def test_start_run_reuses_active_run_and_does_not_end_it(self) -> None:
         import mlflow_integration.experiment_tracker as tracker
 
-        tracker._STARTED_RUN_ID = None
+        tracker.clear_started_run_id()
         mock_mlflow = MagicMock()
         existing = SimpleNamespace(info=SimpleNamespace(run_id="existing"), data=SimpleNamespace(tags={}))
         mock_mlflow.active_run.return_value = existing
@@ -61,7 +61,7 @@ class TestMlflowRunLifecycle(unittest.TestCase):
                 run = tracker.start_run(config, run_name="ignored")
 
         self.assertIs(run, existing)
-        self.assertIsNone(tracker._STARTED_RUN_ID)
+        self.assertIsNone(tracker.get_started_run_id())
         mock_mlflow.start_run.assert_not_called()
 
         with patch("mlflow_integration.experiment_tracker._import_mlflow", return_value=mock_mlflow):
@@ -71,7 +71,7 @@ class TestMlflowRunLifecycle(unittest.TestCase):
     def test_end_run_closes_direct_child_then_parent(self) -> None:
         import mlflow_integration.experiment_tracker as tracker
 
-        tracker._STARTED_RUN_ID = None
+        tracker.clear_started_run_id()
         mock_mlflow = MagicMock()
         parent = SimpleNamespace(info=SimpleNamespace(run_id="parent"), data=SimpleNamespace(tags={}))
         child = SimpleNamespace(
@@ -87,14 +87,14 @@ class TestMlflowRunLifecycle(unittest.TestCase):
             with patch("mlflow_integration.experiment_tracker._import_mlflow", return_value=mock_mlflow):
                 run = tracker.start_run(config, run_name="parent")
         self.assertEqual(str(run.info.run_id), "parent")
-        self.assertEqual(tracker._STARTED_RUN_ID, "parent")
+        self.assertEqual(tracker.get_started_run_id(), "parent")
 
         # end_run() should end the leaked child first, then the parent.
         mock_mlflow.active_run.side_effect = [child, parent]
         with patch("mlflow_integration.experiment_tracker._import_mlflow", return_value=mock_mlflow):
             tracker.end_run(expected_run_id="parent")
 
-        self.assertIsNone(tracker._STARTED_RUN_ID)
+        self.assertIsNone(tracker.get_started_run_id())
         self.assertEqual(mock_mlflow.end_run.call_count, 2)
 
 

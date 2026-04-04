@@ -23,12 +23,17 @@ def get_mlflow_if_active() -> Optional[Any]:
 
     try:
         import mlflow  # type: ignore[import]
+    except ImportError as exc:
+        logger.debug("MLFlow import unavailable in get_mlflow_if_active: %s", exc)
+        return None
     except Exception:  # noqa: BLE001
+        logger.exception("Unexpected failure importing MLFlow in get_mlflow_if_active")
         return None
 
     try:
         active = mlflow.active_run()
     except Exception:  # noqa: BLE001
+        logger.exception("Unexpected failure checking MLFlow active run status")
         return None
 
     if active is None:

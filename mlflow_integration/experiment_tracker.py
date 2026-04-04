@@ -30,6 +30,25 @@ _ORIGINAL_CWD: Path = Path.cwd().resolve()
 _STARTED_RUN_ID: Optional[str] = None
 
 
+class _RunLifecycleState:
+    def __init__(self) -> None:
+        self._started_run_id: Optional[str] = None
+
+    def get_started_run_id(self) -> Optional[str]:
+        return self._started_run_id
+
+    def set_started_run_id(self, run_id: Optional[str]) -> None:
+        global _STARTED_RUN_ID
+        self._started_run_id = str(run_id) if run_id is not None else None
+        _STARTED_RUN_ID = self._started_run_id
+
+    def clear_started_run_id(self) -> None:
+        self.set_started_run_id(None)
+
+
+_RUN_LIFECYCLE_STATE = _RunLifecycleState()
+
+
 def get_original_cwd() -> Path:
     """Return the original working directory from application startup.
     
@@ -59,6 +78,22 @@ def resolve_path_from_original_cwd(path: str) -> Path:
     if p.is_absolute():
         return p.resolve()
     return (_ORIGINAL_CWD / p).resolve()
+
+
+def get_started_run_id() -> Optional[str]:
+    started_run_id = _RUN_LIFECYCLE_STATE.get_started_run_id()
+    global_started = _STARTED_RUN_ID
+    if started_run_id is None and global_started is not None:
+        _RUN_LIFECYCLE_STATE.set_started_run_id(global_started)
+        return _RUN_LIFECYCLE_STATE.get_started_run_id()
+    if started_run_id != global_started:
+        _RUN_LIFECYCLE_STATE.set_started_run_id(global_started)
+        return _RUN_LIFECYCLE_STATE.get_started_run_id()
+    return started_run_id
+
+
+def clear_started_run_id() -> None:
+    _RUN_LIFECYCLE_STATE.clear_started_run_id()
 
 
 def _import_mlflow():
@@ -135,12 +170,11 @@ def start_run(config: Dict[str, Any], run_name: Optional[str] = None):
         run_name,
     )
 
-    global _STARTED_RUN_ID
-
     active = None
     try:
         active = mlflow.active_run()
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Failed to inspect active MLflow run before starting a run: %s", exc)
         active = None
 
     if active is not None:
@@ -156,9 +190,10 @@ def start_run(config: Dict[str, Any], run_name: Optional[str] = None):
     else:
         run = mlflow.start_run(run_name=run_name)
         try:
-            _STARTED_RUN_ID = str(run.info.run_id)
-        except Exception:  # noqa: BLE001
-            _STARTED_RUN_ID = None
+            _RUN_LIFECYCLE_STATE.set_started_run_id(str(run.info.run_id))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to capture started MLflow run id: %s", exc)
+            _RUN_LIFECYCLE_STATE.clear_started_run_id()
 
     try:
         snapshot_path = tmp_path / "training_config_effective.yaml"
@@ -216,16 +251,16 @@ def end_run(expected_run_id: Optional[str] = None) -> None:
         module.
     """
 
-    global _STARTED_RUN_ID
-    if _STARTED_RUN_ID is None:
+    started_run_id = get_started_run_id()
+    if started_run_id is None:
         logger.info("Skipping MLFlow end_run: no run was started by experiment_tracker.")
         return
 
-    if expected_run_id is not None and str(expected_run_id) != str(_STARTED_RUN_ID):
+    if expected_run_id is not None and str(expected_run_id) != str(started_run_id):
         logger.warning(
             "Skipping MLFlow end_run: expected_run_id does not match started run. expected=%s started=%s",
             expected_run_id,
-            _STARTED_RUN_ID,
+            started_run_id,
         )
         return
 
@@ -233,23 +268,25 @@ def end_run(expected_run_id: Optional[str] = None) -> None:
     active = None
     try:
         active = mlflow.active_run()
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Failed to inspect active MLflow run before ending a run: %s", exc)
         active = None
 
     if active is None:
         logger.info("Skipping MLFlow end_run: no active run.")
-        _STARTED_RUN_ID = None
+        _RUN_LIFECYCLE_STATE.clear_started_run_id()
         return
 
     try:
         active_id = str(active.info.run_id)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Failed to resolve active MLflow run id while ending a run: %s", exc)
         active_id = None
 
-    if active_id == str(_STARTED_RUN_ID):
+    if active_id == str(started_run_id):
         logger.info("Ending MLFlow run. run_id=%s", active_id)
         mlflow.end_run()
-        _STARTED_RUN_ID = None
+        _RUN_LIFECYCLE_STATE.clear_started_run_id()
         return
 
     # If a nested run is still active, end it only when it clearly belongs
@@ -257,10 +294,11 @@ def end_run(expected_run_id: Optional[str] = None) -> None:
     try:
         tags = getattr(getattr(active, "data", None), "tags", None)
         parent_id = tags.get("mlflow.parentRunId") if isinstance(tags, dict) else None
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Failed to inspect MLflow parent run tag while ending a run: %s", exc)
         parent_id = None
 
-    if parent_id == str(_STARTED_RUN_ID):
+    if parent_id == str(started_run_id):
         logger.warning(
             "Ending nested MLFlow run before ending parent. nested_run_id=%s parent_run_id=%s",
             active_id,
@@ -270,24 +308,33 @@ def end_run(expected_run_id: Optional[str] = None) -> None:
         # Try ending the parent if it becomes active.
         try:
             active2 = mlflow.active_run()
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Failed to inspect MLflow active run after ending nested run: %s", exc)
             active2 = None
         if active2 is not None:
             try:
                 active2_id = str(active2.info.run_id)
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Failed to resolve MLflow parent run id after ending nested run: %s", exc)
                 active2_id = None
-            if active2_id == str(_STARTED_RUN_ID):
+            if active2_id == str(started_run_id):
                 logger.info("Ending MLFlow run. run_id=%s", active2_id)
                 mlflow.end_run()
-        _STARTED_RUN_ID = None
+        _RUN_LIFECYCLE_STATE.clear_started_run_id()
         return
 
     logger.warning(
         "Skipping MLFlow end_run: active run does not match started run. active=%s started=%s",
         active_id,
-        _STARTED_RUN_ID,
+        started_run_id,
     )
 
 
-__all__ = ["start_run", "end_run", "get_original_cwd", "resolve_path_from_original_cwd"]
+__all__ = [
+    "start_run",
+    "end_run",
+    "get_original_cwd",
+    "resolve_path_from_original_cwd",
+    "get_started_run_id",
+    "clear_started_run_id",
+]

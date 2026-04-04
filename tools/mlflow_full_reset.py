@@ -5,12 +5,13 @@
 # at MLFLOW_URI. Use DRY_RUN=True first to inspect before actually deleting.
 
 import logging
+import os
 
 from mlflow.tracking import MlflowClient
 from mlflow.entities import ViewType
 import mlflow
 
-MLFLOW_URI = "http://192.168.1.11:5501"  # adjust if needed
+MLFLOW_URI = os.environ.get("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000")
 DRY_RUN = True  # set to False to actually delete
 
 logger = logging.getLogger(__name__)
