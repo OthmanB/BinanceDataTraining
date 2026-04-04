@@ -25,16 +25,20 @@
 \newcommand{\MermaidFigure}[4]{%
 \begin{figure}[t]
   \centering
-  \IfFileExists{#1}{%
-    \includegraphics[width=0.95\linewidth]{#1}%
+  \IfFileExists{#1.pdf}{%
+    \includegraphics[width=0.95\linewidth,height=0.75\textheight,keepaspectratio]{#1.pdf}%
   }{%
-    \IfFileExists{#3}{%
-      \lstinputlisting[style=mermaid]{#3}%
+    \IfFileExists{#1.png}{%
+      \includegraphics[width=0.95\linewidth,height=0.75\textheight,keepaspectratio]{#1.png}%
     }{%
-      \fbox{\parbox{0.95\linewidth}{%
-        Missing figure assets. Expected either \texttt{\detokenize{#1}} (rendered image)
-        or \texttt{\detokenize{#3}} (Mermaid source).%
-      }}%
+      \IfFileExists{#3}{%
+        \lstinputlisting[style=mermaid]{#3}%
+      }{%
+        \fbox{\parbox{0.95\linewidth}{%
+          Missing figure assets. Expected one of \texttt{\detokenize{#1}.pdf},
+          \texttt{\detokenize{#1}.png}, or the Mermaid source \texttt{\detokenize{#3}}.%
+        }}%
+      }%
     }%
   }%
   \caption{#2 (Mermaid source: \texttt{\detokenize{#3}}).}
@@ -82,7 +86,7 @@ and the output-type constraint that snapshot training and evaluation require
 
 The global control flow includes optional diagnostics and optional hyperparameter optimization (HPO), followed by final training and evaluation in ``production'' mode. Figure~\ref{fig:pipeline} depicts this orchestration.
 
-\MermaidFigure{figures/pipeline_flow.pdf}{Top-level pipeline flow (configuration load, optional diagnostics and HPO, training, evaluation, MLflow lifecycle).}{figures/pipeline_flow.mmd}{fig:pipeline}
+\MermaidFigure{figures/pipeline_flow}{Top-level pipeline flow (configuration load, optional diagnostics and HPO, training, evaluation, MLflow lifecycle).}{figures/pipeline_flow.mmd}{fig:pipeline}
 
 \subsection{Time discretization and sample geometry}
 
@@ -225,7 +229,7 @@ matching the generator logic in \texttt{training/snapshot\_dataset.py}.
 
 The baseline model is a Keras CNN+LSTM network (\texttt{models/cnn\_lstm\_multiclass.py}) that applies a shared per-frame convolutional feature extractor, then an LSTM over time, then dense layers, and finally two softmax heads. Long-term context features can optionally add a second input branch whose output is concatenated with the short-term embedding.
 
-\MermaidFigure{figures/model_architecture.pdf}{Model architecture: short-term CNN+LSTM with optional long-term branch and two softmax heads.}{figures/model_architecture.mmd}{fig:model-architecture}
+\MermaidFigure{figures/model_architecture}{Model architecture: short-term CNN+LSTM with optional long-term branch and two softmax heads.}{figures/model_architecture.mmd}{fig:model-architecture}
 
 Let $p^{\uparrow}(\cdot\mid x)$ and $p^{\downarrow}(\cdot\mid x)$ denote the predicted distributions, and let $y^{\uparrow},y^{\downarrow}$ be the class labels. The per-sample loss is the sum of cross-entropies,
 \begin{equation}
@@ -247,7 +251,7 @@ which is solved by bounded scalar minimization.
 
 The evaluation pipeline can also compute temporal degradation metrics by slicing time into windows, and it can run a simplified backtest that converts two-head outputs into a trading signal according to a configured strategy (e.g., net intensity or thresholding).
 
-\MermaidFigure{figures/data_flow.pdf}{Data flow from GreptimeDB ingestion through snapshot materialization, training, evaluation, and optional calibration/backtesting.}{figures/data_flow.mmd}{fig:data-flow}
+\MermaidFigure{figures/data_flow}{Data flow from GreptimeDB ingestion through snapshot materialization, training, evaluation, and optional calibration/backtesting.}{figures/data_flow.mmd}{fig:data-flow}
 
 \section{Functionalities}
 
@@ -451,8 +455,9 @@ This document is self-contained and can be rendered from \texttt{Notes/tex/}.
 \begin{itemize}
   \item \textbf{LaTeX build (pdflatex):} run \texttt{pdflatex cnn\_lstm\_feature\_representation.tex} twice to resolve references.
   \item \textbf{LaTeX build (tectonic):} run \texttt{tectonic -X compile cnn\_lstm\_feature\_representation.tex} (it automatically reruns as needed).
-  \item \textbf{Mermaid figures (optional):} if \texttt{figures/*.pdf} are present, they are included; otherwise the build falls back to embedding the Mermaid source (\texttt{figures/*.mmd}) via the \texttt{\textbackslash MermaidFigure} macro.
-  \item \textbf{Optional render step:} with Node.js installed, install \texttt{@mermaid-js/mermaid-cli} and render each \texttt{.mmd} to \texttt{.pdf} under \texttt{Notes/tex/figures/} (e.g. \texttt{mmdc -i pipeline\_flow.mmd -o pipeline\_flow.pdf}).
+  \item \textbf{Mermaid figures (optional):} if a rendered image is present (\texttt{figures/*.pdf} or \texttt{figures/*.png}), it is included; otherwise the build falls back to embedding the Mermaid source (\texttt{figures/*.mmd}) via the \texttt{\textbackslash MermaidFigure} macro.
+  \item \textbf{Optional render step (curl + Kroki):} run \texttt{bash render\_mermaid\_figures.sh} from \texttt{Notes/tex/} to render \texttt{figures/*.mmd} into \texttt{figures/*.png}.
+  \item \textbf{Optional render step (Node + Mermaid CLI):} with Node.js installed, install \texttt{@mermaid-js/mermaid-cli} and render each \texttt{.mmd} to \texttt{.png} or \texttt{.pdf} under \texttt{Notes/tex/figures/} (e.g. \texttt{mmdc -i pipeline\_flow.mmd -o pipeline\_flow.png}).
 \end{itemize}
 
 \end{document}

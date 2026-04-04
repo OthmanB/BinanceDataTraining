@@ -5,12 +5,12 @@ flowchart LR
     TDFlat --> LSTM[LSTM stack]
   end
 
-  subgraph LongTerm[Long-Term Input (optional)]
+  subgraph LongTerm[Long-Term Input optional]
     LT[(x_lt: d_lt)] --> LTDense[Dense/Conv1D stack]
   end
 
   LSTM --> CAT[Concatenate]
   LTDense --> CAT
   CAT --> D[Dense stack]
-  D --> UP[Up intensity\nsoftmax]
-  D --> DOWN[Down intensity\nsoftmax]
+  D --> UP[Up intensity softmax]
+  D --> DOWN[Down intensity softmax]
