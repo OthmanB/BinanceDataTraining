@@ -1,35 +1,26 @@
+from __future__ import annotations
+
+import os
 import unittest
 from unittest import mock
 
 import numpy as np
 
 from evaluation.evaluator import evaluate_model
+from tests.test_evaluator import _DummyEvalModel
 
 
-class _DummyEvalModel:
-    def __init__(self, num_classes: int) -> None:
-        self.num_classes = num_classes
-        self.last_input_shape = None
+class TestEvaluatorArtifactFlow(unittest.TestCase):
+    @mock.patch("evaluation.evaluator.get_mlflow_if_active")
+    @mock.patch("evaluation.evaluator.mlflow", create=True)
+    def test_confusion_matrix_artifacts_logged_from_tempdir(
+        self,
+        mock_mlflow,
+        mock_get_mlflow_if_active,
+    ) -> None:  # type: ignore[override]
+        num_samples = 20
+        num_classes = 4
 
-    def predict(self, x, verbose=0):  # type: ignore[override]
-        self.last_input_shape = tuple(x.shape)
-        n = x.shape[0]
-        up = np.zeros((n, self.num_classes), dtype="float32")
-        down = np.zeros((n, self.num_classes), dtype="float32")
-        up[:, 0] = 1.0
-        down[:, 0] = 1.0
-        return [up, down]
-
-
-class _FailingEvalModel:
-    def predict(self, x, verbose=0):  # type: ignore[override]
-        _ = x
-        _ = verbose
-        raise RuntimeError("predict boom")
-
-
-class TestEvaluator(unittest.TestCase):
-    def _build_eval_config_and_data(self, *, num_samples: int, num_classes: int, missing_strategy: str) -> tuple[dict, dict]:
         config = {
             "data": {
                 "asset_pairs": {"target_asset": "BTCUSDT", "correlated_assets": []},
@@ -87,7 +78,10 @@ class TestEvaluator(unittest.TestCase):
                 "validation_split": 0.15,
                 "debug_max_samples": 100,
                 "missing_snapshot_strategy": "synthetic",
-                "callbacks": {"early_stopping": {"enabled": False, "monitor": "val_loss", "patience": 1, "restore_best_weights": False}, "reduce_lr": {"enabled": False, "monitor": "val_loss", "factor": 0.5, "patience": 1, "min_lr": 1e-5}},
+                "callbacks": {
+                    "early_stopping": {"enabled": False, "monitor": "val_loss", "patience": 1, "restore_best_weights": False},
+                    "reduce_lr": {"enabled": False, "monitor": "val_loss", "factor": 0.5, "patience": 1, "min_lr": 1e-5},
+                },
                 "class_weights": {"compute_from_train": False},
                 "sample_weighting": {"enabled": False, "method": "exponential_decay", "half_life_days": 90, "apply_to": "loss_function"},
                 "fine_tuning": {
@@ -105,7 +99,7 @@ class TestEvaluator(unittest.TestCase):
                 "calibration_analysis": {"enabled": False, "n_bins": 10},
                 "post_hoc_calibration": {"enabled": False, "method": "temperature_scaling", "fit_on_validation": True, "min_samples": 500, "temperature_bounds": {"min": 0.1, "max": 10.0}},
                 "temporal_degradation": {"enabled": False, "num_windows": 5, "overlap_fraction": 0.0, "log_per_window_metrics": True},
-                "missing_snapshot_strategy": missing_strategy,
+                "missing_snapshot_strategy": "synthetic",
                 "backtesting": {"enabled": False, "horizon_steps": 5, "initial_capital": 10000.0, "transaction_cost": 0.001, "signal_strategy": "net_intensity", "signal_threshold": 0.6, "intensity_threshold": 1, "position_sizing": "equal", "max_position_pct": 1.0},
             },
             "mlflow": {
@@ -113,7 +107,14 @@ class TestEvaluator(unittest.TestCase):
                 "experiment_name": "test",
                 "local_tmp_dir": "tmp",
                 "run_naming": {"pattern": "test"},
-                "artifact_logging": {"trained_model": False, "model_architecture_plot": False, "training_plots": False, "confusion_matrix": False, "class_distribution": False, "feature_importance": False},
+                "artifact_logging": {
+                    "trained_model": False,
+                    "model_architecture_plot": False,
+                    "training_plots": False,
+                    "confusion_matrix": True,
+                    "class_distribution": False,
+                    "feature_importance": False,
+                },
                 "model_registry": {"register_model": False, "model_name_pattern": "test"},
             },
             "diagnostics": {
@@ -155,74 +156,38 @@ class TestEvaluator(unittest.TestCase):
             },
         }
 
+        metadata = {
+            "num_samples": num_samples,
+            "anchor_indices": list(range(num_samples)),
+        }
+
+        labels = [0] * num_samples
         data_object = {
-            "metadata": {"num_samples": num_samples, "anchor_indices": list(range(num_samples))},
+            "metadata": metadata,
             "order_books": {},
             "temporal_features": {},
             "targets": {
-                "labels_up_intensity": [0] * num_samples,
-                "labels_down_intensity": [0] * num_samples,
+                "labels_up_intensity": labels,
+                "labels_down_intensity": labels,
             },
             "external_data": {},
         }
-        return config, data_object
 
-    @mock.patch("evaluation.evaluator.get_mlflow_if_active")
-    @mock.patch("evaluation.evaluator.mlflow", create=True)
-    def test_evaluate_model_runs_with_synthetic_inputs(
-        self,
-        mock_mlflow,
-        mock_get_mlflow_if_active,
-    ) -> None:  # type: ignore[override]
-        num_samples = 20
-        num_classes = 4
-        config, data_object = self._build_eval_config_and_data(
-            num_samples=num_samples,
-            num_classes=num_classes,
-            missing_strategy="synthetic",
-        )
+        calls: list[str] = []
 
-        model = _DummyEvalModel(num_classes=num_classes)
+        def _log_artifact(path: str, artifact_path: str | None = None) -> None:
+            self.assertTrue(os.path.exists(path))
+            self.assertEqual(artifact_path, "evaluation")
+            calls.append(path)
+
+        mock_mlflow.log_artifact.side_effect = _log_artifact
         mock_get_mlflow_if_active.return_value = mock_mlflow
+        model = _DummyEvalModel(num_classes=num_classes)
 
         evaluate_model(config, model, data_object)
 
-        self.assertIsNotNone(model.last_input_shape)
-        assert model.last_input_shape is not None
-        self.assertEqual(model.last_input_shape[0], int(num_samples * 0.15))
-        self.assertGreater(mock_mlflow.log_metric.call_count, 0)
-
-    @mock.patch("evaluation.evaluator.get_mlflow_if_active")
-    def test_evaluate_model_skip_strategy_returns_without_predict(
-        self,
-        mock_get_mlflow_if_active,
-    ) -> None:
-        config, data_object = self._build_eval_config_and_data(
-            num_samples=20,
-            num_classes=4,
-            missing_strategy="skip",
-        )
-        model = _DummyEvalModel(num_classes=4)
-        mock_get_mlflow_if_active.return_value = None
-
-        evaluate_model(config, model, data_object)
-
-        self.assertIsNone(model.last_input_shape)
-
-    @mock.patch("evaluation.evaluator.get_mlflow_if_active")
-    def test_evaluate_model_predict_failure_is_handled(
-        self,
-        mock_get_mlflow_if_active,
-    ) -> None:
-        config, data_object = self._build_eval_config_and_data(
-            num_samples=20,
-            num_classes=4,
-            missing_strategy="synthetic",
-        )
-        mock_get_mlflow_if_active.return_value = None
-
-        evaluate_model(config, _FailingEvalModel(), data_object)
+        self.assertGreaterEqual(len(calls), 2)
 
 
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":
     unittest.main()

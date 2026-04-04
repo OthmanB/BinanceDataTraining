@@ -82,6 +82,7 @@ class TestSnapshotEvaluation(unittest.TestCase):
 
             manifest = load_or_create_manifest(context, config)
 
+            np.random.seed(42)
             x_core = np.random.randn(10, 2, 2, 2, 1).astype("float32")
             mask = np.ones_like(x_core, dtype="float32")
             x = np.concatenate([x_core, mask], axis=-1)
@@ -186,6 +187,7 @@ class TestSnapshotEvaluation(unittest.TestCase):
 
             manifest = load_or_create_manifest(context, config)
 
+            np.random.seed(42)
             x_core = np.random.randn(10, 2, 2, 2, 1).astype("float32")
             mask = np.ones_like(x_core, dtype="float32")
             x = np.concatenate([x_core, mask], axis=-1)
@@ -281,6 +283,7 @@ class TestSnapshotEvaluation(unittest.TestCase):
 
             manifest = load_or_create_manifest(context, config)
 
+            np.random.seed(42)
             x_core = np.random.randn(10, 2, 2, 2, 1).astype("float32")
             mask = np.ones_like(x_core, dtype="float32")
             x = np.concatenate([x_core, mask], axis=-1)
@@ -391,6 +394,7 @@ class TestSnapshotEvaluation(unittest.TestCase):
 
             manifest = load_or_create_manifest(context, config)
 
+            np.random.seed(42)
             x_core = np.random.randn(10, 2, 2, 2, 1).astype("float32")
             mask = np.ones_like(x_core, dtype="float32")
             x = np.concatenate([x_core, mask], axis=-1)
