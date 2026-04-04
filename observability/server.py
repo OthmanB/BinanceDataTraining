@@ -40,6 +40,8 @@ from urllib.parse import parse_qs, urlparse
 from prometheus_client import CollectorRegistry, Gauge, generate_latest, CONTENT_TYPE_LATEST
 
 from .run_state import RunStateWriter, _resolve_sqlite_path, load_run_state, load_run_history
+from utils.config_loader import _resolve_env_placeholders, _deep_merge, ConfigError
+from utils.formatting import _fmt_metric
 
 
 logger = logging.getLogger(__name__)
@@ -101,30 +103,6 @@ class ServerConfig:
         raise ValueError(f"Invalid integer value: {value!r}")
 
     @staticmethod
-    def _resolve_env_placeholders(obj: Any) -> Any:
-        if isinstance(obj, dict):
-            return {k: ServerConfig._resolve_env_placeholders(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [ServerConfig._resolve_env_placeholders(v) for v in obj]
-        if isinstance(obj, str) and "${" in obj:
-            result = obj
-            start = result.find("${")
-            while start != -1:
-                end = result.find("}", start)
-                if end == -1:
-                    raise RuntimeError(f"Unclosed environment placeholder in value: {obj}")
-                var_name = result[start + 2 : end]
-                if var_name not in os.environ:
-                    raise RuntimeError(
-                        f"Environment variable '{var_name}' required by observability config is not set"
-                    )
-                value = os.environ[var_name]
-                result = result[:start] + value + result[end + 1 :]
-                start = result.find("${", start + len(value))
-            return result
-        return obj
-
-    @staticmethod
     def _load_yaml_config(config_path: Optional[str]) -> Dict[str, Any]:
         if not config_path:
             return {}
@@ -138,7 +116,10 @@ class ServerConfig:
         data = yaml.safe_load(path_obj.read_text(encoding="utf-8")) or {}
         if not isinstance(data, dict):
             raise RuntimeError(f"Observability config must be a mapping, got: {type(data).__name__}")
-        return ServerConfig._resolve_env_placeholders(data)
+        try:
+            return _resolve_env_placeholders(data)
+        except ConfigError as exc:
+            raise RuntimeError(str(exc)) from exc
 
     @classmethod
     def from_sources(cls, *, config_path: Optional[str]) -> "ServerConfig":
@@ -330,11 +311,56 @@ def _check_auth(headers: Any, user: str, password: str) -> bool:
 
 
 def _tail_log(path: str, *, max_lines: int) -> List[str]:
+    """Return the last max_lines from a file using O(max_lines) memory.
+    
+    Uses a contiguous byte-buffer strategy: reads backward in fixed-size chunks,
+    prepends each chunk to a growing buffer, and splits lines only when the full
+    buffer is available. This ensures no line is split at chunk boundaries.
+    """
     path_obj = Path(path)
     if not path_obj.exists():
         return ["Log file not found"]
-    lines = path_obj.read_text(encoding="utf-8", errors="replace").splitlines()
-    return lines[-max_lines:]
+    
+    try:
+        file_size = path_obj.stat().st_size
+    except (OSError, ValueError):
+        return ["Unable to read log file"]
+    
+    if file_size == 0:
+        return []
+    
+    CHUNK_READ_SIZE = 64 * 1024
+    MAX_BUFFER_SIZE = 10 * 1024 * 1024
+    
+    buffer = b""
+    collected_lines: List[str] = []
+    seek_pos = file_size
+    
+    try:
+        with open(path_obj, "rb") as f:
+            while len(collected_lines) < max_lines and seek_pos > 0:
+                read_size = min(CHUNK_READ_SIZE, seek_pos)
+                seek_pos -= read_size
+                f.seek(seek_pos)
+                chunk = f.read(read_size)
+                
+                buffer = chunk + buffer
+                
+                if len(buffer) > MAX_BUFFER_SIZE:
+                    buffer = buffer[-MAX_BUFFER_SIZE:]
+                
+                try:
+                    text = buffer.decode("utf-8", errors="replace")
+                except Exception:  # noqa: BLE001
+                    text = buffer.decode("latin-1", errors="replace")
+                
+                lines = text.splitlines()
+                collected_lines = lines[-max_lines:]
+    
+    except (OSError, ValueError):
+        return ["Unable to read log file"]
+    
+    return collected_lines[-max_lines:] if collected_lines else []
 
 
 def _read_linux_memory_stats() -> Dict[str, Optional[float]]:
@@ -584,7 +610,7 @@ _SELECT_OPTIONS: Dict[str, List[str]] = {
     "targets.price_classes.definition_type": ["percentage"],
     "targets.labeling.scheme": ["two_head_intensity"],
     "targets.labeling.handle_gaps": ["skip", "interpolate", "error"],
-    "preprocessing.normalization.method": ["min_max", "standard", "robust"],
+    "preprocessing.normalization.method": ["min_max", "standard"],
     "preprocessing.feature_engineering.volume_proxy_method": ["top_of_book", "total_depth"],
     "preprocessing.feature_engineering.edge_decay.method": ["linear", "exponential"],
     "preprocessing.train_test_split.method": ["chronological"],
@@ -760,28 +786,16 @@ def _safe_yaml_load(value: Any) -> Any:
 
 
 def _load_yaml_file(path: Path) -> Dict[str, Any]:
-    if not path.exists():
-        raise RuntimeError(f"Config file not found: {path}")
-    try:
-        import yaml  # type: ignore[import]
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError("PyYAML is required to parse configuration files") from exc
-    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    if not isinstance(data, dict):
-        raise RuntimeError(f"Config must be a mapping, got {type(data).__name__}")
-    return data
-
-
-def _deep_merge(base: Any, override: Any) -> Any:
-    if isinstance(base, dict) and isinstance(override, dict):
-        merged = dict(base)
-        for key, value in override.items():
-            if key in merged:
-                merged[key] = _deep_merge(merged[key], value)
-            else:
-                merged[key] = value
-        return merged
-    return override
+     if not path.exists():
+         raise RuntimeError(f"Config file not found: {path}")
+     try:
+         import yaml  # type: ignore[import]
+     except Exception as exc:  # noqa: BLE001
+         raise RuntimeError("PyYAML is required to parse configuration files") from exc
+     data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+     if not isinstance(data, dict):
+         raise RuntimeError(f"Config must be a mapping, got {type(data).__name__}")
+     return data
 
 
 def _normalize_selected_path(path: str) -> str:
@@ -846,7 +860,7 @@ def _join_rel(*parts: str) -> str:
 
 def _load_training_config(config_path: Path) -> Dict[str, Any]:
     """Load a training config, following the full base_config chain."""
-    chain = _resolve_config_chain(config_path)
+    chain = _build_config_inheritance_chain(config_path)
     if len(chain) == 1:
         return {k: v for k, v in chain[0]["data"].items() if k != "base_config"}
     merged: Dict[str, Any] = {}
@@ -856,7 +870,7 @@ def _load_training_config(config_path: Path) -> Dict[str, Any]:
     return merged
 
 
-def _resolve_config_chain(config_path: Path) -> List[Dict[str, Any]]:
+def _build_config_inheritance_chain(config_path: Path) -> List[Dict[str, Any]]:
     """Return the inheritance chain as a list of dicts with 'path' and 'data'.
 
     Index 0 is the leaf (selected file), last element is the root base config.
@@ -1893,14 +1907,16 @@ def _render_run_control_panel(config: ServerConfig, selected_path: Optional[str]
       <p class=\"muted\">{_escape_text(hint_text)}</p>
       <div class=\"muted\"><strong>Selected:</strong> {_escape_text(selected_display)}</div>
       {warning_html}
-      <div class=\"run-actions\">
-        <form hx-post=\"/ui/start\" hx-target=\"#run-status\">
-          <input type=\"hidden\" name=\"config\" value=\"{_escape_text(selected_normalized)}\" />
-          <button type=\"submit\" class=\"primary\" {start_disabled}>Start Run</button>
+      <div class="run-actions">
+        <form hx-post="/ui/start" hx-target="#run-status">
+          <input type="hidden" name="config" value="{_escape_text(selected_normalized)}" />
+          <button type="submit" class="primary" {start_disabled}>Start Run</button>
+          <span class="htmx-indicator">Starting...</span>
         </form>
-        <form hx-post=\"/ui/stop\" hx-target=\"#run-status\" hx-confirm=\"Stop the running job?\">
-          <input type=\"hidden\" name=\"confirm\" value=\"yes\" />
-          <button type=\"submit\" class=\"danger\" {stop_disabled}>Stop Run</button>
+        <form hx-post="/ui/stop" hx-target="#run-status" hx-confirm="Stop the running job?">
+          <input type="hidden" name="confirm" value="yes" />
+          <button type="submit" class="danger" {stop_disabled}>Stop Run</button>
+          <span class="htmx-indicator">Stopping...</span>
         </form>
       </div>
     </div>
@@ -1986,7 +2002,13 @@ def _render_pipeline_stepper(
     return '<div class="stepper">' + ''.join(parts) + '</div>'
 
 
+def _render_ui_page_scripts() -> str:
+    return '<script src="/static/app.js"></script><script src="/static/charts.js"></script>'
+
+
 def _render_ui_page(_config: ServerConfig) -> str:
+    nn_params_json = _escape_text(json.dumps(_NN_LAYER_PARAMS, separators=(",", ":")))
+    scripts_html = _render_ui_page_scripts()
     return f"""
 <!doctype html>
 <html lang="en">
@@ -1997,399 +2019,14 @@ def _render_ui_page(_config: ServerConfig) -> str:
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1F4CA;</text></svg>" />
     <script src="/static/htmx.min.js"></script>
     <script src="/static/chart.min.js"></script>
-    <style>
-      :root {{
-        --bg: #f4f6f9; --bg-alt: #e8ecf1; --panel: #ffffff;
-        --ink: #1a1a2e; --ink-2: #5a6072; --ink-3: #8b90a0;
-        --border: #dce0e8;
-        --accent: #3b82f6; --accent-hover: #2563eb; --accent-soft: #dbeafe;
-        --danger: #ef4444; --danger-soft: #fce4e4;
-        --success: #22c55e; --success-soft: #dcfce7;
-        --warning: #f59e0b; --warning-soft: #fef3c7;
-        --shadow: 0 1px 3px rgba(0,0,0,0.06), 0 2px 8px rgba(0,0,0,0.04);
-        --shadow-lg: 0 4px 12px rgba(0,0,0,0.08);
-        --radius: 10px;
-        --font: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
-        --mono: "SF Mono", "Cascadia Code", "JetBrains Mono", "Fira Code", ui-monospace, monospace;
-      }}
-      [data-theme="dark"] {{
-        --bg: #0c0e14; --bg-alt: #151822; --panel: #1a1e2e;
-        --ink: #e2e4eb; --ink-2: #9499ad; --ink-3: #5d6377;
-        --border: #282d3e;
-        --accent: #60a5fa; --accent-hover: #93c5fd; --accent-soft: #1e3a5f;
-        --danger: #f87171; --danger-soft: #3b1c1c;
-        --success: #4ade80; --success-soft: #14352a;
-        --warning: #fbbf24; --warning-soft: #3b2f10;
-        --shadow: 0 1px 3px rgba(0,0,0,0.25), 0 2px 8px rgba(0,0,0,0.2);
-        --shadow-lg: 0 4px 12px rgba(0,0,0,0.35);
-      }}
-      *, *::before, *::after {{ box-sizing: border-box; }}
-      body {{
-        font-family: var(--font); margin: 0; padding: 0;
-        background: var(--bg); color: var(--ink);
-        font-size: 14px; line-height: 1.5; -webkit-font-smoothing: antialiased;
-      }}
-      .shell {{ max-width: 1320px; margin: 0 auto; padding: 16px 20px; }}
-      /* Header */
-      .header {{
-        display: flex; justify-content: space-between; align-items: center;
-        padding: 12px 0 16px 0; border-bottom: 1px solid var(--border); margin-bottom: 16px;
-      }}
-      .header h1 {{ font-size: 1.25rem; font-weight: 700; margin: 0; letter-spacing: -0.02em; }}
-      .header-controls {{ display: flex; align-items: center; gap: 12px; }}
-      .theme-toggle {{
-        background: var(--bg-alt); border: 1px solid var(--border); border-radius: 8px;
-        padding: 6px 10px; cursor: pointer; font-size: 1rem; line-height: 1; color: var(--ink);
-      }}
-      .theme-toggle:hover {{ background: var(--border); }}
-      /* Tabs */
-      .tab-bar {{
-        display: flex; gap: 2px; background: var(--bg-alt); border-radius: 10px;
-        padding: 3px; margin-bottom: 16px; width: fit-content;
-      }}
-      .tab-btn {{
-        padding: 7px 18px; border: none; border-radius: 8px; cursor: pointer;
-        font-size: 0.85rem; font-weight: 600; color: var(--ink-2); background: transparent;
-        transition: all 0.15s ease; font-family: var(--font);
-      }}
-      .tab-btn:hover {{ color: var(--ink); }}
-      .tab-btn.active {{ background: var(--panel); color: var(--ink); box-shadow: var(--shadow); }}
-      .tab-panel {{ display: none; }}
-      .tab-panel.active {{ display: block; }}
-      /* Cards */
-      .card, .panel {{
-        background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
-        padding: 16px; box-shadow: var(--shadow);
-      }}
-      .card + .card {{ margin-top: 16px; }}
-      .card-header, .panel-header {{
-        display: flex; justify-content: space-between; align-items: center;
-        margin-bottom: 10px; padding-bottom: 8px; border-bottom: 1px solid var(--border);
-      }}
-      .card-header h3, .panel-header h3 {{ margin: 0; font-size: 0.95rem; font-weight: 700; letter-spacing: -0.01em; }}
-      .card-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-bottom: 16px; }}
-      /* Badges */
-      .badge {{
-        display: inline-flex; align-items: center; gap: 5px;
-        padding: 3px 10px; border-radius: 999px; font-size: 0.75rem; font-weight: 600;
-      }}
-      .badge.idle {{ background: var(--bg-alt); color: var(--ink-3); }}
-      .badge.running {{ background: var(--accent-soft); color: var(--accent); }}
-      .badge.completed {{ background: var(--success-soft); color: var(--success); }}
-      .badge.failed {{ background: var(--danger-soft); color: var(--danger); }}
-      .badge.fresh {{ background: var(--success-soft); color: var(--success); }}
-      .badge.stale {{ background: var(--warning-soft); color: var(--warning); }}
-      .badge.unknown {{ background: var(--bg-alt); color: var(--ink-3); }}
-      .badge.warn {{ background: var(--warning-soft); color: var(--warning); }}
-      .badge.ok {{ background: var(--success-soft); color: var(--success); }}
-      .badge.abandoned {{ background: var(--bg-alt); color: var(--ink-3); }}
-      /* KV rows */
-      .kv {{ display: flex; justify-content: space-between; padding: 5px 0; font-size: 0.85rem; }}
-      .kv .k {{ color: var(--ink-2); }}
-      .kv .v {{ font-weight: 600; font-variant-numeric: tabular-nums; }}
-      .kv + .kv {{ border-top: 1px solid var(--border); }}
-      /* Pipeline stepper */
-      .stepper {{ display: flex; align-items: center; gap: 0; margin: 12px 0; flex-wrap: wrap; }}
-      .step {{
-        display: flex; align-items: center; gap: 4px; padding: 5px 12px;
-        font-size: 0.78rem; font-weight: 600; border-radius: 6px; white-space: nowrap;
-      }}
-      .step.done {{ color: var(--success); }}
-      .step.active {{ background: var(--accent-soft); color: var(--accent); }}
-      .step.pending {{ color: var(--ink-3); }}
-      .step.error {{ background: var(--danger-soft); color: var(--danger); }}
-      .step-arrow {{ color: var(--ink-3); font-size: 0.7rem; margin: 0 2px; }}
-      /* Progress bar */
-      .progress-wrap {{ margin: 8px 0; }}
-      .progress-bar-outer {{
-        width: 100%; height: 20px; background: var(--bg-alt); border-radius: 10px;
-        overflow: hidden; position: relative;
-      }}
-      .progress-bar-inner {{
-        height: 100%; border-radius: 10px; transition: width 0.4s ease;
-        background: linear-gradient(90deg, var(--accent), #818cf8);
-        position: relative; min-width: 0;
-      }}
-      .progress-bar-inner.training {{ background: linear-gradient(90deg, #22c55e, #4ade80); }}
-      .progress-bar-inner.snapshot_build {{ background: linear-gradient(90deg, #3b82f6, #60a5fa); }}
-      .progress-bar-inner.evaluation {{ background: linear-gradient(90deg, #a855f7, #c084fc); }}
-      .progress-bar-inner.trial {{ background: linear-gradient(90deg, #f59e0b, #fbbf24); }}
-      .progress-bar-inner.diagnostics {{ background: linear-gradient(90deg, #06b6d4, #22d3ee); }}
-      .progress-bar-inner.active {{
-        background-image: linear-gradient(
-          -45deg, rgba(255,255,255,0.15) 25%, transparent 25%,
-          transparent 50%, rgba(255,255,255,0.15) 50%, rgba(255,255,255,0.15) 75%, transparent 75%
-        );
-        background-size: 30px 30px; animation: barberpole 1s linear infinite;
-      }}
-      @keyframes barberpole {{ 0% {{ background-position: 0 0; }} 100% {{ background-position: 30px 0; }} }}
-      .progress-label {{
-        font-size: 0.8rem; font-weight: 600; color: var(--ink-2); margin-top: 4px;
-        display: flex; justify-content: space-between;
-      }}
-      /* Log viewer */
-      .log-viewer {{
-        background: #0d1117; color: #c9d1d9; padding: 12px 14px; border-radius: var(--radius);
-        height: 420px; overflow: auto; font-family: var(--mono); font-size: 0.78rem;
-        line-height: 1.65; white-space: pre-wrap; word-break: break-all; border: 1px solid #21262d;
-      }}
-      [data-theme="dark"] .log-viewer {{ background: #010409; border-color: #21262d; }}
-      .log-line {{ display: block; }}
-      .log-line-error {{ color: #f87171; }}
-      .log-line-warning {{ color: #fbbf24; }}
-      .log-line-debug {{ color: #6b7280; }}
-      .log-controls {{ display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }}
-      .log-controls input {{
-        flex: 1; padding: 6px 10px; border-radius: 6px; border: 1px solid var(--border);
-        background: var(--panel); color: var(--ink); font-family: var(--font); font-size: 0.8rem;
-      }}
-      .log-controls button {{
-        padding: 6px 12px; border-radius: 6px; border: 1px solid var(--border);
-        background: var(--bg-alt); color: var(--ink-2); cursor: pointer; font-size: 0.8rem;
-        font-family: var(--font); font-weight: 500;
-      }}
-      /* Error detail panel */
-      .error-detail {{
-        background: var(--danger-soft); border: 1px solid var(--danger); border-radius: var(--radius);
-        padding: 12px; margin-top: 10px;
-      }}
-      .error-detail summary {{ cursor: pointer; font-weight: 600; color: var(--danger); font-size: 0.85rem; }}
-      .error-detail pre {{
-        margin: 8px 0 0 0; font-family: var(--mono); font-size: 0.75rem;
-        white-space: pre-wrap; color: var(--ink); max-height: 300px; overflow: auto;
-      }}
-      /* Config panel */
-      .config-panel {{ margin-top: 0; }}
-      .config-panel .field label,
-      .config-panel input:not([type="checkbox"]),
-      .config-panel select,
-      .config-panel textarea,
-      .config-panel .file-entry,
-      .config-panel .browser-header {{ font-size: 0.8rem; line-height: 1.3; }}
-      .config-browser {{
-        margin-top: 12px; border: 1px dashed var(--border); border-radius: var(--radius);
-        padding: 12px; background: var(--bg-alt);
-      }}
-      .browser-header {{ display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; font-size: 0.85rem; }}
-      .file-list {{
-        max-height: 220px; overflow: auto; display: grid; gap: 4px; padding: 8px;
-        margin-top: 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel);
-      }}
-      .file-entry {{
-        text-align: left; padding: 5px 8px; border-radius: 6px;
-        border: 1px solid transparent; background: var(--bg-alt); cursor: pointer;
-        font-family: var(--mono); font-size: 0.78rem; color: var(--ink);
-      }}
-      .file-entry:hover {{ background: var(--border); }}
-      .file-entry.dir {{ font-weight: 600; }}
-      .file-entry.file.selected {{ border-color: var(--accent); background: var(--accent-soft); }}
-      .load-form {{ margin-top: 10px; }}
-      .config-form {{ margin-top: 16px; display: grid; gap: 12px; }}
-      .config-fields {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }}
-      @media (max-width: 1100px) {{ .config-fields {{ grid-template-columns: repeat(2, 1fr); }} }}
-      @media (max-width: 720px) {{ .config-fields {{ grid-template-columns: 1fr; }} }}
-      .section-title {{
-        grid-column: 1 / -1; font-weight: 700; margin-top: 14px; padding-bottom: 4px;
-        border-bottom: 2px solid var(--border); font-size: 0.9rem; cursor: pointer;
-        display: flex; align-items: center; gap: 6px;
-      }}
-      .section-title::before {{ content: "\\25BC"; font-size: 0.65rem; color: var(--ink-3); transition: transform 0.15s; }}
-      .section-title.collapsed::before {{ transform: rotate(-90deg); }}
-      .subsection-title {{ grid-column: 1 / -1; font-weight: 600; margin-top: 8px; color: var(--ink-2); font-size: 0.82rem; }}
-      .subsub-title {{ grid-column: 1 / -1; font-weight: 600; margin-top: 4px; color: var(--ink-3); font-size: 0.78rem; }}
-      .field {{ display: grid; gap: 4px; }}
-      .field.missing input, .field.missing textarea, .field.missing select {{ border-color: var(--danger); }}
-      .status {{ margin: 8px 0; padding: 8px 12px; border-radius: 8px; font-size: 0.85rem; }}
-      .status.info {{ background: var(--bg-alt); color: var(--ink-2); }}
-      .status.ok {{ background: var(--success-soft); color: var(--success); }}
-      .status.error {{ background: var(--danger-soft); color: var(--danger); }}
-      .status.warning {{ background: var(--warning-soft); color: var(--warning); }}
-      .status ul {{ margin: 6px 0 0 18px; }}
-      form {{ display: grid; gap: 8px; margin-top: 8px; }}
-      .run-actions {{ display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap; }}
-      .mode-toggle {{ display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }}
-      .muted {{ color: var(--ink-2); font-size: 0.85rem; }}
-      label {{ font-weight: 600; font-size: 0.82rem; }}
-      input, select {{
-        padding: 7px 10px; border-radius: 8px; border: 1px solid var(--border);
-        background: var(--panel); color: var(--ink); font-family: var(--font); font-size: 0.85rem;
-      }}
-      textarea {{
-        padding: 7px 10px; border-radius: 8px; border: 1px solid var(--border);
-        background: var(--panel); color: var(--ink); font-family: var(--mono); font-size: 0.8rem; resize: vertical;
-      }}
-      input:focus, select:focus, textarea:focus {{ outline: 2px solid var(--accent); outline-offset: -1px; border-color: var(--accent); }}
-      input[type="checkbox"] {{ width: 15px; height: 15px; margin: 0; accent-color: var(--accent); }}
-      button {{
-        padding: 7px 14px; border-radius: 8px; border: none; cursor: pointer;
-        font-weight: 600; font-family: var(--font); font-size: 0.82rem; transition: all 0.15s;
-      }}
-      button.ghost {{ background: transparent; border: 1px solid var(--border); color: var(--ink-2); }}
-      button.ghost:hover {{ background: var(--bg-alt); }}
-      button.primary {{ background: var(--accent); color: #fff; }}
-      button.primary:hover {{ background: var(--accent-hover); }}
-      button.danger {{ background: var(--danger); color: #fff; }}
-      button[disabled] {{ opacity: 0.45; cursor: not-allowed; }}
-      .chip {{ padding: 3px 10px; border-radius: 999px; font-size: 0.75rem; font-weight: 600; }}
-      .chip.ok {{ background: var(--success-soft); color: var(--success); }}
-      .chip.muted {{ background: var(--bg-alt); color: var(--ink-3); }}
-      .hint {{
-        display: inline-flex; align-items: center; justify-content: center;
-        width: 16px; height: 16px; margin-left: 4px; border-radius: 50%;
-        background: var(--bg-alt); color: var(--ink-3); font-size: 0.65rem;
-        cursor: help; position: relative;
-      }}
-      .hint::after {{
-        content: attr(data-hint); position: absolute; bottom: 150%; left: 50%;
-        transform: translateX(-50%); background: var(--ink); color: var(--panel);
-        padding: 6px 10px; border-radius: 6px; font-size: 0.72rem; white-space: nowrap;
-        max-width: 300px; opacity: 0; pointer-events: none; transition: opacity 0.15s; z-index: 10;
-      }}
-      .hint:hover::after {{ opacity: 1; }}
-      /* Config inheritance chain graph */
-      .chain-graph {{
-        margin: 12px 0; padding: 10px 14px; border-radius: var(--radius);
-        background: var(--bg-alt); border: 1px solid var(--border);
-      }}
-      .chain-label {{ font-size: 0.78rem; font-weight: 600; color: var(--ink-2); margin-bottom: 6px; }}
-      .chain-nodes {{ display: flex; align-items: center; gap: 0; flex-wrap: wrap; }}
-      .chain-node {{
-        display: inline-flex; align-items: center; gap: 5px;
-        padding: 5px 12px; border-radius: 6px; font-family: var(--mono);
-        font-size: 0.78rem; font-weight: 600; white-space: nowrap;
-      }}
-      .chain-leaf {{ background: var(--accent-soft); color: var(--accent); border: 1px solid var(--accent); }}
-      .chain-base {{ background: var(--panel); color: var(--ink-2); border: 1px solid var(--border); }}
-      .chain-tag {{
-        font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.04em;
-        padding: 1px 5px; border-radius: 4px; background: rgba(0,0,0,0.06); color: var(--ink-3);
-      }}
-      [data-theme="dark"] .chain-tag {{ background: rgba(255,255,255,0.06); }}
-      .chain-arrow {{ color: var(--ink-3); font-size: 0.85rem; margin: 0 6px; }}
-      /* YAML viewer blocks */
-      .yaml-viewer-section {{ margin: 14px 0; }}
-      .yaml-block {{ margin-bottom: 6px; }}
-      .yaml-block summary {{
-        cursor: pointer; font-weight: 600; font-size: 0.82rem; color: var(--ink);
-        padding: 6px 10px; border-radius: 6px; background: var(--bg-alt);
-        border: 1px solid var(--border); user-select: none;
-      }}
-      .yaml-block summary:hover {{ background: var(--border); }}
-      .yaml-block[open] summary {{ border-radius: 6px 6px 0 0; border-bottom: none; }}
-      .yaml-pre {{
-        margin: 0; padding: 10px 14px; font-family: var(--mono); font-size: 0.76rem;
-        line-height: 1.6; background: #0d1117; color: #c9d1d9; border-radius: 0 0 6px 6px;
-        border: 1px solid var(--border); border-top: none; max-height: 400px; overflow: auto;
-        white-space: pre-wrap; word-break: break-all;
-      }}
-      [data-theme="dark"] .yaml-pre {{ background: #010409; }}
-      .yaml-key {{ color: #7ee787; }}
-      .yaml-list {{ color: #79c0ff; }}
-      /* Structured config sections (accordion) */
-      .cfg-section {{ margin-bottom: 4px; border: 1px solid var(--border); border-radius: var(--radius); }}
-      .cfg-section-title {{
-        cursor: pointer; font-weight: 700; font-size: 0.88rem; color: var(--ink);
-        padding: 10px 14px; background: var(--bg-alt); border-radius: var(--radius);
-        user-select: none; list-style: none;
-        display: flex; align-items: center; gap: 6px;
-      }}
-      .cfg-section-title::before {{ content: "\\25BC"; font-size: 0.6rem; color: var(--ink-3); transition: transform 0.15s; }}
-      .cfg-section[open] .cfg-section-title {{ border-radius: var(--radius) var(--radius) 0 0; }}
-      .cfg-section:not([open]) .cfg-section-title::before {{ transform: rotate(-90deg); }}
-      .cfg-section-title::-webkit-details-marker {{ display: none; }}
-      .cfg-section-body {{ padding: 8px 14px 12px 14px; }}
-      .cfg-subsection {{
-        margin-bottom: 8px; padding: 6px 0 6px 10px;
-        border-left: 3px solid var(--border);
-      }}
-      .cfg-subsection-title {{
-        font-weight: 600; font-size: 0.8rem; color: var(--accent);
-        margin-bottom: 6px; padding-bottom: 3px;
-        border-bottom: 1px dashed var(--border);
-      }}
-      .cfg-field {{
-        display: grid; grid-template-columns: minmax(120px, 1fr) 2fr; gap: 4px 10px;
-        align-items: center; padding: 3px 0; font-size: 0.8rem;
-      }}
-      .cfg-field label {{ font-weight: 500; font-size: 0.78rem; color: var(--ink-2); }}
-      .cfg-field.missing input, .cfg-field.missing textarea, .cfg-field.missing select {{ border-color: var(--danger); }}
-      .cfg-field input:not([type="checkbox"]), .cfg-field select {{ font-size: 0.78rem; padding: 5px 8px; }}
-      .cfg-field textarea {{ font-size: 0.76rem; padding: 5px 8px; }}
-      .list-field-wrap {{ display: flex; flex-direction: column; gap: 4px; }}
-      .list-items {{ display: flex; flex-wrap: wrap; gap: 4px; }}
-      .list-item {{
-        display: inline-flex; align-items: center; gap: 4px;
-        padding: 2px 8px; border-radius: 6px; font-size: 0.75rem;
-        background: var(--accent-soft); color: var(--accent); border: 1px solid var(--accent);
-      }}
-      .list-item-text {{ font-family: var(--mono); }}
-      .list-btn-sm {{
-        width: 20px; height: 20px; padding: 0; border: none; border-radius: 4px;
-        font-size: 0.75rem; font-weight: 700; cursor: pointer; line-height: 1;
-        display: inline-flex; align-items: center; justify-content: center;
-      }}
-      .list-btn-sm.danger {{ background: var(--danger-soft); color: var(--danger); }}
-      .list-btn-sm.danger:hover {{ background: var(--danger); color: #fff; }}
-      .list-btn-sm.primary {{ background: var(--accent-soft); color: var(--accent); }}
-      .list-btn-sm.primary:hover {{ background: var(--accent); color: #fff; }}
-      .list-add-row {{ display: flex; gap: 4px; align-items: center; }}
-      .list-add-select, .list-add-input {{ font-size: 0.75rem; padding: 3px 6px; flex: 1; min-width: 0; }}
-      .list-hidden-ta {{ display: none; }}
-      .pc-boundaries-wrap {{ display: flex; flex-direction: column; gap: 6px; }}
-      .pc-boundaries-head {{ display: flex; align-items: center; gap: 8px; }}
-      .pc-boundaries-head select {{ font-size: 0.75rem; padding: 3px 6px; }}
-      .pc-auto-grid {{
-        display: grid;
-        grid-template-columns: repeat(2, minmax(120px, 1fr));
-        gap: 6px 10px;
-        align-items: center;
-      }}
-      .pc-auto-field {{ display: grid; grid-template-columns: 1fr 1.2fr; gap: 6px; align-items: center; }}
-      .pc-auto-field label {{ font-size: 0.75rem; color: var(--ink-2); }}
-      @media (max-width: 720px) {{
-        .pc-auto-grid {{ grid-template-columns: 1fr; }}
-        .pc-auto-field {{ grid-template-columns: 1fr 1.4fr; }}
-      }}
-      .asset-select-wrap {{ display: flex; gap: 4px; align-items: center; }}
-      .asset-select {{ flex: 1; min-width: 0; }}
-      .asset-list-wrap {{ display: flex; flex-direction: column; gap: 4px; }}
-      .conn-table-wrap {{ grid-column: 1 / -1; }}
-      .conn-table {{ width: 100%; border-collapse: collapse; font-size: 0.75rem; }}
-      .conn-table th {{ padding: 4px 6px; text-align: left; font-weight: 600; color: var(--ink-2); border-bottom: 2px solid var(--border); }}
-      .conn-table td {{ padding: 3px 4px; border-bottom: 1px solid var(--border); }}
-      .conn-table input {{ width: 100%; font-size: 0.74rem; padding: 3px 5px; }}
-      .nn-builder-wrap {{ grid-column: 1 / -1; margin: 8px 0; }}
-      .nn-cards-row {{ display: flex; gap: 6px; overflow-x: auto; padding: 8px 0; align-items: stretch; }}
-      .nn-card {{
-        min-width: 130px; max-width: 180px; border: 2px solid var(--accent);
-        border-radius: 8px; background: var(--bg); font-size: 0.72rem; flex-shrink: 0;
-      }}
-      .nn-card-header {{
-        display: flex; justify-content: space-between; align-items: center;
-        padding: 4px 8px; background: var(--accent-soft); border-radius: 6px 6px 0 0;
-      }}
-      .nn-card-type {{ font-weight: 700; color: var(--accent); font-size: 0.72rem; }}
-      .nn-card-body {{ padding: 6px 8px; display: grid; gap: 3px; }}
-      .nn-param {{ display: flex; justify-content: space-between; align-items: center; gap: 4px; }}
-      .nn-param label {{ font-size: 0.68rem; color: var(--ink-2); white-space: nowrap; }}
-      .nn-param input, .nn-param select {{ width: 65px; font-size: 0.7rem; padding: 2px 4px; }}
-      .nn-fixed-card {{
-        min-width: 70px; display: flex; align-items: center; justify-content: center;
-        padding: 8px 12px; border: 2px dashed var(--border); border-radius: 8px;
-        font-weight: 700; font-size: 0.72rem; color: var(--ink-3); flex-shrink: 0;
-      }}
-      .nn-fixed-card.input {{ border-color: var(--success); color: var(--success); }}
-      .nn-fixed-card.output {{ border-color: var(--warning); color: var(--warning); }}
-      .nn-add-bar {{ display: flex; gap: 6px; align-items: center; margin-top: 6px; }}
-      @media (max-width: 720px) {{
-        .shell {{ padding: 12px; }}
-        .card-grid {{ grid-template-columns: 1fr; }}
-        .tab-bar {{ width: 100%; }}
-        .tab-btn {{ flex: 1; text-align: center; }}
-      }}
-    </style>
+    <link rel="stylesheet" href="/static/app.css" />
   </head>
-  <body>
+  <body
+    data-theme-storage-key="obs-theme"
+    data-api-run-state="/api/run-state"
+    data-api-assets="/api/config/assets"
+    data-nn-params="{nn_params_json}"
+  >
     <div class="shell">
       <div class="header">
         <h1>Observability Dashboard</h1>
@@ -2444,88 +2081,7 @@ def _render_ui_page(_config: ServerConfig) -> str:
         <div class="card" hx-get="/ui/history" hx-trigger="load, every 15s"></div>
       </div>
     </div>
-    <script>
-      function getPreferredTheme(){{var s=localStorage.getItem('obs-theme');if(s)return s;return window.matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light';}}
-      function applyTheme(t){{document.documentElement.setAttribute('data-theme',t);document.getElementById('theme-icon').textContent=t==='dark'?'\u2600\uFE0F':'\uD83C\uDF19';localStorage.setItem('obs-theme',t);}}
-      function toggleTheme(){{var c=document.documentElement.getAttribute('data-theme')||'light';applyTheme(c==='dark'?'light':'dark');}}
-      applyTheme(getPreferredTheme());
-       function switchTab(btn,name){{document.querySelectorAll('.tab-panel').forEach(function(p){{p.classList.remove('active')}});document.querySelectorAll('.tab-btn').forEach(function(t){{t.classList.remove('active')}});var panel=document.getElementById('tab-'+name);if(panel){{panel.classList.add('active');btn.classList.add('active');}}}}
-      function filterLogs(){{var q=document.getElementById('log-filter').value.toLowerCase();document.querySelectorAll('#logs-panel .log-line').forEach(function(l){{l.style.display=(!q||l.textContent.toLowerCase().indexOf(q)!==-1)?'':'none'}});}}
-      window._autoScroll=true;
-       function toggleAutoScroll(){{window._autoScroll=!window._autoScroll;var btn=document.getElementById('autoscroll-btn');if(btn)btn.textContent='Auto-scroll: '+(window._autoScroll?'ON':'OFF');}}
-      document.addEventListener('click',function(e){{if(e.target.classList.contains('section-title')){{e.target.classList.toggle('collapsed');var el=e.target.nextElementSibling;while(el&&!el.classList.contains('section-title')){{el.style.display=e.target.classList.contains('collapsed')?'none':'';el=el.nextElementSibling;}}}}}});
-      function exportRunState(){{fetch('/api/run-state').then(function(r){{return r.json()}}).then(function(d){{var blob=new Blob([JSON.stringify(d,null,2)],{{type:'application/json'}});var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='run_state_'+new Date().toISOString().slice(0,19).replace(/:/g,'-')+'.json';a.click();}}).catch(function(e){{alert('Export failed: '+e);}});}}
-      function setRefreshRate(sec){{var val=parseInt(sec,10)||5;document.querySelectorAll('[hx-trigger*="every"]').forEach(function(el){{var t=el.getAttribute('hx-trigger');if(t){{var newT=t.replace(/every \\d+s/g,'every '+val+'s');el.setAttribute('hx-trigger',newT);if(window.htmx)htmx.process(el);}}}});}}
-      function _syncListTA(uid){{var c=document.getElementById('items_'+uid);if(!c)return;var items=[];c.querySelectorAll('.list-item-text').forEach(function(s){{items.push(s.textContent)}});var ta=document.getElementById('ta_'+uid);if(ta)ta.value=items.length?'['+items.map(function(v){{return /^\\d+(\\.\\d+)?$/.test(v)?v:'"'+v.replace(/"/g,'\\\\"')+'"'}}).join(', ')+']':'[]';}}
-       function removeListItem(btn,uid){{var parent=btn.parentElement;if(parent){{parent.remove();_syncListTA(uid);}}}}
-      function addListItemFromSelect(uid){{var sel=document.getElementById('sel_'+uid);if(!sel||!sel.value)return;var v=sel.value;var c=document.getElementById('items_'+uid);if(!c)return;var existing=[];c.querySelectorAll('.list-item-text').forEach(function(s){{existing.push(s.textContent)}});if(existing.indexOf(v)!==-1){{sel.value='';return;}}var d=document.createElement('div');d.className='list-item';d.setAttribute('data-list',uid);d.innerHTML='<span class="list-item-text">'+v+'</span><button type="button" class="list-btn-sm danger" onclick="removeListItem(this,\\''+uid+'\\')">-</button>';c.appendChild(d);sel.value='';_syncListTA(uid);}}
-      function addListItemFromInput(uid){{var inp=document.getElementById('inp_'+uid);if(!inp||!inp.value.trim())return;var v=inp.value.trim();var c=document.getElementById('items_'+uid);if(!c)return;var d=document.createElement('div');d.className='list-item';d.setAttribute('data-list',uid);d.innerHTML='<span class="list-item-text">'+v+'</span><button type="button" class="list-btn-sm danger" onclick="removeListItem(this,\\''+uid+'\\')">-</button>';c.appendChild(d);inp.value='';_syncListTA(uid);}}
-      function _syncConnTA(){{
-        var rows=document.querySelectorAll('#conn-tbody .conn-row');
-        var conns=[];
-        rows.forEach(function(r){{
-          var c={{}};
-          r.querySelectorAll('.conn-f').forEach(function(f){{
-            var k=f.getAttribute('data-field');
-            if(k==='start_date'||k==='end_date'){{
-              if(!c.time_range)c.time_range={{}};
-              c.time_range[k]=f.value;
-            }}else{{
-              c[k]=f.value;
-            }}
-          }});
-          conns.push(c);
-        }});
-
-        var ta=document.getElementById('ta_conn');
-        if(!ta)return;
-
-        var lines=[];
-        conns.forEach(function(c){{
-          var part=[
-            '- name: "'+((c.name||'').replace(/"/g,'\\\\"'))+'"',
-            '  database_uri: "'+((c.database_uri||'').replace(/"/g,'\\\\"'))+'"',
-            '  table_prefix: "'+((c.table_prefix||'').replace(/"/g,'\\\\"'))+'"',
-            '  time_range:',
-            '    start_date: "'+((c.time_range&&c.time_range.start_date)||'')+'"',
-            '    end_date: "'+((c.time_range&&c.time_range.end_date)||'')+'"'
-          ];
-          lines.push(part.join('\\n'));
-        }});
-        ta.value=lines.length?lines.join('\\n'):'[]';
-      }}
-      function removeConnRow(btn){{var row=btn.closest('tr');if(row){{row.remove();_syncConnTA();}}}}
-      function addConnRow(){{var tb=document.getElementById('conn-tbody');if(!tb)return;var tr=document.createElement('tr');tr.className='conn-row';tr.innerHTML='<td><input type="text" class="conn-f" data-field="name" value="" /></td><td><input type="text" class="conn-f" data-field="database_uri" value="" /></td><td><input type="text" class="conn-f" data-field="table_prefix" value="orderbook_" /></td><td><input type="date" class="conn-f" data-field="start_date" value="" /></td><td><input type="date" class="conn-f" data-field="end_date" value="" /></td><td><button type="button" class="list-btn-sm danger" onclick="removeConnRow(this)">-</button></td>';tb.appendChild(tr);tr.querySelectorAll('.conn-f').forEach(function(f){{f.addEventListener('change',_syncConnTA);}});_syncConnTA();}}
-      document.addEventListener('change',function(e){{if(e.target.classList.contains('conn-f'))_syncConnTA();}});
-      function loadAssets(fieldKey){{fetch('/api/config/assets').then(function(r){{return r.json()}}).then(function(d){{var sel=document.getElementById('asset_sel_'+fieldKey);if(!sel)return;var cur=sel.value;var opts='';(d.assets||[]).forEach(function(a){{var s=(a===cur)?'selected':'';opts+='<option value="'+a+'" '+s+'>'+a+'</option>';}});if(opts)sel.innerHTML=opts;else sel.innerHTML='<option value="">No assets found</option>';}}).catch(function(e){{alert('Failed to load assets: '+e);}});}}
-      function loadAssetsForList(uid){{fetch('/api/config/assets').then(function(r){{return r.json()}}).then(function(d){{var sel=document.getElementById('sel_'+uid);if(!sel)return;var opts='<option value="">Add...</option>';(d.assets||[]).forEach(function(a){{opts+='<option value="'+a+'">'+a+'</option>';}});sel.innerHTML=opts;}}).catch(function(e){{alert('Failed to load assets: '+e);}});}}
-      function setPriceBoundariesMode(mode){{
-        var manual=document.getElementById('pc_boundaries_manual');
-        var auto=document.getElementById('pc_boundaries_auto');
-        var ta=document.getElementById('ta_targets_price_classes_boundaries');
-        if(!manual||!auto||!ta)return;
-        if(mode==='auto'){{
-          manual.style.display='none';
-          auto.style.display='';
-          ta.value='auto';
-        }}else{{
-          manual.style.display='';
-          auto.style.display='none';
-          _syncListTA('targets_price_classes_boundaries');
-        }}
-      }}
-      var _nnParams={{"cnn":[{{"name":"filters","type":"number","default":"32"}},{{"name":"kernel_size","type":"text","default":"[3,3]"}},{{"name":"pool_size","type":"text","default":"[2,2]"}},{{"name":"normalization","type":"select","default":"null","options":"null,batch,group,layer"}},{{"name":"dropout","type":"number","default":"0.0"}}],"lstm":[{{"name":"units","type":"number","default":"64"}},{{"name":"dropout","type":"number","default":"0.0"}},{{"name":"recurrent_dropout","type":"number","default":"0.0"}},{{"name":"post_dropout","type":"number","default":"0.0"}}],"dense":[{{"name":"units","type":"number","default":"64"}},{{"name":"dropout","type":"number","default":"0.0"}}]}};
-      function _syncNNTA(){{var row=document.getElementById('nn-cards-row');if(!row)return;['cnn','lstm','dense'].forEach(function(lt){{var cards=row.querySelectorAll('.nn-card[data-layer-type="'+lt+'"]');var layers=[];cards.forEach(function(c){{var l={{}};c.querySelectorAll('.nn-p').forEach(function(f){{var k=f.getAttribute('data-param');var v=f.value;if(/^\\d+$/.test(v))l[k]=parseInt(v,10);else if(/^\\d+\\.\\d*$/.test(v)||/^\\d*\\.\\d+$/.test(v))l[k]=parseFloat(v);else if(v==='null')l[k]=null;else if(v.startsWith('[')){{try{{l[k]=JSON.parse(v)}}catch(e){{l[k]=v}}}}else l[k]=v;}});layers.push(l);}});var ta=document.getElementById('ta_nn_'+lt);if(ta){{try{{ta.value=JSON.stringify(layers)}}catch(e){{ta.value='[]'}}}}}});}}
-      function removeNNCard(btn){{var card=btn.closest('.nn-card');if(card){{card.remove();_syncNNTA();}}}}
-      function addNNCard(lt){{var row=document.getElementById('nn-cards-row');if(!row)return;var params=_nnParams[lt]||[];var html='';params.forEach(function(p){{if(p.type==='select'){{var opts='';p.options.split(',').forEach(function(o){{var s=(o===p.default)?'selected':'';opts+='<option value="'+o+'" '+s+'>'+o+'</option>';}});html+='<div class="nn-param"><label>'+p.name+'</label><select class="nn-p" data-param="'+p.name+'">'+opts+'</select></div>';}}else{{var it=p.type==='number'?'number':'text';var st=p.type==='number'?' step="any"':'';html+='<div class="nn-param"><label>'+p.name+'</label><input type="'+it+'"'+st+' class="nn-p" data-param="'+p.name+'" value="'+p.default+'" /></div>';}}}});var idx=row.querySelectorAll('.nn-card[data-layer-type="'+lt+'"]').length;var card=document.createElement('div');card.className='nn-card';card.setAttribute('data-layer-type',lt);card.setAttribute('data-idx',idx);card.innerHTML='<div class="nn-card-header"><span class="nn-card-type">'+lt.toUpperCase()+' '+(idx+1)+'</span><button type="button" class="list-btn-sm danger" onclick="removeNNCard(this)">-</button></div><div class="nn-card-body">'+html+'</div>';var output=row.querySelector('.nn-fixed-card.output');if(output)row.insertBefore(card,output);else row.appendChild(card);_syncNNTA();}}
-      document.addEventListener('change',function(e){{if(e.target.classList.contains('nn-p'))_syncNNTA();}});
-       document.addEventListener('DOMContentLoaded',function(){{
-         _syncNNTA();
-         var sel=document.getElementById('pc_boundaries_mode');
-         if(sel){{setPriceBoundariesMode(sel.value);}}
-       }});
-       document.body.addEventListener('htmx:beforeSwap',function(e){{if(e.detail.xhr.status===409){{e.detail.shouldSwap=true;e.detail.isError=false;}}}});
-     </script>
+    {scripts_html}
   </body>
 </html>
 """
@@ -2551,6 +2107,12 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(json.dumps(payload).encode("utf-8"))
+
+    def _send_plain(self, body: str, status: int = 200) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(body.encode("utf-8", errors="replace"))
 
     def _require_auth(self) -> bool:
         config = self.server_state.config
@@ -2595,7 +2157,7 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
         if not self._require_auth():
             return
 
-        if path == "/" or path == "/ui":
+        if path == "/" or path == "/ui" or path == "/ui/":
             cfg = self.server_state.config
             body = _render_ui_page(cfg)
             self._send_html(body)
@@ -2699,13 +2261,6 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
 
         if path == "/ui/metrics":
             state = load_run_state(self.server_state.config.run_state_path) or {}
-            def _fmt(value: Any) -> str:
-                if value is None:
-                    return "n/a"
-                try:
-                    return f"{float(value):.3f}"
-                except (TypeError, ValueError):
-                    return "n/a"
 
             body = '<div class="card-header"><h3>Duty Cycle</h3></div>'
 
@@ -2732,34 +2287,48 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
                         chart_labels.append(ts_label)
                         chart_values.append(f"{mean_val:.4f}")
                     chart_id = "dutyCycleChart"
+                    chart_config = {
+                        "type": "line",
+                        "data": {
+                            "labels": chart_labels,
+                            "datasets": [{
+                                "label": "Median Duty Cycle",
+                                "data": [float(v) for v in chart_values],
+                                "borderColor": "#3b82f6",
+                                "backgroundColor": "#3b82f622",
+                                "tension": 0.3,
+                                "pointRadius": 2,
+                                "borderWidth": 2,
+                                "fill": True,
+                            }],
+                        },
+                        "options": {
+                            "responsive": True,
+                            "maintainAspectRatio": False,
+                            "animation": False,
+                            "plugins": {"legend": {"display": False}},
+                            "scales": {
+                                "x": {
+                                    "grid": {"color": "rgba(255,255,255,0.08)"},
+                                    "ticks": {"color": "#9499ad", "font": {"size": 10}},
+                                },
+                                "y": {
+                                    "grid": {"color": "rgba(255,255,255,0.08)"},
+                                    "ticks": {"color": "#9499ad", "font": {"size": 10}},
+                                    "title": {"display": True, "text": "Duty Cycle", "color": "#9499ad"},
+                                },
+                            },
+                        },
+                    }
+                    chart_config_json = json.dumps(chart_config, separators=(",", ":"))
                     body += (
-                        f'<canvas id="{chart_id}" style="width:100%;max-height:200px"></canvas>'
-                        '<script>'
-                        f'(function(){{'
-                        f'var ctx=document.getElementById("{chart_id}");'
-                        f'if(!ctx)return;'
-                        f'if(ctx._chartInstance){{ctx._chartInstance.destroy();}}'
-                        f'if(typeof Chart==="undefined"){{console.warn("Chart.js not loaded");return;}}'
-                        f'var isDark=document.documentElement.getAttribute("data-theme")==="dark";'
-                        f'var gridColor=isDark?"rgba(255,255,255,0.08)":"rgba(0,0,0,0.06)";'
-                        f'var tickColor=isDark?"#9499ad":"#5a6072";'
-                        f'ctx._chartInstance=new Chart(ctx,{{'
-                        f'type:"line",'
-                        f'data:{{labels:[{",".join(repr(l) for l in chart_labels)}],'
-                        f'datasets:[{{label:"Median Duty Cycle",data:[{",".join(chart_values)}],'
-                        f'borderColor:"#3b82f6",backgroundColor:"#3b82f622",tension:0.3,pointRadius:2,borderWidth:2,fill:true}}]}},'
-                        f'options:{{responsive:true,maintainAspectRatio:false,animation:false,'
-                        f'plugins:{{legend:{{display:false}}}},'
-                        f'scales:{{x:{{grid:{{color:gridColor}},ticks:{{color:tickColor,font:{{size:10}}}}}},'
-                        f'y:{{grid:{{color:gridColor}},ticks:{{color:tickColor,font:{{size:10}}}},'
-                        f'title:{{display:true,text:"Duty Cycle",color:tickColor}}}}}}}}'
-                        f'}});'
-                        f'}})()</script>'
+                        f'<canvas id="{chart_id}" style="width:100%;max-height:200px" '
+                        f'data-chart-config=\'{chart_config_json}\'></canvas>'
                     )
 
-            body += f'<div class="kv"><span class="k">Min</span><span class="v">{_fmt(state.get("duty_cycle_min"))}</span></div>'
-            body += f'<div class="kv"><span class="k">Median</span><span class="v">{_fmt(state.get("duty_cycle_median"))}</span></div>'
-            body += f'<div class="kv"><span class="k">P95</span><span class="v">{_fmt(state.get("duty_cycle_p95"))}</span></div>'
+            body += f'<div class="kv"><span class="k">Min</span><span class="v">{_fmt_metric(state.get("duty_cycle_min"))}</span></div>'
+            body += f'<div class="kv"><span class="k">Median</span><span class="v">{_fmt_metric(state.get("duty_cycle_median"))}</span></div>'
+            body += f'<div class="kv"><span class="k">P95</span><span class="v">{_fmt_metric(state.get("duty_cycle_p95"))}</span></div>'
             self._send_html(body)
             return
 
@@ -3125,41 +2694,56 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
             epochs = [str(m.get("epoch", i + 1)) for i, m in enumerate(epoch_metrics)]
             metric_keys = sorted({k for m in epoch_metrics for k in m if k != "epoch"})
             palette = ["#3b82f6", "#ef4444", "#22c55e", "#f59e0b", "#a855f7", "#06b6d4", "#ec4899", "#84cc16"]
-            datasets_js_parts: List[str] = []
+            datasets: List[Dict[str, Any]] = []
             for idx, key in enumerate(metric_keys):
                 color = palette[idx % len(palette)]
-                values = [str(m.get(key, "null")) for m in epoch_metrics]
+                values = [m.get(key) for m in epoch_metrics]
                 is_val = key.startswith("val_")
-                dash = "borderDash:[5,3]," if is_val else ""
-                datasets_js_parts.append(
-                    f'{{label:"{_escape_text(key)}",data:[{",".join(values)}],'
-                    f'borderColor:"{color}",backgroundColor:"{color}22",{dash}'
-                    f'tension:0.3,pointRadius:2,borderWidth:2,fill:false}}'
-                )
-            datasets_js = ",".join(datasets_js_parts)
+                dataset: Dict[str, Any] = {
+                    "label": str(key),
+                    "data": values,
+                    "borderColor": color,
+                    "backgroundColor": f"{color}22",
+                    "tension": 0.3,
+                    "pointRadius": 2,
+                    "borderWidth": 2,
+                    "fill": False,
+                }
+                if is_val:
+                    dataset["borderDash"] = [5, 3]
+                datasets.append(dataset)
             chart_id = "trainChart"
+            chart_config = {
+                "type": "line",
+                "data": {"labels": epochs, "datasets": datasets},
+                "options": {
+                    "responsive": True,
+                    "maintainAspectRatio": False,
+                    "animation": False,
+                    "plugins": {
+                        "legend": {
+                            "position": "top",
+                            "labels": {"color": "#9499ad", "font": {"size": 11}},
+                        }
+                    },
+                    "scales": {
+                        "x": {
+                            "grid": {"color": "rgba(255,255,255,0.08)"},
+                            "ticks": {"color": "#9499ad", "font": {"size": 10}},
+                            "title": {"display": True, "text": "Epoch", "color": "#9499ad"},
+                        },
+                        "y": {
+                            "grid": {"color": "rgba(255,255,255,0.08)"},
+                            "ticks": {"color": "#9499ad", "font": {"size": 10}},
+                        },
+                    },
+                },
+            }
+            chart_config_json = json.dumps(chart_config, separators=(",", ":"))
             body = (
                 '<div class="card-header"><h3>Training Curves</h3></div>'
-                f'<canvas id="{chart_id}" style="width:100%;max-height:320px"></canvas>'
-                '<script>'
-                f'(function(){{'
-                 f'var ctx=document.getElementById("{chart_id}");'
-                 f'if(!ctx)return;'
-                 f'if(ctx._chartInstance){{ctx._chartInstance.destroy();}}'
-                 f'if(typeof Chart==="undefined"){{console.warn("Chart.js not loaded");return;}}'
-                 f'var isDark=document.documentElement.getAttribute("data-theme")==="dark";'
-                f'var gridColor=isDark?"rgba(255,255,255,0.08)":"rgba(0,0,0,0.06)";'
-                f'var tickColor=isDark?"#9499ad":"#5a6072";'
-                f'ctx._chartInstance=new Chart(ctx,{{'
-                f'type:"line",'
-                f'data:{{labels:[{",".join(repr(e) for e in epochs)}],datasets:[{datasets_js}]}},'
-                f'options:{{responsive:true,maintainAspectRatio:false,animation:false,'
-                f'plugins:{{legend:{{position:"top",labels:{{color:tickColor,font:{{size:11}}}}}}}},'
-                f'scales:{{x:{{grid:{{color:gridColor}},ticks:{{color:tickColor,font:{{size:10}}}},title:{{display:true,text:"Epoch",color:tickColor}}}},'
-                f'y:{{grid:{{color:gridColor}},ticks:{{color:tickColor,font:{{size:10}}}}}}}}}}'
-                f'}});'
-                f'}})()'
-                '</script>'
+                f'<canvas id="{chart_id}" style="width:100%;max-height:320px" '
+                f'data-chart-config=\'{chart_config_json}\'></canvas>'
             )
             self._send_html(body)
             return
@@ -3461,7 +3045,7 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": "config file not found"}, status=404)
                 return
             try:
-                chain = _resolve_config_chain(resolved)
+                chain = _build_config_inheritance_chain(resolved)
                 result = []
                 for entry in chain:
                     entry_path = entry.get("path", "")
@@ -3486,7 +3070,30 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
 
         parsed = urlparse(self.path)
         path = parsed.path
-        content_length = int(self.headers.get("Content-Length", 0))
+
+        # Validate Content-Length header
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except (ValueError, TypeError):
+            self._send_plain("Invalid Content-Length header", status=400)
+            return
+
+        # Enforce max body size (1 MB)
+        MAX_BODY_SIZE = 1_048_576
+        if content_length > MAX_BODY_SIZE:
+            self._send_plain(f"Request body exceeds {MAX_BODY_SIZE} bytes", status=413)
+            return
+
+        # Validate Content-Type for POST requests
+        content_type = self.headers.get("Content-Type", "").lower()
+        allowed_content_types = {
+            "application/x-www-form-urlencoded",
+            "multipart/form-data",
+        }
+        if content_length > 0 and not any(content_type.startswith(ct) for ct in allowed_content_types):
+            self._send_plain(f"Unsupported Content-Type: {self.headers.get('Content-Type', 'missing')}", status=415)
+            return
+
         body = self.rfile.read(content_length) if content_length > 0 else b""
         params = parse_qs(body.decode("utf-8"))
 
@@ -3551,7 +3158,7 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
                 self._send_html(body_html)
                 return
             try:
-                chain = _resolve_config_chain(resolved)
+                chain = _build_config_inheritance_chain(resolved)
                 config_data = _load_training_config(resolved)
                 merged_config = config_data
                 if mode == "simple":
@@ -3715,7 +3322,7 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
                     level = "error"
                 else:
                     try:
-                        chain_data = _resolve_config_chain(resolved)
+                        chain_data = _build_config_inheritance_chain(resolved)
                         config_data = _load_training_config(resolved)
                         merged_cfg = config_data
                         if mode == "simple":
