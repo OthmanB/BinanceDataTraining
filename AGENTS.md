@@ -12,7 +12,7 @@ Follow these rules before making changes.
 
 ## Setup
 - Use `bash setup_venv.sh` to create `.venv` and install deps.
-- Required Python: >=3.9 and <3.12 (per `setup_venv.sh`).
+- Required Python: >=3.9 and <3.13 (per `setup_venv.sh`).
 - Dependency install: `pip install --only-binary=pyarrow -r requirements.txt`.
 - Sanity check: `python -m pip check`.
 

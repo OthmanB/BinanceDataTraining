@@ -48,7 +48,7 @@ The pipeline validates configuration strictly against `config/validation_schema.
 - [Codebase Audit](documentation/2026-02-08/codebase_full_audit.md) — full audit report
 
 ## Notes
-- Python 3.9 to <3.12 is required (see `setup_venv.sh`).
+- Python 3.9 to <3.13 is required (see `setup_venv.sh`).
 - Snapshot datasets are the only supported training mode.
 
 ## License
