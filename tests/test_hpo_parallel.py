@@ -6,6 +6,7 @@ import os
 import types
 import unittest
 import copy
+from typing import Any
 from unittest import mock
 
 from models.hyperparameter_tuning import (
@@ -18,6 +19,7 @@ from models.hyperparameter_tuning import (
     _extract_trial_details,
     _evaluate_trial_objective,
     _is_resource_exhaustion_error,
+    _migrate_legacy_search_space,
     _record_trial_phase_memory_event,
     _select_wave_resources,
     _should_trigger_rss_watchdog,
@@ -31,6 +33,47 @@ from models.hyperparameter_tuning import (
 
 
 class TestHPOParallelHelpers(unittest.TestCase):
+    def test_migrate_legacy_search_space_converts_flat_keys(self) -> None:
+        hpo_cfg = {
+            "search_space": {
+                "cnn_filters_1": [32, 64],
+                "cnn_filters_2": [64, 128],
+                "lstm_units": [64, 96],
+                "learning_rate": [0.0005, 0.001],
+                "batch_size": [8, 16],
+            }
+        }
+
+        with self.assertLogs("models.hyperparameter_tuning", level="WARNING") as captured:
+            _migrate_legacy_search_space(hpo_cfg)
+
+        self.assertIn("Deprecated hyperparameter_optimization.search_space keys detected", "\n".join(captured.output))
+        migrated = hpo_cfg["search_space"]
+        self.assertNotIn("cnn_filters_1", migrated)
+        self.assertNotIn("cnn_filters_2", migrated)
+        self.assertNotIn("lstm_units", migrated)
+        self.assertEqual(migrated["cnn"], [{"filters": [32, 64]}, {"filters": [64, 128]}])
+        self.assertEqual(migrated["lstm"], [{"units": [64, 96]}])
+
+    def test_migrate_legacy_search_space_keeps_existing_nested_values(self) -> None:
+        hpo_cfg = {
+            "search_space": {
+                "cnn": [{"filters": [10, 20]}, {"filters": [30, 40]}],
+                "lstm": [{"units": [50, 60]}],
+                "cnn_filters_1": [32, 64],
+                "cnn_filters_2": [64, 128],
+                "lstm_units": [64, 96],
+                "learning_rate": [0.0005, 0.001],
+                "batch_size": [8, 16],
+            }
+        }
+
+        _migrate_legacy_search_space(hpo_cfg)
+
+        migrated = hpo_cfg["search_space"]
+        self.assertEqual(migrated["cnn"], [{"filters": [10, 20]}, {"filters": [30, 40]}])
+        self.assertEqual(migrated["lstm"], [{"units": [50, 60]}])
+
     def test_run_hyperparameter_search_resets_study_with_stale_running_trials(self) -> None:
         class _FakeTrial:
             def __init__(self, state_name: str, number: int, value: float) -> None:
@@ -56,8 +99,8 @@ class TestHPOParallelHelpers(unittest.TestCase):
         complete_b = _FakeTrial("COMPLETE", 2, 0.7)
         clean_study = _FakeStudy(trials=[complete_a, complete_b], best_trial=complete_b)
 
-        create_calls: list[dict] = []
-        delete_calls: list[dict] = []
+        create_calls: list[dict[str, Any]] = []
+        delete_calls: list[dict[str, Any]] = []
 
         def _create_study(*, direction: str, study_name: str, storage: str, load_if_exists: bool = False):
             create_calls.append(
@@ -679,7 +722,7 @@ class TestHPOParallelHelpers(unittest.TestCase):
 
         trial.set_user_attr = _set_user_attr
 
-        captured: dict = {}
+        captured: dict[str, Any] = {}
 
         base_config = {
             "mlflow": {
@@ -698,14 +741,18 @@ class TestHPOParallelHelpers(unittest.TestCase):
             "model": {"cnn_lstm": {"filters": [64, 128], "lstm_units": 64}},
         }
 
-        def _run_training_pipeline(cfg: dict, _data_obj: object) -> None:
-            phase_probe = cfg.get("_hpo_phase_memory_probe")
-            if callable(phase_probe):
-                phase_probe("after_snapshot_load", {"n_samples": 321})
+        def _run_training_pipeline_result(
+            cfg: dict[str, Any],
+            _data_obj: object,
+            *,
+            phase_memory_probe: object = None,
+        ) -> object:
+            if callable(phase_memory_probe):
+                phase_memory_probe("after_snapshot_load", {"n_samples": 321})
             captured["trial_config"] = copy.deepcopy(cfg)
-            cfg["_hpo_last_metric"] = 0.321
+            return types.SimpleNamespace(hpo_metric_value=0.321)
 
-        fake_pipeline = types.SimpleNamespace(run_training_pipeline=_run_training_pipeline)
+        fake_pipeline = types.SimpleNamespace(run_training_pipeline_result=_run_training_pipeline_result)
 
         with mock.patch.dict("sys.modules", {"training.pipeline": fake_pipeline}):
             with mock.patch("models.hyperparameter_tuning._sample_hyperparameters", return_value={"batch_size": 16}):
@@ -756,10 +803,17 @@ class TestHPOParallelHelpers(unittest.TestCase):
             "model": {"cnn_lstm": {"filters": [64, 128], "lstm_units": 64}},
         }
 
-        def _run_training_pipeline(cfg: dict, _data_obj: object) -> None:
-            cfg["_hpo_last_metric"] = 0.123
+        def _run_training_pipeline_result(
+            cfg: dict[str, Any],
+            _data_obj: object,
+            *,
+            phase_memory_probe: object = None,
+        ) -> object:
+            _ = cfg
+            _ = phase_memory_probe
+            return types.SimpleNamespace(hpo_metric_value=0.123)
 
-        fake_pipeline = types.SimpleNamespace(run_training_pipeline=_run_training_pipeline)
+        fake_pipeline = types.SimpleNamespace(run_training_pipeline_result=_run_training_pipeline_result)
 
         with mock.patch.dict("sys.modules", {"training.pipeline": fake_pipeline}):
             with mock.patch("models.hyperparameter_tuning._sample_hyperparameters", return_value={"batch_size": 16}):
@@ -797,10 +851,16 @@ class TestHPOParallelHelpers(unittest.TestCase):
             "model": {"cnn_lstm": {"filters": [64, 128], "lstm_units": 64}},
         }
 
-        def _run_training_pipeline(_cfg: dict, _data_obj: object) -> None:
+        def _run_training_pipeline_result(
+            _cfg: dict[str, Any],
+            _data_obj: object,
+            *,
+            phase_memory_probe: object = None,
+        ) -> object:
+            _ = phase_memory_probe
             raise RuntimeError("boom")
 
-        fake_pipeline = types.SimpleNamespace(run_training_pipeline=_run_training_pipeline)
+        fake_pipeline = types.SimpleNamespace(run_training_pipeline_result=_run_training_pipeline_result)
 
         with mock.patch.dict("sys.modules", {"training.pipeline": fake_pipeline}):
             with mock.patch("models.hyperparameter_tuning._sample_hyperparameters", return_value={"batch_size": 16}):
@@ -819,6 +879,55 @@ class TestHPOParallelHelpers(unittest.TestCase):
                                 study_name="test",
                             )
         self.assertEqual(cleanup_mock.call_count, 1)
+
+    def test_evaluate_trial_objective_falls_back_to_data_object_metric(self) -> None:
+        trial = types.SimpleNamespace(number=3, user_attrs={})
+
+        def _set_user_attr(key: str, value: object) -> None:
+            trial.user_attrs[key] = value
+
+        trial.set_user_attr = _set_user_attr
+
+        base_config = {
+            "mlflow": {
+                "local_tmp_dir": "/tmp",
+                "artifact_logging": {"trained_model": True},
+                "model_registry": {"register_model": True},
+            },
+            "training": {"runtime": {"device": "gpu", "gpu_visible_devices": "0"}},
+            "model": {"cnn_lstm": {"filters": [64, 128], "lstm_units": 64}},
+        }
+        data_object = {"metadata": {"last_hpo_metric": 0.456}}
+
+        def _run_training_pipeline_result(
+            cfg: dict[str, Any],
+            _data_obj: object,
+            *,
+            phase_memory_probe: object = None,
+        ) -> object:
+            _ = cfg
+            _ = phase_memory_probe
+            return types.SimpleNamespace(hpo_metric_value=None)
+
+        fake_pipeline = types.SimpleNamespace(run_training_pipeline_result=_run_training_pipeline_result)
+
+        with mock.patch.dict("sys.modules", {"training.pipeline": fake_pipeline}):
+            with mock.patch("models.hyperparameter_tuning._sample_hyperparameters", return_value={"batch_size": 16}):
+                with mock.patch("models.hyperparameter_tuning._apply_hyperparameters", side_effect=lambda cfg, _p: cfg):
+                    with mock.patch("models.hyperparameter_tuning._cleanup_trial_runtime"):
+                        value = _evaluate_trial_objective(
+                            base_config,
+                            data_object,
+                            {"search_space": {}},
+                            "loss",
+                            "minimize",
+                            False,
+                            trial,
+                            resource=None,
+                            study_name="test",
+                        )
+
+        self.assertEqual(value, 0.456)
 
 
 if __name__ == "__main__":

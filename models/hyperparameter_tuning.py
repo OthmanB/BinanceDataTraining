@@ -28,6 +28,7 @@ _PHASE_MEMORY_EVENTS_ATTR = "phase_memory_events"
 _PHASE_MEMORY_MAX_BY_PHASE_ATTR = "phase_memory_max_by_phase"
 _PHASE_MEMORY_EVENTS_LIMIT = 256
 _PHASE_MEMORY_EXPORT_LIMIT = 64
+_LEGACY_CNN_FILTERS_PATTERN = re.compile(r"^cnn_filters_(\d+)$")
 
 
 def _summarize_trial_states(study: Any) -> Dict[str, int]:
@@ -74,6 +75,78 @@ def _format_search_space_guidance(search_space: Dict[str, Any]) -> str:
     return "\n".join(guidance_lines)
 
 
+def _migrate_legacy_search_space(hpo_cfg: Dict[str, Any]) -> None:
+    search_space = hpo_cfg.get("search_space")
+    if not isinstance(search_space, dict):
+        return
+
+    normalized_search_space = copy.deepcopy(search_space)
+    legacy_keys_used: List[str] = []
+
+    cnn_legacy_entries: List[Tuple[int, Any]] = []
+    for key, value in search_space.items():
+        match = _LEGACY_CNN_FILTERS_PATTERN.match(str(key))
+        if match is None:
+            continue
+        layer_index = int(match.group(1)) - 1
+        if layer_index < 0:
+            continue
+        legacy_keys_used.append(str(key))
+        normalized_search_space.pop(str(key), None)
+        cnn_legacy_entries.append((layer_index, value))
+
+    lstm_legacy_units = search_space.get("lstm_units")
+    if "lstm_units" in search_space:
+        legacy_keys_used.append("lstm_units")
+        normalized_search_space.pop("lstm_units", None)
+
+    if not legacy_keys_used:
+        return
+
+    logger.warning(
+        "Deprecated hyperparameter_optimization.search_space keys detected (%s). "
+        "Please migrate to nested search_space.cnn[*].filters and search_space.lstm[*].units.",
+        ", ".join(sorted(set(legacy_keys_used))),
+    )
+
+    if cnn_legacy_entries:
+        cnn_space = normalized_search_space.get("cnn")
+        if cnn_space is None:
+            cnn_space = []
+            normalized_search_space["cnn"] = cnn_space
+
+        if not isinstance(cnn_space, list):
+            raise ValueError("hyperparameter_optimization.search_space.cnn must be a list")
+
+        for layer_index, bounds in sorted(cnn_legacy_entries, key=lambda item: item[0]):
+            while len(cnn_space) <= layer_index:
+                cnn_space.append({})
+            layer_space = cnn_space[layer_index]
+            if not isinstance(layer_space, dict):
+                raise ValueError(f"search_space.cnn[{layer_index}] must be a dict")
+            if "filters" not in layer_space:
+                layer_space["filters"] = bounds
+
+    if "lstm_units" in legacy_keys_used:
+        lstm_space = normalized_search_space.get("lstm")
+        if lstm_space is None:
+            lstm_space = []
+            normalized_search_space["lstm"] = lstm_space
+
+        if not isinstance(lstm_space, list):
+            raise ValueError("hyperparameter_optimization.search_space.lstm must be a list")
+
+        while len(lstm_space) <= 0:
+            lstm_space.append({})
+        first_lstm_layer = lstm_space[0]
+        if not isinstance(first_lstm_layer, dict):
+            raise ValueError("search_space.lstm[0] must be a dict")
+        if "units" not in first_lstm_layer:
+            first_lstm_layer["units"] = lstm_legacy_units
+
+    hpo_cfg["search_space"] = normalized_search_space
+
+
 def _normalize_phase_memory_events(raw_events: Any, *, limit: int) -> List[Dict[str, Any]]:
     events: List[Dict[str, Any]] = []
     if not isinstance(raw_events, list):
@@ -92,15 +165,15 @@ def _normalize_phase_memory_events(raw_events: Any, *, limit: int) -> List[Dict[
         try:
             if timestamp_value is not None:
                 normalized["timestamp"] = float(timestamp_value)
-        except (TypeError, ValueError):
-            pass
+        except (TypeError, ValueError) as exc:
+            logger.debug("Ignoring non-numeric phase-memory timestamp value %r: %s", timestamp_value, exc)
 
         rss_value = item.get("rss_bytes")
         try:
             if rss_value is not None:
                 normalized["rss_bytes"] = float(rss_value)
-        except (TypeError, ValueError):
-            pass
+        except (TypeError, ValueError) as exc:
+            logger.debug("Ignoring non-numeric phase-memory rss_bytes value %r: %s", rss_value, exc)
 
         resource_value = item.get("resource")
         if resource_value is not None:
@@ -381,6 +454,13 @@ def _read_regime_memory(path: str) -> Dict[str, Any]:
         return _default_regime_memory()
 
 
+def _coerce_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
 def _build_model_signature(params: Dict[str, Any]) -> str:
     parts: List[str] = []
     # CNN layer params
@@ -438,8 +518,8 @@ def _update_regime_memory(
                     }
 
                 if successful_batch is not None:
-                    signature_state["success_count"] = int(signature_state.get("success_count", 0)) + 1
-                    global_state["success_count"] = int(global_state.get("success_count", 0)) + 1
+                    signature_state["success_count"] = _coerce_int(signature_state.get("success_count", 0), 0) + 1
+                    global_state["success_count"] = _coerce_int(global_state.get("success_count", 0), 0) + 1
                     current_sig_max = signature_state.get("max_success_batch")
                     current_global_max = global_state.get("max_success_batch")
                     signature_state["max_success_batch"] = (
@@ -454,8 +534,8 @@ def _update_regime_memory(
                     )
 
                 if oom_batch is not None:
-                    signature_state["failure_count"] = int(signature_state.get("failure_count", 0)) + 1
-                    global_state["failure_count"] = int(global_state.get("failure_count", 0)) + 1
+                    signature_state["failure_count"] = _coerce_int(signature_state.get("failure_count", 0), 0) + 1
+                    global_state["failure_count"] = _coerce_int(global_state.get("failure_count", 0), 0) + 1
                     current_sig_min = signature_state.get("min_oom_batch")
                     current_global_min = global_state.get("min_oom_batch")
                     signature_state["min_oom_batch"] = (
@@ -566,8 +646,8 @@ def _is_configuration_error(exc: Exception) -> bool:
 
         if isinstance(exc, ConfigError):
             return True
-    except Exception:
-        pass
+    except Exception as import_exc:  # noqa: BLE001
+        logger.debug("Unable to import ConfigError while classifying trial error type: %s", import_exc)
 
     message = str(exc)
     if "model.output.num_classes must equal len(targets.price_classes.boundaries) + 1" in message:
@@ -644,7 +724,8 @@ def _start_hpo_trial_mlflow_run(
             asset_pairs = data_cfg.get("asset_pairs")
             if isinstance(asset_pairs, dict):
                 target_asset = asset_pairs.get("target_asset")
-    except Exception:
+    except Exception:  # noqa: BLE001
+        # Safe: config.get never throws, but defensive guard for run-name fallback
         target_asset = None
 
     safe_resource = str(resource or "cpu").replace(":", "_")
@@ -660,7 +741,8 @@ def _start_hpo_trial_mlflow_run(
     active = None
     try:
         active = mlflow.active_run()
-    except Exception:
+    except Exception:  # noqa: BLE001
+        # Safe: MLflow active_run() may raise in various states; fallback to None for run setup
         active = None
 
     # When a parent run is already active (sequential HPO), we must start a
@@ -1317,6 +1399,283 @@ def _build_trial_storage_uri(base_config: Dict[str, Any], storage_uri: Optional[
     return f"sqlite:///{db_path}"
 
 
+def _apply_regime_safe_batch_cap(
+    *,
+    base_config: Dict[str, Any],
+    regime_enabled: bool,
+    regime_settings: Dict[str, Any],
+    initial_batch_size: int,
+    signature: str,
+    memory_path: str,
+    trial_number: int,
+) -> int:
+    active_batch_size = int(initial_batch_size)
+    if not regime_enabled or not bool(regime_settings["safe_envelope_enabled"]):
+        return active_batch_size
+
+    memory_payload = _read_regime_memory(memory_path)
+    cap = _compute_safe_batch_cap_from_memory(
+        memory_payload,
+        signature=signature,
+        min_batch_size=int(regime_settings["min_batch_size"]),
+        min_success_trials=int(regime_settings["safe_envelope_min_success_trials"]),
+        headroom_fraction=float(regime_settings["safe_envelope_headroom_fraction"]),
+    )
+    if cap is not None and active_batch_size > cap:
+        logger.info(
+            "Applying safe-envelope batch clamp for trial %s: requested=%s capped=%s signature=%s",
+            trial_number,
+            active_batch_size,
+            cap,
+            signature,
+        )
+        active_batch_size = cap
+    return active_batch_size
+
+
+def _attach_and_log_mlflow_trial(
+    *,
+    base_config: Dict[str, Any],
+    study_name: str,
+    trial: Any,
+    resource: Optional[str],
+    parent_mlflow_run_id: Optional[str],
+    params: Dict[str, Any],
+) -> Optional[Any]:
+    trial_mlflow_run = _start_hpo_trial_mlflow_run(
+        config=base_config,
+        study_name=study_name,
+        trial_number=int(trial.number),
+        resource=resource,
+        parent_run_id=parent_mlflow_run_id,
+    )
+    if trial_mlflow_run is None:
+        return None
+
+    try:
+        run_id = getattr(getattr(trial_mlflow_run, "info", None), "run_id", None)
+        if run_id:
+            trial.set_user_attr("mlflow_run_id", str(run_id))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to attach MLFlow run id to trial metadata: %s", exc)
+
+    try:
+        mlflow = _try_import_mlflow()
+        if mlflow is not None:
+            mlflow.log_param("hpo_study_name", study_name)
+            mlflow.log_param("hpo_trial_number", int(trial.number))
+            if resource is not None:
+                mlflow.log_param("hpo_resource", str(resource))
+            for name, value in params.items():
+                mlflow.log_param(f"hpo_param_{name}", value)
+    except Exception:  # noqa: BLE001
+        logger.warning("Failed to log initial HPO trial parameters to MLflow", exc_info=True)
+
+    return trial_mlflow_run
+
+
+def _make_phase_memory_probe(
+    trial: Any,
+    *,
+    resource: Optional[str],
+    attempt: int,
+    active_batch_size: int,
+) -> Any:
+    def _phase_memory_probe(phase: str, details: Optional[Dict[str, Any]] = None) -> None:
+        payload: Dict[str, Any] = {
+            "attempt": int(attempt),
+            "batch_size": int(active_batch_size),
+        }
+        if isinstance(details, dict):
+            for key, value in details.items():
+                if isinstance(value, (str, int, float, bool)) or value is None:
+                    payload[str(key)] = value
+        _record_trial_phase_memory_event(
+            trial,
+            phase=phase,
+            resource=resource,
+            details=payload,
+        )
+
+    return _phase_memory_probe
+
+
+def _prepare_trial_attempt_config(
+    *,
+    base_config: Dict[str, Any],
+    params: Dict[str, Any],
+    active_batch_size: int,
+    resource: Optional[str],
+    study_name: str,
+    trial: Any,
+    attempt: int,
+    trial_log_models: bool,
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    params_for_attempt = dict(params)
+    params_for_attempt["batch_size"] = int(active_batch_size)
+
+    trial_config = _apply_hyperparameters(base_config, params_for_attempt)
+    if resource is not None:
+        trial_config = _apply_worker_resource(trial_config, resource)
+
+    resume_namespace = _apply_hpo_resume_namespace(
+        trial_config,
+        study_name=study_name,
+        trial_number=int(trial.number),
+        resource=resource,
+        attempt=attempt,
+    )
+
+    if not trial_log_models:
+        try:
+            mlflow_cfg = trial_config["mlflow"]
+            artifact_logging_cfg = mlflow_cfg["artifact_logging"]
+            artifact_logging_cfg["trained_model"] = False
+            mlflow_cfg["artifact_logging"] = artifact_logging_cfg
+
+            model_registry_cfg = mlflow_cfg["model_registry"]
+            model_registry_cfg["register_model"] = False
+            mlflow_cfg["model_registry"] = model_registry_cfg
+            trial_config["mlflow"] = mlflow_cfg
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to adjust MLFlow logging configuration for HPO trial: %s",
+                exc,
+            )
+
+    return trial_config, resume_namespace
+
+
+def _resolve_trial_metric_value(pipeline_result: Any, data_object: Optional[Dict[str, Any]]) -> float:
+    value_obj = getattr(pipeline_result, "hpo_metric_value", None)
+    if value_obj is None and isinstance(data_object, dict):
+        metadata = data_object.get("metadata", {})
+        value_obj = metadata.get("last_hpo_metric")
+    if value_obj is None:
+        raise ValueError(
+            "Training pipeline did not populate an HPO metric; ensure "
+            "hyperparameter_optimization.metric matches a key in Keras History.",
+        )
+    return float(value_obj)
+
+
+def _estimate_trial_sample_rate(
+    *,
+    data_object: Optional[Dict[str, Any]],
+    active_batch_size: int,
+    duration_seconds: float,
+) -> Optional[float]:
+    sample_count: Optional[float] = None
+    if isinstance(data_object, dict):
+        metadata = data_object.get("metadata")
+        if isinstance(metadata, dict) and metadata.get("num_samples") is not None:
+            try:
+                sample_count = float(metadata["num_samples"])
+            except (TypeError, ValueError):
+                sample_count = None
+    if sample_count is None:
+        sample_count = float(active_batch_size)
+    return sample_count / duration_seconds if duration_seconds > 0 else None
+
+
+def _record_trial_success_metadata(
+    *,
+    trial: Any,
+    metric_name: str,
+    metric_raw: float,
+    metric_effective: float,
+    penalty_total: float,
+    attempt: int,
+    initial_batch_size: int,
+    active_batch_size: int,
+    duration_seconds: float,
+    samples_per_second_est: Optional[float],
+    resource: Optional[str],
+    gpu_stats: Dict[str, Optional[float]],
+    regime_enabled: bool,
+    regime_settings: Dict[str, Any],
+    memory_path: str,
+    signature: str,
+) -> None:
+    trial.set_user_attr("metric_name", metric_name)
+    trial.set_user_attr("metric_raw", metric_raw)
+    trial.set_user_attr("metric_effective", metric_effective)
+    trial.set_user_attr("regime_penalty_total", penalty_total)
+    trial.set_user_attr("regime_retry_count", attempt)
+    trial.set_user_attr("batch_size_initial", initial_batch_size)
+    trial.set_user_attr("batch_size_effective", int(active_batch_size))
+    trial.set_user_attr("trial_duration_seconds", duration_seconds)
+    trial.set_user_attr("samples_per_second_est", samples_per_second_est)
+    trial.set_user_attr("resource", resource)
+    if gpu_stats["gpu_memory_used_bytes"] is not None:
+        trial.set_user_attr("gpu_memory_used_bytes", float(gpu_stats["gpu_memory_used_bytes"]))
+    if gpu_stats["gpu_memory_total_bytes"] is not None:
+        trial.set_user_attr("gpu_memory_total_bytes", float(gpu_stats["gpu_memory_total_bytes"]))
+    if gpu_stats["gpu_memory_fraction"] is not None:
+        trial.set_user_attr("gpu_memory_fraction", float(gpu_stats["gpu_memory_fraction"]))
+
+    if regime_enabled and bool(regime_settings["safe_envelope_persistence_enabled"]):
+        _update_regime_memory(
+            memory_path,
+            signature=signature,
+            successful_batch=int(active_batch_size),
+        )
+
+
+def _finalize_trial_mlflow_run(trial_mlflow_run: Optional[Any]) -> None:
+    if trial_mlflow_run is None:
+        return
+    try:
+        mlflow = _try_import_mlflow()
+        if mlflow is not None:
+            mlflow.end_run()
+    except Exception:  # noqa: BLE001
+        logger.warning("Failed to end MLflow run for HPO trial", exc_info=True)
+
+
+def _initialize_hpo_writer(n_trials: int) -> Optional[Any]:
+    writer = None
+    try:
+        from observability.run_state import get_run_state_writer
+
+        writer = get_run_state_writer()
+    except Exception:  # noqa: BLE001
+        writer = None
+    if writer is not None:
+        try:
+            writer.set_stage("trial")
+            writer.update_hpo_progress(completed=0, total=n_trials, pruned=0, failed=0)
+            writer.update_hpo_wave_memory({})
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to initialize HPO run-state progress: %s", exc)
+    return writer
+
+
+def _ensure_snapshot_prebuild_for_hpo(
+    config: Dict[str, Any],
+    *,
+    snapshot_prebuild_completed: bool,
+) -> bool:
+    prebuild_done = bool(snapshot_prebuild_completed)
+    if not bool(config.get("snapshot", {}).get("enabled", False)):
+        return prebuild_done
+    if prebuild_done:
+        logger.info("Snapshot pre-build already completed in current process; skipping duplicate pre-build.")
+        return True
+    try:
+        from training.pipeline import pre_build_snapshots
+
+        logger.info("Pre-building snapshots before hyperparameter search.")
+        pre_build_snapshots(config)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Snapshot pre-build failed; workers/trials will build on demand: %s",
+            exc,
+        )
+        return False
+
+
 def _evaluate_trial_objective(
     base_config: Dict[str, Any],
     data_object: Optional[Dict[str, Any]],
@@ -1337,55 +1696,26 @@ def _evaluate_trial_objective(
     memory_path = _build_regime_memory_path(base_config, study_name)
 
     initial_batch_size = int(params["batch_size"])
-    active_batch_size = initial_batch_size
-
-    if regime_enabled and bool(regime_settings["safe_envelope_enabled"]):
-        memory_payload = _read_regime_memory(memory_path)
-        cap = _compute_safe_batch_cap_from_memory(
-            memory_payload,
-            signature=signature,
-            min_batch_size=int(regime_settings["min_batch_size"]),
-            min_success_trials=int(regime_settings["safe_envelope_min_success_trials"]),
-            headroom_fraction=float(regime_settings["safe_envelope_headroom_fraction"]),
-        )
-        if cap is not None and active_batch_size > cap:
-            logger.info(
-                "Applying safe-envelope batch clamp for trial %s: requested=%s capped=%s signature=%s",
-                trial.number,
-                active_batch_size,
-                cap,
-                signature,
-            )
-            active_batch_size = cap
-
-    from training.pipeline import run_training_pipeline
-
-    trial_mlflow_run = _start_hpo_trial_mlflow_run(
-        config=base_config,
-        study_name=study_name,
+    active_batch_size = _apply_regime_safe_batch_cap(
+        base_config=base_config,
+        regime_enabled=regime_enabled,
+        regime_settings=regime_settings,
+        initial_batch_size=initial_batch_size,
+        signature=signature,
+        memory_path=memory_path,
         trial_number=int(trial.number),
-        resource=resource,
-        parent_run_id=parent_mlflow_run_id,
     )
-    if trial_mlflow_run is not None:
-        try:
-            run_id = getattr(getattr(trial_mlflow_run, "info", None), "run_id", None)
-            if run_id:
-                trial.set_user_attr("mlflow_run_id", str(run_id))
-        except Exception:  # noqa: BLE001
-            pass
 
-        try:
-            mlflow = _try_import_mlflow()
-            if mlflow is not None:
-                mlflow.log_param("hpo_study_name", study_name)
-                mlflow.log_param("hpo_trial_number", int(trial.number))
-                if resource is not None:
-                    mlflow.log_param("hpo_resource", str(resource))
-                for name, value in params.items():
-                    mlflow.log_param(f"hpo_param_{name}", value)
-        except Exception:  # noqa: BLE001
-            logger.warning("Failed to log initial HPO trial parameters to MLflow", exc_info=True)
+    from training.pipeline import run_training_pipeline_result
+
+    trial_mlflow_run = _attach_and_log_mlflow_trial(
+        base_config=base_config,
+        study_name=study_name,
+        trial=trial,
+        resource=resource,
+        parent_mlflow_run_id=parent_mlflow_run_id,
+        params=params,
+    )
 
     max_retry_attempts = int(regime_settings["max_retry_attempts"]) if regime_enabled else 0
     attempt = 0
@@ -1393,87 +1723,41 @@ def _evaluate_trial_objective(
 
     try:
         while True:
-            params_for_attempt = dict(params)
-            params_for_attempt["batch_size"] = int(active_batch_size)
-
-            trial_config = _apply_hyperparameters(base_config, params_for_attempt)
-            if resource is not None:
-                trial_config = _apply_worker_resource(trial_config, resource)
-
-            def _phase_memory_probe(phase: str, details: Optional[Dict[str, Any]] = None) -> None:
-                payload: Dict[str, Any] = {
-                    "attempt": int(attempt),
-                    "batch_size": int(active_batch_size),
-                }
-                if isinstance(details, dict):
-                    for key, value in details.items():
-                        if isinstance(value, (str, int, float, bool)) or value is None:
-                            payload[str(key)] = value
-                _record_trial_phase_memory_event(
-                    trial,
-                    phase=phase,
-                    resource=resource,
-                    details=payload,
-                )
-
-            trial_config["_hpo_phase_memory_probe"] = _phase_memory_probe
-
-            resume_namespace = _apply_hpo_resume_namespace(
-                trial_config,
-                study_name=study_name,
-                trial_number=int(trial.number),
+            trial_config, resume_namespace = _prepare_trial_attempt_config(
+                base_config=base_config,
+                params=params,
+                active_batch_size=active_batch_size,
                 resource=resource,
+                study_name=study_name,
+                trial=trial,
                 attempt=attempt,
+                trial_log_models=trial_log_models,
             )
             if resume_namespace is not None:
                 trial.set_user_attr("sequential_resume_namespace", resume_namespace)
 
-            mlflow_cfg = trial_config["mlflow"]
-            if not trial_log_models:
-                try:
-                    artifact_logging_cfg = mlflow_cfg["artifact_logging"]
-                    artifact_logging_cfg["trained_model"] = False
-                    mlflow_cfg["artifact_logging"] = artifact_logging_cfg
-
-                    model_registry_cfg = mlflow_cfg["model_registry"]
-                    model_registry_cfg["register_model"] = False
-                    mlflow_cfg["model_registry"] = model_registry_cfg
-
-                    trial_config["mlflow"] = mlflow_cfg
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "Failed to adjust MLFlow logging configuration for HPO trial: %s",
-                        exc,
-                    )
+            phase_memory_probe = _make_phase_memory_probe(
+                trial,
+                resource=resource,
+                attempt=attempt,
+                active_batch_size=active_batch_size,
+            )
 
             started = time.monotonic()
             try:
-                run_training_pipeline(trial_config, data_object)
-
-                value_obj = trial_config.get("_hpo_last_metric")
-                if value_obj is None and isinstance(data_object, dict):
-                    metadata = data_object.get("metadata", {})
-                    value_obj = metadata.get("last_hpo_metric")
-                if value_obj is None:
-                    raise ValueError(
-                        "Training pipeline did not populate an HPO metric; ensure "
-                        "hyperparameter_optimization.metric matches a key in Keras History.",
-                    )
+                pipeline_result = run_training_pipeline_result(
+                    trial_config,
+                    data_object,
+                    phase_memory_probe=phase_memory_probe,
+                )
 
                 duration_seconds = max(time.monotonic() - started, 1e-9)
-                metric_raw = float(value_obj)
-
-                sample_count: Optional[float] = None
-                if isinstance(data_object, dict):
-                    metadata = data_object.get("metadata")
-                    if isinstance(metadata, dict) and metadata.get("num_samples") is not None:
-                        try:
-                            sample_count = float(metadata["num_samples"])
-                        except (TypeError, ValueError):
-                            sample_count = None
-                if sample_count is None:
-                    sample_count = float(active_batch_size)
-                samples_per_second_est = sample_count / duration_seconds if duration_seconds > 0 else None
+                metric_raw = _resolve_trial_metric_value(pipeline_result, data_object)
+                samples_per_second_est = _estimate_trial_sample_rate(
+                    data_object=data_object,
+                    active_batch_size=active_batch_size,
+                    duration_seconds=duration_seconds,
+                )
 
                 gpu_stats = _try_read_gpu_memory_stats(resource)
                 metric_effective = metric_raw
@@ -1491,29 +1775,24 @@ def _evaluate_trial_objective(
                         samples_per_second_est=samples_per_second_est,
                     )
 
-                trial.set_user_attr("metric_name", metric_name)
-                trial.set_user_attr("metric_raw", metric_raw)
-                trial.set_user_attr("metric_effective", metric_effective)
-                trial.set_user_attr("regime_penalty_total", penalty_total)
-                trial.set_user_attr("regime_retry_count", attempt)
-                trial.set_user_attr("batch_size_initial", initial_batch_size)
-                trial.set_user_attr("batch_size_effective", int(active_batch_size))
-                trial.set_user_attr("trial_duration_seconds", duration_seconds)
-                trial.set_user_attr("samples_per_second_est", samples_per_second_est)
-                trial.set_user_attr("resource", resource)
-                if gpu_stats["gpu_memory_used_bytes"] is not None:
-                    trial.set_user_attr("gpu_memory_used_bytes", float(gpu_stats["gpu_memory_used_bytes"]))
-                if gpu_stats["gpu_memory_total_bytes"] is not None:
-                    trial.set_user_attr("gpu_memory_total_bytes", float(gpu_stats["gpu_memory_total_bytes"]))
-                if gpu_stats["gpu_memory_fraction"] is not None:
-                    trial.set_user_attr("gpu_memory_fraction", float(gpu_stats["gpu_memory_fraction"]))
-
-                if regime_enabled and bool(regime_settings["safe_envelope_persistence_enabled"]):
-                    _update_regime_memory(
-                        memory_path,
-                        signature=signature,
-                        successful_batch=int(active_batch_size),
-                    )
+                _record_trial_success_metadata(
+                    trial=trial,
+                    metric_name=metric_name,
+                    metric_raw=metric_raw,
+                    metric_effective=metric_effective,
+                    penalty_total=penalty_total,
+                    attempt=attempt,
+                    initial_batch_size=initial_batch_size,
+                    active_batch_size=active_batch_size,
+                    duration_seconds=duration_seconds,
+                    samples_per_second_est=samples_per_second_est,
+                    resource=resource,
+                    gpu_stats=gpu_stats,
+                    regime_enabled=regime_enabled,
+                    regime_settings=regime_settings,
+                    memory_path=memory_path,
+                    signature=signature,
+                )
 
                 return metric_effective
             except Exception as exc:  # noqa: BLE001
@@ -1599,13 +1878,7 @@ def _evaluate_trial_objective(
                 trial_config = None
                 _cleanup_trial_runtime()
     finally:
-        if trial_mlflow_run is not None:
-            try:
-                mlflow = _try_import_mlflow()
-                if mlflow is not None:
-                    mlflow.end_run()
-            except Exception:  # noqa: BLE001
-                logger.warning("Failed to end MLflow run for HPO trial", exc_info=True)
+        _finalize_trial_mlflow_run(trial_mlflow_run)
 
     if last_exception is not None:
         raise last_exception
@@ -1826,6 +2099,8 @@ def _resolve_best_params_for_final_training(best_trial: Any) -> tuple[Dict[str, 
 def run_hyperparameter_search(
     config: Dict[str, Any],
     data_object: Optional[Dict[str, Any]],
+    *,
+    snapshot_prebuild_completed: bool = False,
 ) -> Optional[Dict[str, Any]]:
     hpo_cfg = config["hyperparameter_optimization"]
     if not bool(hpo_cfg["enabled"]):
@@ -1848,21 +2123,9 @@ def run_hyperparameter_search(
     metric_name = str(hpo_cfg["metric"])
     parallel_settings = _resolve_parallel_settings(hpo_cfg)
     _resolve_regime_settings(hpo_cfg)
+    _migrate_legacy_search_space(hpo_cfg)
 
-    writer = None
-    try:
-        from observability.run_state import get_run_state_writer
-
-        writer = get_run_state_writer()
-    except Exception:  # noqa: BLE001
-        writer = None
-    if writer is not None:
-        try:
-            writer.set_stage("trial")
-            writer.update_hpo_progress(completed=0, total=n_trials, pruned=0, failed=0)
-            writer.update_hpo_wave_memory({})
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to initialize HPO run-state progress: %s", exc)
+    writer = _initialize_hpo_writer(n_trials)
 
     trial_logging_cfg = hpo_cfg["trial_model_logging"]
     trial_log_models = bool(trial_logging_cfg["enabled"])
@@ -1878,21 +2141,10 @@ def run_hyperparameter_search(
 
     use_parallel = bool(parallel_settings["enabled"]) and n_trials > 1 and len(parallel_settings["resources"]) > 0
 
-    if bool(config.get("snapshot", {}).get("enabled", False)):
-        if bool(config.get("_snapshot_prebuild_complete", False)):
-            logger.info("Snapshot pre-build already completed in current process; skipping duplicate pre-build.")
-        else:
-            try:
-                from training.pipeline import pre_build_snapshots
-
-                logger.info("Pre-building snapshots before hyperparameter search.")
-                pre_build_snapshots(config)
-                config["_snapshot_prebuild_complete"] = True
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Snapshot pre-build failed; workers/trials will build on demand: %s",
-                    exc,
-                )
+    _ = _ensure_snapshot_prebuild_for_hpo(
+        config,
+        snapshot_prebuild_completed=snapshot_prebuild_completed,
+    )
 
     study: Any
     if use_parallel:
@@ -2433,8 +2685,10 @@ def run_hyperparameter_search(
 
     try:
         import mlflow  # type: ignore[import]
-    except Exception:  # noqa: BLE001
-        pass
+    except ImportError as exc:
+        logger.debug("MLFlow unavailable; skipping HPO result logging: %s", exc)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Unexpected failure importing MLFlow for HPO result logging: %s", exc)
     else:
         try:
             mlflow.log_param("hpo_enabled", True)
