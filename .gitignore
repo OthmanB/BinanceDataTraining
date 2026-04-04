@@ -163,3 +163,4 @@ dmypy.json
 .opencode
 .sisyphus/
 Notes/tex/*.out
+Notes/tex/*.aux
