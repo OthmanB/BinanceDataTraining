@@ -19,7 +19,7 @@ import os
 
 import numpy as np
 
-from data.greptime_client import OrderBookChunk, _generate_time_chunks, stream_order_book_chunks_by_time
+from data.greptime_client import OrderBookChunk, generate_time_chunks, stream_order_book_chunks_by_time
 from preprocessing.depth_aggregator import get_hybrid_output_shape
 from training.series_store import (
     SeriesContext,
@@ -30,13 +30,13 @@ from training.series_store import (
 )
 from training.snapshot_dataset import (
     GapHandler,
-    _build_snapshots_from_rows,
-    _chunk_filename,
-    _format_bytes,
-    _populate_hybrid_snapshots,
-    _safe_file_size,
+    build_snapshots_from_rows,
+    chunk_filename,
+    populate_hybrid_snapshots,
+    safe_file_size,
 )
 from utils.config_loader import ConfigError
+from utils.formatting import format_bytes
 
 
 logger = logging.getLogger(__name__)
@@ -165,7 +165,7 @@ def _build_series_chunks(config: Dict[str, Any], context: SeriesContext, manifes
     if not assets:
         raise ValueError("data.asset_pairs must define at least one asset")
 
-    output_chunks = _generate_time_chunks(start_date, end_date, chunk_hours)
+    output_chunks = generate_time_chunks(start_date, end_date, chunk_hours)
     output_boundaries = [(c[0], c[1]) for c in output_chunks]
 
     os.makedirs(os.path.join(context.series_dir, "chunks"), exist_ok=True)
@@ -209,10 +209,10 @@ def _build_series_chunks(config: Dict[str, Any], context: SeriesContext, manifes
             rows = chunk_rows_by_asset.get(asset, [])
             chunk = OrderBookChunk(asset=asset, chunk_start=chunk_key[0], chunk_end=chunk_key[1], rows=rows)
             compute_volume_proxy = asset == target_asset
-            records = _build_snapshots_from_rows(chunk, config, compute_volume_proxy=compute_volume_proxy)
+            records = build_snapshots_from_rows(chunk, config, compute_volume_proxy=compute_volume_proxy)
             filled = list(gap_handlers[asset].iter_gap_handled(records))
             if representation == "hybrid":
-                _populate_hybrid_snapshots(
+                populate_hybrid_snapshots(
                     filled,
                     config,
                     fail_on_invalid=fail_on_invalid,
@@ -242,7 +242,7 @@ def _build_series_chunks(config: Dict[str, Any], context: SeriesContext, manifes
             series_mid_prices.append(float(target_snapshot.mid_price))
             series_volumes.append(float(target_snapshot.volume_proxy))
 
-        series_filename = _chunk_filename(chunk_key[0], chunk_key[1])
+        series_filename = chunk_filename(chunk_key[0], chunk_key[1])
         series_rel = os.path.join("chunks", series_filename)
         series_path = os.path.join(context.series_dir, series_rel)
 
@@ -258,7 +258,7 @@ def _build_series_chunks(config: Dict[str, Any], context: SeriesContext, manifes
                 chunk_key[0],
                 chunk_key[1],
                 int(ts_arr.shape[0]),
-                _format_bytes(_safe_file_size(series_path)),
+                format_bytes(safe_file_size(series_path)),
             )
 
         entry = {
