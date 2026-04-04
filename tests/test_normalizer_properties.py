@@ -240,6 +240,28 @@ class TestNormalizerRejection(unittest.TestCase):
             Normalizer("invalid_method")
         self.assertIn("unsupported", str(ctx.exception).lower())
 
+    def test_transform_raises_when_min_max_statistics_missing(self) -> None:
+        normalizer = Normalizer("min_max")
+        normalizer._is_fitted = True
+        normalizer._min = None
+        normalizer._max = None
+
+        with self.assertRaises(RuntimeError) as ctx:
+            normalizer.transform(np.ones((2, 2), dtype=np.float32))
+
+        self.assertIn("fit()", str(ctx.exception))
+
+    def test_transform_raises_when_standard_statistics_missing(self) -> None:
+        normalizer = Normalizer("standard")
+        normalizer._is_fitted = True
+        normalizer._mean = None
+        normalizer._std = None
+
+        with self.assertRaises(RuntimeError) as ctx:
+            normalizer.transform(np.ones((2, 2), dtype=np.float32))
+
+        self.assertIn("fit()", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

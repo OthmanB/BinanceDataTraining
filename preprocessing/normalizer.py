@@ -128,13 +128,19 @@ class Normalizer:
         X_flat = X.reshape(X.shape[0], -1)
 
         if self._method == "min_max":
-            assert self._min is not None and self._max is not None
+            if self._min is None or self._max is None:
+                raise RuntimeError(
+                    "Normalizer min/max statistics are unavailable; call fit() before transform()",
+                )
             denom = self._max - self._min
             denom = np.where(denom == 0, 1.0, denom)
             X_normalized = (X_flat - self._min) / denom
 
         elif self._method == "standard":
-            assert self._mean is not None and self._std is not None
+            if self._mean is None or self._std is None:
+                raise RuntimeError(
+                    "Normalizer mean/std statistics are unavailable; call fit() before transform()",
+                )
             std = np.where(self._std == 0, 1.0, self._std)
             X_normalized = (X_flat - self._mean) / std
 
