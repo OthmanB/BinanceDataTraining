@@ -51,6 +51,7 @@ class TestMlflowRunLifecycle(unittest.TestCase):
         import mlflow_integration.experiment_tracker as tracker
 
         tracker.clear_started_run_id()
+        tracker._RUN_LIFECYCLE_STATE.set_started_run_id("stale-run")
         mock_mlflow = MagicMock()
         existing = SimpleNamespace(info=SimpleNamespace(run_id="existing"), data=SimpleNamespace(tags={}))
         mock_mlflow.active_run.return_value = existing

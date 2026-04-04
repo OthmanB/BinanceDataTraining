@@ -178,6 +178,7 @@ def start_run(config: Dict[str, Any], run_name: Optional[str] = None):
         active = None
 
     if active is not None:
+        _RUN_LIFECYCLE_STATE.clear_started_run_id()
         try:
             active_id = getattr(getattr(active, "info", None), "run_id", None)
         except Exception:  # noqa: BLE001
