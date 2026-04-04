@@ -170,6 +170,63 @@ class TestGreptimeClient(unittest.TestCase):
         with self.assertRaises(ValueError):
             fetch_order_book_rows(config)
 
+    def test_fetch_order_book_rows_touching_ranges_raise(self) -> None:
+        config = {
+            "data": {
+                "asset_pairs": {
+                    "target_asset": "BTCUSDT",
+                    "correlated_assets": [],
+                },
+                "time_range": {
+                    "start_date": "2024-01-01",
+                    "end_date": "2024-01-10",
+                },
+                "ingestion": {
+                    "chunk_hours": 24,
+                    "chunk_delay_seconds": 0.0,
+                    "max_concurrent_chunk_fetches": 1,
+                },
+                "order_book": {
+                    "schema": self._build_base_schema(),
+                },
+                "multi_database": {
+                    "enabled": True,
+                    "strategy": "time_split",
+                    "connections": [
+                        {
+                            "name": "db1",
+                            "database_uri": "http://db1",
+                            "table_prefix": "orderbook_",
+                            "request_timeout_seconds": 30,
+                            "connect_timeout_seconds": 10,
+                            "max_retries": 3,
+                            "retry_backoff_factor": 0.5,
+                            "time_range": {
+                                "start_date": "2024-01-01",
+                                "end_date": "2024-01-08",
+                            },
+                        },
+                        {
+                            "name": "db2",
+                            "database_uri": "http://db2",
+                            "table_prefix": "orderbook_",
+                            "request_timeout_seconds": 30,
+                            "connect_timeout_seconds": 10,
+                            "max_retries": 3,
+                            "retry_backoff_factor": 0.5,
+                            "time_range": {
+                                "start_date": "2024-01-08",
+                                "end_date": "2024-01-10",
+                            },
+                        },
+                    ],
+                },
+            },
+        }
+
+        with self.assertRaises(ValueError):
+            fetch_order_book_rows(config)
+
     def test_stream_order_book_chunks_rejects_concurrent(self) -> None:
         config = {
             "data": {
@@ -227,7 +284,7 @@ class TestGreptimeClient(unittest.TestCase):
         self.assertEqual(retry.backoff_max, 3.0)
         self.assertIn("POST", retry.allowed_methods)
 
-    def test_fetch_chunk_uses_retry_session_and_retry_budget_timeout(self) -> None:
+    def test_fetch_chunk_uses_retry_session_and_configured_request_timeout(self) -> None:
         timeout_cfg = {
             "request_timeout_seconds": 30,
             "connect_timeout_seconds": 10,
@@ -262,7 +319,7 @@ class TestGreptimeClient(unittest.TestCase):
         self.assertEqual(rows, [["row1"]])
         build_retry_session.assert_called_once_with(timeout_cfg)
         session.post.assert_called_once()
-        self.assertEqual(session.post.call_args.kwargs["timeout"], (10.0, 3.0))
+        self.assertEqual(session.post.call_args.kwargs["timeout"], (10.0, 30.0))
         session.close.assert_called_once()
 
 

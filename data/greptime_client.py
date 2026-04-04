@@ -55,10 +55,38 @@ def _get_retry_budget_seconds(timeout_cfg: Dict[str, Any]) -> float:
 def _get_request_timeout(timeout_cfg: Dict[str, Any]) -> Tuple[float, float]:
     connect_timeout = float(timeout_cfg["connect_timeout_seconds"])
     request_timeout = float(timeout_cfg["request_timeout_seconds"])
-    retry_budget_seconds = _get_retry_budget_seconds(timeout_cfg)
-    if retry_budget_seconds > 0:
-        request_timeout = min(request_timeout, retry_budget_seconds)
     return (connect_timeout, request_timeout)
+
+
+def _resolve_sorted_connection_intervals(
+    connections: List[Dict[str, Any]],
+) -> List[Tuple[str, str, Dict[str, Any]]]:
+    intervals: List[Tuple[str, str, Dict[str, Any]]] = []
+    for conn in connections:
+        conn_time_range = conn["time_range"]
+        conn_start = str(conn_time_range["start_date"])
+        conn_end = str(conn_time_range["end_date"])
+
+        if conn_start > conn_end:
+            raise ValueError(
+                "Connection-level time_range.start_date must be <= time_range.end_date for data.multi_database.connections; "
+                f"got start_date={conn_start!r}, end_date={conn_end!r}",
+            )
+
+        intervals.append((conn_start, conn_end, conn))
+
+    intervals.sort(key=lambda item: item[0])
+
+    prev_end = None
+    for conn_start, conn_end, _ in intervals:
+        if prev_end is not None and conn_start <= prev_end:
+            raise ValueError(
+                "Overlapping or touching time ranges are not supported for data.multi_database.connections; "
+                "connection date ranges are inclusive, so each connection must start strictly after the previous one ends.",
+            )
+        prev_end = conn_end
+
+    return intervals
 
 
 def _build_retry_session(timeout_cfg: Dict[str, Any]) -> requests.Session:
@@ -330,30 +358,7 @@ def fetch_order_book_rows(config: Dict[str, Any]) -> Dict[str, List[List[Any]]]:
                 "data.multi_database.connections must be a non-empty list when multi_database.enabled is true",
             )
 
-        intervals: List[Tuple[str, str, Dict[str, Any]]] = []
-        for conn in connections:
-            conn_time_range = conn["time_range"]
-            conn_start = str(conn_time_range["start_date"])
-            conn_end = str(conn_time_range["end_date"])
-
-            if conn_start > conn_end:
-                raise ValueError(
-                    "Connection-level time_range.start_date must be <= time_range.end_date for data.multi_database.connections; "
-                    f"got start_date={conn_start!r}, end_date={conn_end!r}",
-                )
-
-            intervals.append((conn_start, conn_end, conn))
-
-        intervals.sort(key=lambda item: item[0])
-
-        prev_end = None
-        for conn_start, conn_end, _ in intervals:
-            if prev_end is not None and conn_start < prev_end:
-                raise ValueError(
-                    "Overlapping time ranges are not supported for data.multi_database.connections; "
-                    "ensure per-connection time_range intervals are ordered and do not have interior overlap.",
-                )
-            prev_end = conn_end
+        intervals = _resolve_sorted_connection_intervals(connections)
 
         for conn_start, conn_end, conn in intervals:
             constrained_start = max(global_start_date, conn_start)
@@ -454,30 +459,7 @@ def stream_order_book_chunks(
                 "data.multi_database.connections must be a non-empty list when multi_database.enabled is true",
             )
 
-        intervals: List[Tuple[str, str, Dict[str, Any]]] = []
-        for conn in connections:
-            conn_time_range = conn["time_range"]
-            conn_start = str(conn_time_range["start_date"])
-            conn_end = str(conn_time_range["end_date"])
-
-            if conn_start > conn_end:
-                raise ValueError(
-                    "Connection-level time_range.start_date must be <= time_range.end_date for data.multi_database.connections; "
-                    f"got start_date={conn_start!r}, end_date={conn_end!r}",
-                )
-
-            intervals.append((conn_start, conn_end, conn))
-
-        intervals.sort(key=lambda item: item[0])
-
-        prev_end = None
-        for conn_start, conn_end, _ in intervals:
-            if prev_end is not None and conn_start < prev_end:
-                raise ValueError(
-                    "Overlapping time ranges are not supported for data.multi_database.connections; "
-                    "ensure per-connection time_range intervals are ordered and do not have interior overlap.",
-                )
-            prev_end = conn_end
+        intervals = _resolve_sorted_connection_intervals(connections)
 
         for conn_start, conn_end, conn in intervals:
             constrained_start = max(global_start_date, conn_start)
@@ -577,28 +559,7 @@ def stream_order_book_chunks_by_time(
                 "data.multi_database.connections must be a non-empty list when multi_database.enabled is true",
             )
 
-        intervals: List[Tuple[str, str, Dict[str, Any]]] = []
-        for conn in connections:
-            conn_time_range = conn["time_range"]
-            conn_start = str(conn_time_range["start_date"])
-            conn_end = str(conn_time_range["end_date"])
-            if conn_start > conn_end:
-                raise ValueError(
-                    "Connection-level time_range.start_date must be <= time_range.end_date for data.multi_database.connections; "
-                    f"got start_date={conn_start!r}, end_date={conn_end!r}",
-                )
-            intervals.append((conn_start, conn_end, conn))
-
-        intervals.sort(key=lambda item: item[0])
-
-        prev_end = None
-        for conn_start, conn_end, _ in intervals:
-            if prev_end is not None and conn_start < prev_end:
-                raise ValueError(
-                    "Overlapping time ranges are not supported for data.multi_database.connections; "
-                    "ensure per-connection time_range intervals are ordered and do not have interior overlap.",
-                )
-            prev_end = conn_end
+        intervals = _resolve_sorted_connection_intervals(connections)
 
         for conn_start, conn_end, conn in intervals:
             constrained_start = max(global_start_date, conn_start)
