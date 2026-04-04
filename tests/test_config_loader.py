@@ -398,6 +398,62 @@ hyperparameter_optimization:
 
         self.assertTrue(bool(cfg["hyperparameter_optimization"]["parallel"]["resume_study"]))
 
+    def test_normalization_method_robust_rejected(self) -> None:
+        base_config_path = os.path.abspath("config/training_config.yaml")
+        override_yaml = f"""
+base_config: "{base_config_path}"
+preprocessing:
+  normalization:
+    method: "robust"
+"""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            override_path = Path(tmpdir) / "override_robust.yaml"
+            override_path.write_text(override_yaml, encoding="utf-8")
+
+            env = {
+                "DATABASE_URI": "http://example-db",
+                "DATABASE_URI_HIST": "http://example-db-hist",
+                "DATABASE_URI_LIVE": "http://example-db-live",
+                "MLFLOW_TRACKING_URI": "http://mlflow",
+            }
+            with mock.patch.dict(os.environ, env, clear=False):
+                with self.assertRaises(ConfigError) as ctx:
+                    load_config(
+                        config_path=str(override_path),
+                        schema_path="config/validation_schema.yaml",
+                    )
+            self.assertIn("robust", str(ctx.exception).lower())
+            self.assertIn("not supported", str(ctx.exception).lower())
+
+    def test_normalization_method_invalid_rejected(self) -> None:
+        base_config_path = os.path.abspath("config/training_config.yaml")
+        override_yaml = f"""
+base_config: "{base_config_path}"
+preprocessing:
+  normalization:
+    method: "invalid_method"
+"""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            override_path = Path(tmpdir) / "override_invalid_norm.yaml"
+            override_path.write_text(override_yaml, encoding="utf-8")
+
+            env = {
+                "DATABASE_URI": "http://example-db",
+                "DATABASE_URI_HIST": "http://example-db-hist",
+                "DATABASE_URI_LIVE": "http://example-db-live",
+                "MLFLOW_TRACKING_URI": "http://mlflow",
+            }
+            with mock.patch.dict(os.environ, env, clear=False):
+                with self.assertRaises(ConfigError) as ctx:
+                    load_config(
+                        config_path=str(override_path),
+                        schema_path="config/validation_schema.yaml",
+                    )
+            self.assertIn("min_max", str(ctx.exception).lower())
+            self.assertIn("standard", str(ctx.exception).lower())
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

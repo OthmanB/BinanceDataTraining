@@ -77,6 +77,32 @@ _TYPE_MAP = {
 }
 
 
+def _validate_normalization_method(config: Dict[str, Any]) -> None:
+    """Validate preprocessing.normalization.method at config load time.
+
+    Reject 'robust' normalization as it is not production-ready.
+    """
+    preprocessing_cfg = config.get("preprocessing")
+    if not isinstance(preprocessing_cfg, dict):
+        raise ConfigError("preprocessing must be a dict")
+
+    normalization_cfg = preprocessing_cfg.get("normalization")
+    if not isinstance(normalization_cfg, dict):
+        raise ConfigError("preprocessing.normalization must be a dict")
+
+    method = str(normalization_cfg.get("method") or "")
+    if method == "robust":
+        raise ConfigError(
+            "preprocessing.normalization.method='robust' is not supported "
+            "(streaming quantile computation not implemented). "
+            "Use 'min_max' or 'standard' instead."
+        )
+    if method not in {"min_max", "standard"}:
+        raise ConfigError(
+            f"preprocessing.normalization.method must be 'min_max' or 'standard', got {method!r}"
+        )
+
+
 def _validate_class_balancing_config(config: Dict[str, Any]) -> None:
     """Validate preprocessing.class_balancing semantic constraints.
 
@@ -1078,6 +1104,7 @@ def load_config(
     # Resolve dynamic target boundaries before enforcing num_classes invariants.
     _resolve_price_class_boundaries(resolved_config)
 
+    _validate_normalization_method(resolved_config)
     _validate_two_head_intensity_num_classes(resolved_config)
     _validate_class_balancing_config(resolved_config)
     _validate_model_layer_configs(resolved_config)
