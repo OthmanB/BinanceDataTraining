@@ -679,7 +679,11 @@ class TestCalibrationProperties(unittest.TestCase):
         scaled_probs = apply_temperature_scaling(logits_proxy, temperature)
         scaled_argmax = np.argmax(scaled_probs, axis=1)
 
-        self.assertTrue(np.array_equal(raw_argmax, scaled_argmax))
+        max_probs = np.max(probs, axis=1)
+        tolerance = 1e-12
+        for idx, chosen in enumerate(scaled_argmax):
+            candidates = np.where((max_probs[idx] - probs[idx]) <= tolerance)[0]
+            self.assertIn(chosen, candidates)
 
 
 if __name__ == "__main__":

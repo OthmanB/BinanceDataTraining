@@ -59,7 +59,7 @@ fi
 
 # If an existing venv uses an unsupported Python version, recreate it.
 if [ -x "${VENV_DIR}/bin/python" ]; then
-  "${VENV_DIR}/bin/python" - << 'EOF'
+  if ! "${VENV_DIR}/bin/python" - << 'EOF'
 import sys
 
 min_required = (3, 9)
@@ -67,7 +67,7 @@ max_allowed = (3, 13)
 if sys.version_info < min_required or sys.version_info >= max_allowed:
     raise SystemExit(1)
 EOF
-  if [ "$?" -ne 0 ]; then
+  then
     echo "Existing virtual environment uses an unsupported Python version; recreating..."
     rm -rf "${VENV_DIR}"
     "${PYTHON_BIN}" -m venv "${VENV_DIR}"

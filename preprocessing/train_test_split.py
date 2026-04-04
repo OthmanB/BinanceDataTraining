@@ -1,8 +1,10 @@
 """Chronological train/validation/test split utilities.
 
-These functions operate on sample counts and ratios provided by the YAML
-configuration and return index lists for each split.
+These helpers operate on sample counts and ratios provided by the YAML
+configuration.
 """
+
+from __future__ import annotations
 
 from typing import List, Tuple
 import logging
@@ -11,15 +13,21 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def chronological_split_indices(
+def compute_split_boundaries(
     n_samples: int,
     train_ratio: float,
     validation_ratio: float,
     test_ratio: float,
-) -> Tuple[List[int], List[int], List[int]]:
-    """Compute chronological train/validation/test index splits.
+) -> Tuple[int, int, int]:
+    """Compute chronological split boundaries.
 
-    The ratios must sum to 1.0 (within a small numerical tolerance).
+    Returns
+    -------
+    (train_end, val_end, test_end)
+        Indices describing ranges:
+        - train: [0, train_end)
+        - val:   [train_end, val_end)
+        - test:  [val_end, test_end)
     """
 
     if n_samples < 0:
@@ -34,6 +42,26 @@ def chronological_split_indices(
     if val_end > n_samples:
         val_end = n_samples
     test_end = n_samples
+    return train_end, val_end, test_end
+
+
+def chronological_split_indices(
+    n_samples: int,
+    train_ratio: float,
+    validation_ratio: float,
+    test_ratio: float,
+) -> Tuple[List[int], List[int], List[int]]:
+    """Compute chronological train/validation/test index splits.
+
+    The ratios must sum to 1.0 (within a small numerical tolerance).
+    """
+
+    train_end, val_end, test_end = compute_split_boundaries(
+        n_samples,
+        train_ratio,
+        validation_ratio,
+        test_ratio,
+    )
 
     train_indices = list(range(0, train_end))
     val_indices = list(range(train_end, val_end))
@@ -50,4 +78,4 @@ def chronological_split_indices(
     return train_indices, val_indices, test_indices
 
 
-__all__ = ["chronological_split_indices"]
+__all__ = ["chronological_split_indices", "compute_split_boundaries"]

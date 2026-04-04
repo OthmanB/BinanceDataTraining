@@ -1,6 +1,6 @@
 import unittest
 
-from preprocessing.train_test_split import chronological_split_indices
+from preprocessing.train_test_split import compute_split_boundaries, chronological_split_indices
 
 
 class TestChronologicalSplit(unittest.TestCase):
@@ -14,6 +14,11 @@ class TestChronologicalSplit(unittest.TestCase):
         self.assertEqual(train, list(range(0, 7)))
         self.assertEqual(val, list(range(7, 9)))
         self.assertEqual(test, list(range(9, 10)))
+
+    def test_compute_split_boundaries_matches_indices(self) -> None:
+        n = 10
+        train_end, val_end, test_end = compute_split_boundaries(n, 0.7, 0.2, 0.1)
+        self.assertEqual((train_end, val_end, test_end), (7, 9, 10))
 
     def test_invalid_ratios_raise(self) -> None:
         with self.assertRaises(ValueError):

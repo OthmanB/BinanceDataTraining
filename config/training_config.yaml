@@ -11,7 +11,7 @@
 #   - targets: configures the prediction horizon and label discretisation.
 #   - preprocessing: controls normalization, train/validation/test splitting, etc.
 #   - model: specifies the CNN+LSTM architecture and compilation options.
-#   - training: sets batch size, epochs, weighting, dataset caching, and callbacks.
+#   - training: sets batch size, epochs, weighting, and callbacks.
 #   - snapshot: controls derived dataset snapshots for streaming training.
 #   - hyperparameter_optimization: Optuna search behaviour and search space.
 #   - mlflow: experiment tracking options and model registry settings.
@@ -138,7 +138,7 @@ targets:  # Defines what future event the model predicts and how labels are cons
 # Preprocessing Configuration
 preprocessing:  # Controls normalization, feature engineering, and dataset splitting.
   normalization:
-    method: "min_max"        # Scaling method for numerical features: "min_max", "standard", or "robust".
+    method: "min_max"        # Scaling method for numerical features: "min_max" or "standard".
     per_asset: true           # When true, fit separate normalizers per asset rather than a global one.
     fit_on_train_only: true   # When true, compute normalization statistics on the training split only and reuse for val/test.
 
@@ -168,8 +168,20 @@ preprocessing:  # Controls normalization, feature engineering, and dataset split
     test_ratio: 0.15           # Fraction of samples used for final testing.
 
   class_balancing:
-    enabled: true              # When true, enable strategies to mitigate label imbalance.
-    method: "class_weights"   # Balancing strategy: "class_weights", "oversampling", or "undersampling" (not all fully implemented yet).
+    enabled: false             # When true, evict samples from overrepresented label classes before training.
+    method: "undersampling"   # Currently supported: "undersampling" only.
+
+    # Undersampling is a coarse pre-training filter. It is independent from
+    # training.class_weights and can be combined with it.
+    undersampling:
+      labeling_criteria: "max_intensity"  # One of: "max_intensity" | "up_intensity" | "down_intensity".
+      # Relative class weights; length must equal model.output.num_classes.
+      # Values do not need to sum to 1.0 (e.g. [70, 15, 10, 5]).
+      target_distribution: [70, 15, 10, 5]
+      selection_policy: "uniform_time"  # One of: "uniform_time" | "kmeans" | "random".
+      min_samples_after_balance: 1000  # Fail fast if undersampling keeps fewer samples.
+      min_fraction_after_balance: 0.01  # Fail fast if undersampling keeps a smaller fraction of the train split.
+      random_seed: 42
 
 # Model Architecture Configuration
 model:  # Defines the neural network architecture and its compilation settings.
@@ -185,22 +197,30 @@ model:  # Defines the neural network architecture and its compilation settings.
       use_global_features: true            # When true, include global temporal features (days_since_start, market_session).
 
   cnn:
-    num_layers: 2                # Number of convolutional layers in the CNN block.
-    filters: [64, 128]           # Number of filters per convolutional layer.
-    kernel_sizes: [[3, 3], [3, 3]]  # Spatial kernel sizes for each convolutional layer (height, width).
-    pooling: "max"              # Type of pooling operation; currently max pooling.
-    pool_sizes: [[2, 2], [2, 2]]  # Pooling window sizes per layer.
-    activation: "relu"          # Activation function for convolutional layers.
-    dropout_rates: [0.2, 0.3]    # Dropout rates applied after each convolutional layer.
+    activation: "relu"            # Activation function shared across CNN layers.
+    layers:                       # Per-layer configuration; number of layers = length of this list.
+      - filters: 64               # Number of filters for this convolutional layer.
+        kernel_size: [3, 3]       # Spatial kernel size (height, width).
+        pool_size: [2, 2]         # Pooling window size; null to skip pooling on this layer.
+        normalization: null       # Normalization after Conv2D: null | "batch" | "group" | "layer".
+        dropout: 0.2              # Dropout rate after this layer; 0.0 to skip.
+      - filters: 128
+        kernel_size: [3, 3]
+        pool_size: [2, 2]
+        normalization: null
+        dropout: 0.3
 
   lstm:
-    units: 96             # Number of hidden units in the LSTM layer.
-    dropout: 0.3          # Dropout on the inputs to the LSTM.
-    recurrent_dropout: 0.0 # Dropout on recurrent connections; keep 0.0 when using cuDNN for performance.
+    layers:                       # Per-layer configuration; supports stacked LSTMs.
+      - units: 96                 # Number of hidden units in this LSTM layer.
+        dropout: 0.3              # Keras LSTM input dropout.
+        recurrent_dropout: 0.0    # Recurrent dropout; keep 0.0 for cuDNN acceleration.
+        post_dropout: 0.0         # Standalone Dropout layer after this LSTM; 0.0 to skip.
 
   dense:
-    layers: [64]          # Sizes of fully connected layers after the recurrent block.
-    dropout_rates: [0.2]  # Dropout rates for each dense layer.
+    layers:                       # Fully connected layers after the recurrent block.
+      - units: 64                 # Number of units.
+        dropout: 0.2              # Dropout rate after this dense layer.
 
   long_term:
     enabled: false                    # When true, add long-term context branch (TD-019 dual-channel).
@@ -214,13 +234,18 @@ model:  # Defines the neural network architecture and its compilation settings.
     summary_method: "mean"            # How to summarize stats: "mean", "ewma", "last".
     ewma_halflife_days: 7.0           # Half-life for EWMA weighting (when summary_method="ewma").
     input_dim: null                   # Auto-computed: len(windows_days) * len(features). Set to override.
-    dense:
-      layers: [32]                    # Dense layer sizes for long-term branch.
-      dropout_rates: [0.2]            # Dropout rates for long-term dense layers.
+    architecture:
+      conv1d:                         # Optional Conv1D layers on reshaped (num_windows, features_per_window) input.
+        activation: "relu"            # Activation function for Conv1D layers.
+        layers: []                    # Empty list = no Conv1D (dense-only branch). Same dict format as cnn.layers but 1D.
+      dense:
+        layers:                       # Dense layers for long-term branch.
+          - units: 32
+            dropout: 0.2
 
   output:
     type: "two_head_intensity"  # Output head configuration: separate up/down intensity classifications.
-    num_classes: 4               # Number of classes per head; should equal len(targets.price_classes.boundaries) + 1.
+    num_classes: "auto"          # Number of classes per head; should equal len(targets.price_classes.boundaries) + 1.
     activation: "softmax"       # Activation for each classification head.
 
   compilation:
@@ -237,11 +262,25 @@ training:  # Controls how the model is fit on the prepared dataset.
   debug_max_samples: 200      # Hard cap on chronological training samples; raise for full runs, lower for quick experiments.
   missing_snapshot_strategy: "fail"  # Behaviour when snapshot-based inputs are unavailable: "fail", "skip", or "synthetic".
 
-  dataset_cache:
-    enabled: false                                  # When true, cache constructed datasets to NPZ files for reuse.
-    directory: "cache/datasets"                    # Directory where cached datasets are stored.
-    filename_pattern: "{asset}_{model}_{dataset_version}_{dataset_hash}.npz"  # Template for naming cached datasets.
-    version: "v1"                                  # Logical dataset version tag; increment when feature definitions change.
+  runtime:
+    device: "gpu"  # Compute device target for training: "cpu" or "gpu".
+    gpu_visible_devices: null  # Optional CUDA device list (e.g. "0" or "0,1"); null uses default visibility.
+    gpu_memory_growth: false  # When true, enable TensorFlow memory growth on visible GPUs (recommended for parallel workers).
+    gpu_allocator: "default"  # GPU allocator policy: "default" or "cuda_malloc_async".
+    gpu_init_lock_enabled: false  # When true in parallel HPO workers, serialize initial TensorFlow GPU context setup.
+    gpu_init_stagger_seconds: 0  # Optional startup delay (seconds) before GPU worker initialization.
+    mixed_precision: "float32"  # Precision policy: "float32" (default) or "float16" (mixed precision for ~1.5-2x speedup on Ampere+ GPUs).
+    distributed:
+      enabled: false  # When true, use multi-GPU distributed training via MirroredStrategy for the final training phase.
+      strategy: "mirrored"  # Distribution strategy: "mirrored" (synchronous data-parallel across GPUs).
+      resources: []  # Device list, same format as hpo.parallel.resources, e.g. ["gpu:0", "gpu:1"]. Empty = all visible GPUs.
+
+  sequential_training:
+    enabled: false  # When true, split data.time_range into rolling day windows and train continuously window-by-window.
+    window_days: 7  # Window size in days used when sequential_training.enabled is true.
+    cleanup_completed_windows: false  # When true, delete each completed window snapshot directory after training on it.
+    cleanup_keep_last_windows: 0  # Number of most-recent completed windows to retain when cleanup_completed_windows is true.
+    resume_enabled: false  # When true, persist sequential progress/model checkpoints and resume interrupted runs.
 
   callbacks:
     early_stopping:
@@ -258,7 +297,7 @@ training:  # Controls how the model is fit on the prepared dataset.
       min_lr: 0.00001         # Lower bound on the learning rate.
 
   class_weights:
-    compute_from_train: false  # When true, compute class weights from the training data (not yet fully integrated into loss).
+    compute_from_train: false  # When true, compute class weights from the training labels and apply them in snapshot training.
 
   sample_weighting:
     enabled: false                 # When true, apply time-based exponential decay weights to samples.
@@ -295,12 +334,49 @@ hyperparameter_optimization:  # Controls Optuna-based search over selected hyper
   trial_model_logging:
     enabled: false  # When false, HPO trials do not log or register models in MLflow; set true only when inspecting per-trial models.
 
+  parallel:
+    enabled: false  # When true, distribute HPO trials across multiple worker processes/resources.
+    max_trials_per_worker_process: 1  # Hard cap of trials per worker process before respawn; must be >= 1.
+    adaptive_scheduler_enabled: true  # Dynamically reduce/recover worker count and per-worker wave budget based on stability.
+    adaptive_scheduler_min_workers: 1  # Lower bound on adaptive worker count during instability.
+    adaptive_scheduler_recovery_waves: 2  # Stable waves required before adaptive scale-up.
+    adaptive_scheduler_min_trials_per_worker_process: 1  # Floor for adaptive per-worker trial cap.
+    rss_watchdog_enabled: true  # When true, monitor worker RSS and restart the current wave if memory exceeds threshold.
+    rss_watchdog_max_worker_rss_gb: 28.0  # Per-worker RSS soft limit in GiB; exceeding it triggers wave restart.
+    rss_watchdog_check_interval_seconds: 5.0  # Watchdog polling cadence in seconds while workers are running.
+    resources: []  # Resource list like ["gpu:0", "gpu:1", "cpu"]; each worker is pinned to one entry.
+    storage_uri: null  # Optional Optuna storage URI (e.g. sqlite:///tmp/optuna/hpo.db); null auto-creates local SQLite.
+    study_name: null  # Optional Optuna study name used by parallel workers; null defaults to "binance_hpo".
+    resume_study: false  # When true, reuse an existing Optuna study; when false, delete stale prior trials and start fresh.
+
+  regime:
+    enabled: false  # When true, apply adaptive safeguards/penalties to keep HPO trials in stable GPU/CPU operating regimes.
+    retry_on_oom: true  # Retry trial training after memory-related failures by reducing batch size.
+    max_retry_attempts: 2  # Maximum number of OOM-triggered retries per trial.
+    batch_backoff_factor: 0.5  # Multiplicative batch-size reduction applied on each retry.
+    min_batch_size: 4  # Lower bound for adaptive batch backoff.
+    failure_policy: "prune"  # "prune" marks exhausted trials as pruned; "penalize" returns a large synthetic objective.
+    failure_penalty_value: 1000000.0  # Objective magnitude used when failure_policy="penalize".
+    max_vram_fraction: null  # Optional soft VRAM usage cap in [0,1]; penalties apply when exceeded and telemetry is available.
+    vram_penalty_weight: 1.0  # Weight multiplier for VRAM-overuse penalty.
+    low_utilization_penalty:
+      enabled: false  # When true, penalize trials with low throughput estimates.
+      min_samples_per_second: 0.0  # Throughput target; no penalty when <= 0.
+      weight: 0.0  # Penalty weight applied to throughput deficit.
+    safe_envelope:
+      enabled: true  # Clamp sampled batch sizes to empirically safe ranges learned from prior runs.
+      min_success_trials: 2  # Minimum successful observations before success-based envelope capping activates.
+      headroom_fraction: 1.0  # Fraction in (0,1] applied to learned cap for additional safety margin.
+      persistence_enabled: true  # Persist learned envelope memory to disk for reuse in future runs.
+
   search_space:
-    cnn_filters_1: [16, 128]      # Integer range [low, high] for the first CNN filter size.
-    cnn_filters_2: [64, 256]      # Integer range for the second CNN filter size.
-    lstm_units: [32, 256]         # Integer range for the number of LSTM units.
-    learning_rate: [0.0001, 0.01] # Continuous range [low, high] for learning rate; third entry can be "log" for log scale.
-    batch_size: [16, 32, 64]      # Batch-size candidates; list can encode either a range or categorical set.
+    cnn:                            # Per-layer CNN search ranges; list index matches model.cnn.layers index.
+      - filters: [16, 128]         # Integer range [low, high] for CNN layer 0 filters.
+      - filters: [64, 256]         # Integer range for CNN layer 1 filters.
+    lstm:                           # Per-layer LSTM search ranges; list index matches model.lstm.layers index.
+      - units: [32, 256]           # Integer range for LSTM layer 0 units.
+    learning_rate: [0.0001, 0.01]   # Continuous range [low, high] for learning rate; third entry can be "log" for log scale.
+    batch_size: [16, 32, 64]        # Batch-size candidates; list can encode either a range or categorical set.
 
 # MLFlow Configuration
 mlflow:  # Experiment tracking and model registry configuration.
@@ -367,6 +443,7 @@ evaluation:  # Post-training evaluation and calibration settings.
 # Data Diagnostics Configuration
 diagnostics:  # Controls pre-training data quality checks and their logging.
   enabled: true  # When true, run diagnostics on snapshot-level data before training.
+  execution_mode: "standalone"  # Diagnostics execution: "standalone" (single full-range pass) or "per_snapshot" (run after each prepared snapshot/window).
 
   sampling:
     method: "uniform"   # How to sample indices for diagnostics: "uniform" grid or "random" subset of training indices.
@@ -424,6 +501,7 @@ diagnostics:  # Controls pre-training data quality checks and their logging.
 
 # Logging Configuration
 logging:  # Application logging verbosity and colour settings.
+  format: "colored"      # Log output format: "colored" for human-readable ANSI output, "json" for structured JSON lines (production).
   level: "INFO"          # Global log level: DEBUG, INFO, WARNING, ERROR.
   colored_output: true    # When true, use ANSI colours in log messages.
   log_function_names: true  # When true, include function names in log messages for easier tracing.

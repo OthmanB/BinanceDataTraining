@@ -1,0 +1,542 @@
+# Binance ML Training Platform - Training Configuration (Phase 1 baseline)
+#
+# This YAML file is the single source of truth for the offline data → model pipeline.
+# All behavioural changes (data ranges, model architecture, optimisation strategy,
+# logging, diagnostics) should be made here rather than in code.
+# 
+# Section overview:
+#   - run_mode: selects between production runs (final model training + evaluation)
+#               and trial runs (hyperparameter search only, no final model).
+#   - data: defines where and over which time windows raw order-book data are read.
+#   - targets: configures the prediction horizon and label discretisation.
+#   - preprocessing: controls normalization, train/validation/test splitting, etc.
+#   - model: specifies the CNN+LSTM architecture and compilation options.
+#   - training: sets batch size, epochs, weighting, and callbacks.
+#   - snapshot: controls derived dataset snapshots for streaming training.
+#   - hyperparameter_optimization: Optuna search behaviour and search space.
+#   - mlflow: experiment tracking options and model registry settings.
+#   - evaluation: post-training evaluation and calibration analysis.
+#   - diagnostics: pre-training data quality checks and visual diagnostics.
+#   - logging: verbosity and coloured logging behaviour.
+#   - security: required environment variables and startup validation rules.
+#
+# General guidelines:
+#   - Keep configuration internally consistent (for example, the validation ratio
+#     used for splitting and training must match).
+#   - Treat this file as versioned experiment metadata; when changing key semantic
+#     choices (such as the prediction horizon or label boundaries), record the
+#     change and avoid mixing models trained under incompatible settings.
+#   - Do not rely on defaults in code; every tunable parameter must appear here.
+#
+# Run Mode Configuration
+run_mode:  # High-level execution mode for this run.
+  mode: "production"  # "production": run HPO (if enabled) then final training+evaluation; "trial": run HPO only, no final training.
+
+# Data Source Configuration
+data:  # Controls where raw data come from and over which time windows.
+  source_type: "database"  # Primary data source type: "database" uses GreptimeDB HTTP SQL API; "file" reserved for future file-based ingestion.
+  connection:
+    database_uri: "${DATABASE_URI}"  # URI of the main GreptimeDB instance; resolved from DATABASE_URI env var.
+    table_prefix: "orderbook_"  # Common table name prefix; full table names typically prefix + asset symbol.
+    request_timeout_seconds: 30     # Timeout for HTTP requests to GreptimeDB (seconds).
+    connect_timeout_seconds: 10     # Timeout for establishing HTTP connection (seconds).
+    max_retries: 3                  # Number of retry attempts on transient failures.
+    retry_backoff_factor: 0.5       # Exponential backoff multiplier between retries.
+
+  multi_database:
+    enabled: false  # When true, use multiple database connections below and split time by connection; when false, use single "connection" above.
+    strategy: "time_split"  # Strategy for combining multiple DBs; currently only non-overlapping time-based splitting is supported.
+    connections:
+      - name: "historical"  # Label for this connection (used for logging/identification only).
+        database_uri: "${DATABASE_URI_HIST}"  # URI of the historical GreptimeDB instance; must cover the configured historical time range.
+        table_prefix: "orderbook_"  # Table prefix for this connection; usually identical across connections.
+        time_range:
+          start_date: "2021-04-01"  # Earliest timestamp (inclusive) for which this DB is queried.
+          end_date:   "2025-06-04"  # Latest timestamp (exclusive) for this DB; must not overlap with the next connection.
+      - name: "recent"  # Label for the more recent/live-ish connection.
+        database_uri: "${DATABASE_URI_LIVE}"  # URI of the recent GreptimeDB instance.
+        table_prefix: "orderbook_"  # Table prefix for this connection.
+        time_range:
+          start_date: "2025-06-04"  # Start of the recent DB interval; should match previous end_date for continuity.
+          end_date:   "2025-10-20"  # End of the recent DB interval; extend this as more data become available.
+
+  asset_pairs:
+    target_asset: "BTCUSDT"  # Primary asset whose future price movement is being predicted.
+    correlated_assets: []
+    alignment:
+      method: "interpolate"  # Alignment strategy: "interpolate" (default) or "bucket".
+      missing_policy: "forward_fill"  # Gap handling for aligned assets: "forward_fill", "skip", or "error".
+      max_gap_seconds: 1200  # Max gap size (seconds) allowed for forward fill/interpolation.
+      bucket_tolerance_seconds: 2  # Alignment tolerance for bucket method (seconds).
+      include_mask_channel: true  # Append per-asset confidence mask channels (0..1) to inputs.
+
+  time_range:
+    start_date: "2024-01-01"  # Logical start of the dataset for this run (inclusive); used when querying raw rows.
+    end_date: "2024-01-01"    # Logical end of the dataset for this run (exclusive); extend to train on longer histories.
+    cadence_seconds: 10        # Desired temporal spacing between logical samples; influences visible window length in steps.
+
+  ingestion:
+    chunk_hours: 6  # Physical time span per query chunk; trade-off between request size and number of round trips.
+    chunk_delay_seconds: 0.5  # Sleep between chunk fetches to reduce pressure on live writes.
+    max_concurrent_chunk_fetches: 1  # Concurrency cap for chunk fetches; keep at 1 for low DB load.
+
+  order_book:
+    depth_levels: 100  # Maximum number of price levels per side to ingest for order-book snapshots.
+    representation: "hybrid"  # Order-book representation strategy: "full", "aggregated", or "hybrid" (current model expects hybrid).
+    hybrid:
+      raw_levels: 20           # Keep top N levels as-is (must be < depth_levels).
+      aggregated_bins: 20      # Number of bins for deeper levels (must be > 0).
+      bin_strategy: "equal_width"  # Binning strategy: "equal_width" or "log_spaced" for bin distribution.
+    schema:
+      timestamp_column: "ts"           # Column name in the DB table containing snapshot timestamps.
+      bid_price_column: "bid_price"    # Column storing best (or aggregated) bid prices.
+      bid_quantity_column: "bid_quantity"  # Column storing bid quantities for the chosen representation.
+      ask_price_column: "ask_price"    # Column storing best (or aggregated) ask prices.
+      ask_quantity_column: "ask_quantity"  # Column storing ask quantities for the chosen representation.
+      batch_id_column: "batch_id"      # Column used to group rows that belong to the same logical snapshot/batch.
+
+  temporal_features:
+    local:
+      - "hour_of_day"     # Cyclic encoding of hour of day for each sample.
+      - "day_of_week"     # Cyclic encoding of day of week for each sample.
+      - "minute_of_hour"  # Cyclic encoding of minute within the hour.
+    global:
+      - "days_since_start"  # Monotonic index counting days from the configured start date.
+      - "market_session"    # Encoded global session indicator (e.g. Asian/European/American) based on UTC-offset sessions.
+    market_session:
+      utc_offset_hours: 0  # Offset used when mapping UTC timestamps to session boundaries; 0 implies sessions are defined in UTC.
+      sessions:
+        - name: "asian"     # Name of the first trading session.
+          start_hour: 0      # Session start hour (inclusive) in 24h clock, after applying utc_offset_hours.
+          end_hour: 8        # Session end hour (exclusive).
+        - name: "european"  # Name of the second trading session.
+          start_hour: 8      # Session start hour (inclusive).
+          end_hour: 16       # Session end hour (exclusive).
+        - name: "american"  # Name of the third trading session.
+          start_hour: 16     # Session start hour (inclusive).
+          end_hour: 24       # Session end hour (exclusive).
+
+  validation:
+    check_missing_data: true  # When true, perform basic continuity checks on ingested time series.
+    max_gap_seconds: 60       # Maximum tolerated gap between consecutive snapshots before it is flagged as a problem.
+    fail_on_invalid: true     # When true, abort the run if validation detects invalid data or gaps beyond thresholds.
+
+# Target Configuration
+targets:  # Defines what future event the model predicts and how labels are constructed.
+  prediction_horizon_seconds: 1800  # Prediction horizon in seconds (here: 30 minutes ahead price change).
+  visible_window_seconds: 7200      # Length of past window (in seconds) visible to the model when forming a prediction.
+
+  price_classes:
+    definition_type: "percentage"  # How price-move bins are defined: by percentage, absolute size, or adaptive rules.
+    boundaries: [0.15, 0.35, 0.55, 1.5]    # Ordered boundaries (in percent) that split price moves into intensity classes.
+
+  labeling:
+    scheme: "two_head_intensity"   # Label scheme: separate up/down intensity heads with discretised classes.
+    use_midpoint: true              # When true, compute price changes from mid-price; when false, use last trade or another reference.
+    handle_gaps: "interpolate"     # Strategy for handling missing price points when computing labels ("skip", "forward_fill", etc.).
+
+# Preprocessing Configuration
+preprocessing:  # Controls normalization, feature engineering, and dataset splitting.
+  normalization:
+    method: "min_max"        # Scaling method for numerical features: "min_max" or "standard".
+    per_asset: true           # When true, fit separate normalizers per asset rather than a global one.
+    fit_on_train_only: true   # When true, compute normalization statistics on the training split only and reuse for val/test.
+
+  feature_engineering:
+    enabled: true                    # When true, compute derived features from order book data.
+    order_book_features:
+      - "bid_ask_spread"             # Spread features derived from best bid/ask.
+      - "volume_imbalance"           # Imbalance between bid and ask quantities.
+      - "depth_imbalance"            # Imbalance across multiple depth levels.
+      - "weighted_mid_price"         # Price feature combining bid/ask with volume weights.
+
+    derived_features:
+      - "price_momentum"             # Past price change magnitudes used as additional signals.
+      - "volume_momentum"            # Past volume change magnitudes used as additional signals.
+
+    momentum_window_seconds: 300     # Window for momentum calculations; must be <= visible_window_seconds.
+    volume_proxy_method: "top_of_book"  # Volume proxy: "top_of_book" or "total_depth".
+
+    edge_decay:
+      enabled: true                  # When true, apply decay to momentum features near t_min.
+      method: "linear"               # Edge decay method: "linear" or "exponential".
+
+  train_test_split:
+    method: "chronological"  # Splitting strategy; "chronological" preserves time ordering (no leakage from future to past).
+    train_ratio: 0.70          # Fraction of samples used for training; together with validation_ratio/test_ratio must sum to 1.0.
+    validation_ratio: 0.15     # Fraction of samples used for validation; must match training.validation_split.
+    test_ratio: 0.15           # Fraction of samples used for final testing.
+
+  class_balancing:
+    enabled: false             # When true, evict samples from overrepresented label classes before training.
+    method: "undersampling"   # Currently supported: "undersampling" only.
+
+    # Undersampling is a coarse pre-training filter. It is independent from
+    # training.class_weights and can be combined with it.
+    undersampling:
+      labeling_criteria: "max_intensity"  # One of: "max_intensity" | "up_intensity" | "down_intensity".
+      # Relative class weights; length must equal model.output.num_classes.
+      # Values do not need to sum to 1.0.
+      target_distribution: [70, 15, 7, 4, 2, 1, 1]
+      selection_policy: "uniform_time"  # One of: "uniform_time" | "kmeans" | "random".
+      min_samples_after_balance: 1000  # Fail fast if undersampling keeps fewer samples.
+      min_fraction_after_balance: 0.01  # Fail fast if undersampling keeps a smaller fraction of the train split.
+      random_seed: 42
+
+# Model Architecture Configuration
+model:  # Defines the neural network architecture and its compilation settings.
+  framework: "keras"         # High-level API used to define the model; here, TensorFlow Keras.
+  backend: "tensorflow"      # Numerical backend for running the model.
+  architecture: "CNN_LSTM_MultiClass"  # Logical architecture identifier; used for naming and model-building logic.
+
+  input_representation:
+    strategy: "stacked_channels"  # How to map features into input tensors: stacked channels vs separate branches, etc.
+    temporal_features:
+      integration_mode: "concat_channels"  # If "concat_channels", broadcast temporal features across space/time and append as channels.
+      use_local_features: true             # When true, include local temporal features (hour_of_day, etc.) in the input.
+      use_global_features: true            # When true, include global temporal features (days_since_start, market_session).
+
+  cnn:
+    activation: "relu"            # Activation function shared across CNN layers.
+    layers:                       # Per-layer configuration; number of layers = length of this list.
+      - filters: 16
+        kernel_size: [5,5]
+        pool_size: [2,2]
+        normalization: null
+        dropout: 0.
+      - filters: 32
+        kernel_size: [5,5]
+        pool_size: [2,2]
+        normalization: null
+        dropout: 0.
+      - filters: 64               # Number of filters for this convolutional layer.
+        kernel_size: [5, 5]       # Spatial kernel size (height, width).
+        pool_size: [2, 2]         # Pooling window size; null to skip pooling on this layer.
+        normalization: null       # Normalization after Conv2D: null | "batch" | "group" | "layer".
+        dropout: 0.               # Dropout rate after this layer; 0.0 to skip.
+      - filters: 128
+        kernel_size: [3, 3]
+        pool_size: [2, 2]
+        normalization: null
+        dropout: 0.3
+
+  lstm:
+    layers:                       # Per-layer configuration; supports stacked LSTMs.
+      - units: 96                 # Number of hidden units in this LSTM layer.
+        dropout: 0.              # Keras LSTM input dropout.
+        recurrent_dropout: 0.0    # Recurrent dropout; keep 0.0 for cuDNN acceleration.
+        post_dropout: 0.2         # Standalone Dropout layer after this LSTM; 0.0 to skip.
+
+  dense:
+    layers:                       # Fully connected layers after the recurrent block.
+      - units: 64                 # Number of units.
+        dropout: 0.2              # Dropout rate after this dense layer.
+
+  long_term:
+    enabled: false                    # When true, add long-term context branch (TD-019 dual-channel).
+    windows_days: [7, 30, 90]         # Multi-scale windows: weekly, monthly, quarterly.
+    resolution_days: 1                # Aggregation resolution (daily statistics).
+    features:                         # Features to compute per window:
+      - "mean_return"                 #   Average daily return.
+      - "volatility"                  #   Daily return standard deviation.
+      - "volume_proxy"                #   Average daily volume (from order book depth).
+      - "skewness"                    #   Return distribution skewness.
+    summary_method: "mean"            # How to summarize stats: "mean", "ewma", "last".
+    ewma_halflife_days: 7.0           # Half-life for EWMA weighting (when summary_method="ewma").
+    input_dim: null                   # Auto-computed: len(windows_days) * len(features). Set to override.
+    architecture:
+      conv1d:                         # Optional Conv1D layers on reshaped (num_windows, features_per_window) input.
+        activation: "relu"            # Activation function for Conv1D layers.
+        layers: []                    # Empty list = no Conv1D (dense-only branch). Same dict format as cnn.layers but 1D.
+      dense:
+        layers:                       # Dense layers for long-term branch.
+          - units: 32
+            dropout: 0.2
+
+  output:
+    type: "two_head_intensity"  # Output head configuration: separate up/down intensity classifications.
+    num_classes: "auto"          # Number of classes per head; should equal len(targets.price_classes.boundaries) + 1.
+    activation: "softmax"       # Activation for each classification head.
+
+  compilation:
+    optimizer: "adam"                 # Optimizer used during training (here, Adam).
+    learning_rate: 0.001              # Base learning rate for the optimizer.
+    loss: "categorical_crossentropy"  # Loss function for multi-class classification.
+    metrics: ["accuracy", "precision", "recall"]  # Metrics tracked during training/evaluation.
+
+# Training Configuration
+training:  # Controls how the model is fit on the prepared dataset.
+  epochs: 3                    # Maximum number of passes over the training data (early stopping may stop earlier).
+  batch_size: 16               # Number of samples per gradient update.
+  validation_split: 0.15        # Must match preprocessing.train_test_split.validation_ratio in this phase.
+  debug_max_samples: 200      # Hard cap on chronological training samples; raise for full runs, lower for quick experiments.
+  missing_snapshot_strategy: "fail"  # Behaviour when snapshot-based inputs are unavailable: "fail", "skip", or "synthetic".
+
+  runtime:
+    device: "gpu"  # Compute device target for training: "cpu" or "gpu".
+    gpu_visible_devices: null  # Optional CUDA device list (e.g. "0" or "0,1"); null uses default visibility.
+    gpu_memory_growth: false  # When true, enable TensorFlow memory growth on visible GPUs (recommended for parallel workers).
+    gpu_allocator: "default"  # GPU allocator policy: "default" or "cuda_malloc_async".
+    gpu_init_lock_enabled: false  # When true in parallel HPO workers, serialize initial TensorFlow GPU context setup.
+    gpu_init_stagger_seconds: 0  # Optional startup delay (seconds) before GPU worker initialization.
+    mixed_precision: "float32"  # Precision policy: "float32" (default) or "float16" (mixed precision for ~1.5-2x speedup on Ampere+ GPUs).
+    distributed:
+      enabled: false  # When true, use multi-GPU distributed training via MirroredStrategy for the final training phase.
+      strategy: "mirrored"  # Distribution strategy: "mirrored" (synchronous data-parallel across GPUs).
+      resources: []  # Device list, same format as hpo.parallel.resources, e.g. ["gpu:0", "gpu:1"]. Empty = all visible GPUs.
+
+  sequential_training:
+    enabled: false  # When true, split data.time_range into rolling day windows and train continuously window-by-window.
+    window_days: 7  # Window size in days used when sequential_training.enabled is true.
+    cleanup_completed_windows: false  # When true, delete each completed window snapshot directory after training on it.
+    cleanup_keep_last_windows: 0  # Number of most-recent completed windows to retain when cleanup_completed_windows is true.
+    resume_enabled: false  # When true, persist sequential progress/model checkpoints and resume interrupted runs.
+
+  callbacks:
+    early_stopping:
+      enabled: true           # When true, stop training when monitored metric stops improving.
+      monitor: "val_loss"    # Metric to monitor for early stopping.
+      patience: 10            # Number of epochs with no improvement before stopping.
+      restore_best_weights: true  # When true, restore model weights from the best epoch.
+
+    reduce_lr:
+      enabled: true           # When true, reduce learning rate when the monitored metric plateaus.
+      monitor: "val_loss"    # Metric to monitor for learning-rate reduction.
+      factor: 0.5             # Multiplicative factor for reducing the learning rate.
+      patience: 5             # Number of epochs with no improvement before reducing the learning rate.
+      min_lr: 0.00001         # Lower bound on the learning rate.
+
+    terminate_on_nan:
+      enabled: false  # When true, stop training immediately if loss becomes NaN.
+
+  class_weights:
+    compute_from_train: false  # When true, compute class weights from the training labels and apply them in snapshot training.
+
+  sample_weighting:
+    enabled: false                 # When true, apply time-based exponential decay weights to samples.
+    method: "exponential_decay"   # Weighting method; currently only exponential decay is supported.
+    half_life_days: 90             # Half-life (in days) for the decay; smaller values emphasise recent data more.
+    apply_to: "loss_function"     # Where to apply weights; currently used as sample_weight for the loss.
+
+  fine_tuning:
+    enabled: false              # When true, resume training from a previously saved model instead of starting from scratch.
+    base_model_run_id: null     # Required when fine_tuning.enabled is true and use_model_registry is false; identifies the MLflow run/model to load.
+    base_model_stage: "Production"  # MLflow model registry stage to load from (e.g., "Production", "Staging", "None").
+    use_model_registry: false   # When true, load model from MLflow model registry; when false, load from run artifacts.
+    registry_name: null         # Required when use_model_registry is true; the registered model name in MLflow.
+    freeze_layers: "none"       # Layer freezing pattern: "none", "cnn", "cnn_lstm", "all_but_output".
+    learning_rate_factor: 0.1   # Multiplicative factor for learning rate when fine-tuning (e.g., 0.1 = 10x lower LR).
+
+# Snapshot Configuration
+snapshot:  # Derived dataset snapshots for streaming training/restarts.
+  enabled: true  # When true, build or reuse a snapshot dataset from GreptimeDB chunk streams.
+  directory: "snapshots"  # Root directory for snapshot datasets.
+  root_name: "baseline"  # Required root name for snapshot directories.
+  name: "auto"  # "auto" uses root_name + config hash + time range; or set a custom name.
+  on_config_mismatch: "create_new"  # "create_new" or "error" when a snapshot name already exists.
+  max_snapshots: 5  # Keep most recent N snapshots; <=0 keeps all snapshots.
+
+# Hyperparameter Optimization Configuration
+hyperparameter_optimization:  # Controls Optuna-based search over selected hyperparameters.
+  enabled: true                      # When true, run HPO before final training (in production) or as the only step (in trial mode).
+  framework: "optuna"               # HPO engine; currently only Optuna is supported.
+  n_trials: 1                        # Number of Optuna trials; increase for more thorough search at the cost of runtime.
+  direction: "maximize"             # Optimisation direction for the metric: "maximize" or "minimize".
+  metric: "val_up_intensity_accuracy"  # Name of the Keras History metric used as HPO objective.
+
+  trial_model_logging:
+    enabled: false  # When false, HPO trials do not log or register models in MLflow; set true only when inspecting per-trial models.
+
+  parallel:
+    enabled: false  # When true, distribute HPO trials across multiple worker processes/resources.
+    max_trials_per_worker_process: 1  # Hard cap of trials per worker process before respawn; must be >= 1.
+    adaptive_scheduler_enabled: true  # Dynamically reduce/recover worker count and per-worker wave budget based on stability.
+    adaptive_scheduler_min_workers: 1  # Lower bound on adaptive worker count during instability.
+    adaptive_scheduler_recovery_waves: 2  # Stable waves required before adaptive scale-up.
+    adaptive_scheduler_min_trials_per_worker_process: 1  # Floor for adaptive per-worker trial cap.
+    rss_watchdog_enabled: true  # When true, monitor worker RSS and restart the current wave if memory exceeds threshold.
+    rss_watchdog_max_worker_rss_gb: 28.0  # Per-worker RSS soft limit in GiB; exceeding it triggers wave restart.
+    rss_watchdog_check_interval_seconds: 5.0  # Watchdog polling cadence in seconds while workers are running.
+    resources: []  # Resource list like ["gpu:0", "gpu:1", "cpu"]; each worker is pinned to one entry.
+    storage_uri: null  # Optional Optuna storage URI (e.g. sqlite:///tmp/optuna/hpo.db); null auto-creates local SQLite.
+    study_name: null  # Optional Optuna study name used by parallel workers; null defaults to "binance_hpo".
+    resume_study: false  # When true, reuse an existing Optuna study; when false, delete stale prior trials and start fresh.
+
+  regime:
+    enabled: false  # When true, apply adaptive safeguards/penalties to keep HPO trials in stable GPU/CPU operating regimes.
+    retry_on_oom: true  # Retry trial training after memory-related failures by reducing batch size.
+    max_retry_attempts: 2  # Maximum number of OOM-triggered retries per trial.
+    batch_backoff_factor: 0.5  # Multiplicative batch-size reduction applied on each retry.
+    min_batch_size: 4  # Lower bound for adaptive batch backoff.
+    failure_policy: "prune"  # "prune" marks exhausted trials as pruned; "penalize" returns a large synthetic objective.
+    failure_penalty_value: 1000000.0  # Objective magnitude used when failure_policy="penalize".
+    max_vram_fraction: null  # Optional soft VRAM usage cap in [0,1]; penalties apply when exceeded and telemetry is available.
+    vram_penalty_weight: 1.0  # Weight multiplier for VRAM-overuse penalty.
+    low_utilization_penalty:
+      enabled: false  # When true, penalize trials with low throughput estimates.
+      min_samples_per_second: 0.0  # Throughput target; no penalty when <= 0.
+      weight: 0.0  # Penalty weight applied to throughput deficit.
+    safe_envelope:
+      enabled: true  # Clamp sampled batch sizes to empirically safe ranges learned from prior runs.
+      min_success_trials: 2  # Minimum successful observations before success-based envelope capping activates.
+      headroom_fraction: 1.0  # Fraction in (0,1] applied to learned cap for additional safety margin.
+      persistence_enabled: true  # Persist learned envelope memory to disk for reuse in future runs.
+
+  search_space:
+    cnn:                            # Per-layer CNN search ranges; list index matches model.cnn.layers index.
+      - filters: [8, 24]         # Integer range [low, high] for CNN layer 0 filters.
+      - filters: [24, 64]         # Integer range for CNN layer 1 filters.
+      - filters: [64, 256]
+    lstm:                           # Per-layer LSTM search ranges; list index matches model.lstm.layers index.
+      - units: [16, 96]           # Integer range for LSTM layer 0 units.
+    learning_rate: [0.0001, 0.01]   # Continuous range [low, high] for learning rate; third entry can be "log" for log scale.
+    batch_size: [4, 8, 16]        # Batch-size candidates; list can encode either a range or categorical set.
+
+# MLFlow Configuration
+mlflow:  # Experiment tracking and model registry configuration.
+  tracking_uri: "${MLFLOW_TRACKING_URI}"  # MLflow tracking server URI; resolved from env.
+  experiment_name: "binance-price-prediction"  # MLflow experiment name grouping related runs.
+  local_tmp_dir: "tmp/mlflow"                  # Local directory for temporary artifacts before upload.
+
+  run_naming:
+    pattern: "{asset}_{model}_{timestamp}"  # Template used to construct MLflow run names.
+
+  artifact_logging:
+    trained_model: true           # When true, log the final trained model as an MLflow artifact.
+    model_architecture_plot: true  # When true, log a visualisation of the model architecture (if available).
+    training_plots: true          # When true, log training curves (loss/metrics vs epochs) as artifacts.
+    confusion_matrix: true        # When true, log confusion matrices from evaluation.
+    class_distribution: true      # When true, log label distribution plots.
+    feature_importance: false     # Placeholder for future feature-importance logging.
+
+  model_registry:
+    register_model: true                 # When true, attempt to register the trained model in the MLflow Model Registry.
+    model_name_pattern: "{asset}_predictor"  # Template for MLflow registered model name.
+
+# Evaluation Configuration
+evaluation:  # Post-training evaluation and calibration settings.
+  metrics:
+    - "accuracy"             # Overall accuracy for each head.
+    - "precision_per_class"  # Per-class precision metrics.
+    - "recall_per_class"     # Per-class recall metrics.
+    - "f1_per_class"         # Per-class F1 metrics.
+    - "confusion_matrix"     # Full confusion matrices.
+
+  calibration_analysis:
+    enabled: true  # When true, compute calibration curves and summary statistics.
+    n_bins: 10     # Number of probability bins used for calibration analysis.
+
+  post_hoc_calibration:
+    enabled: false  # When true, apply temperature scaling to calibrate predictions.
+    method: "temperature_scaling"  # Calibration method: "temperature_scaling" or "isotonic" (future).
+    fit_on_validation: true  # If true, fit temperature on validation set; otherwise on test set.
+    min_samples: 500  # Minimum samples required to fit temperature scaling reliably.
+    temperature_bounds:
+      min: 0.1  # Minimum temperature value during optimization.
+      max: 10.0  # Maximum temperature value during optimization.
+
+  temporal_degradation:
+    enabled: false  # When true, analyze model performance degradation over time.
+    num_windows: 5  # Number of chronological windows to evaluate.
+    overlap_fraction: 0.0  # Overlap between consecutive windows (0.0 to 0.5).
+    log_per_window_metrics: true  # Log detailed metrics for each window to MLflow.
+
+  missing_snapshot_strategy: "fail"  # Behaviour when snapshot-based inputs are unavailable during evaluation.
+
+  backtesting:
+    enabled: false              # When true, run backtesting simulation after evaluation.
+    horizon_steps: 180           # Number of steps to hold positions in backtest (e.g., prediction_horizon_seconds / cadence_seconds).
+    initial_capital: 10000      # Starting capital for backtesting simulation.
+    transaction_cost: 0.001     # Per-trade proportional transaction cost (0.001 = 0.1%).
+    signal_strategy: "net_intensity"  # Strategy for signal generation: "net_intensity" or "threshold".
+    signal_threshold: 0.6       # Probability threshold for threshold strategy (ignored for net_intensity).
+    intensity_threshold: 1      # Minimum intensity class for action (0=any, 1=1%+, 2=2%+, 3=5%+).
+    position_sizing: "equal"    # Position sizing method: "equal" (fixed) or "confidence" (scale by probability).
+    max_position_pct: 1.0       # Maximum capital per position as a fraction (1.0 = all-in).
+
+# Data Diagnostics Configuration
+diagnostics:  # Controls pre-training data quality checks and their logging.
+  enabled: true  # When true, run diagnostics on snapshot-level data before training.
+  execution_mode: "standalone"  # Diagnostics execution: "standalone" (single full-range pass) or "per_snapshot" (run after each prepared snapshot/window).
+
+  sampling:
+    method: "uniform"   # How to sample indices for diagnostics: "uniform" grid or "random" subset of training indices.
+    num_samples: 500     # Number of training snapshots to sample for diagnostics.
+    random_seed: 42      # Seed for random sampling to ensure reproducibility.
+
+  spread_checks:
+    suspicious_threshold_pct: 1.0  # Spread percentage above which snapshots are flagged as suspicious.
+    high_spread_threshold_pct: 5.0 # Spread percentage considered high; used for quality metrics.
+    max_high_spread_fraction: 0.05 # Maximum acceptable fraction of high-spread snapshots.
+
+  quantity_checks:
+    enable_negative_checks: true  # When true, track statistics about negative prices/quantities.
+    enable_zero_stats: true       # When true, track statistics about zero prices/quantities.
+
+  outlier_checks:
+    enabled: true          # When true, run z-score based outlier detection on non-zero prices.
+    z_score_threshold: 3.0 # Z-score threshold above which observations are considered outliers.
+    min_nonzero_points: 10 # Minimum number of non-zero points required before computing outlier statistics.
+
+  anomaly_export:
+    enabled: true     # When true, export a CSV of the most severe anomalies.
+    max_samples: 100  # Maximum number of anomaly records to export.
+
+  visualization:
+    enabled: true     # When true, generate and log diagnostic plots.
+    time_series: true # When true, generate time-series plots of prices, spreads, and quantities.
+    histograms: true  # When true, generate histograms of non-zero prices.
+    histogram_bins: 50  # Number of bins for price histograms.
+    heatmaps:
+      enabled: true      # When true, compute 2D histograms/heatmaps.
+      types:
+        - "spread_vs_time"   # Heatmap of spread vs time.
+        - "spread_vs_label"  # Heatmap of spread vs label (if labels available).
+      num_time_bins: 50       # Number of bins along the time axis in heatmaps.
+      num_spread_bins: 50     # Number of bins along the spread axis in heatmaps.
+
+    spread_clipping:
+      enabled: true  # When true, apply sigma-based clipping to spreads for plotting.
+      num_sigma: 5.0 # Number of standard deviations used for clipping.
+
+    depth_heatmap:
+      enabled: true    # When true, compute depth-related heatmaps.
+      num_price_bins: 50  # Number of price bins along the depth axis.
+
+  label_checks:
+    enabled: true              # When true, sample and visualise example labels.
+    num_examples: 3            # Number of label examples to include.
+    max_examples_per_figure: 5 # Maximum number of examples per figure.
+
+  gap_checks:
+    enabled: true              # When true, compute statistics on time gaps between snapshots.
+    large_gap_multiplier: 2.0  # Multiple of cadence_seconds defining a "large" gap.
+    very_large_gap_multiplier: 6.0  # Multiple of cadence_seconds defining a "very large" gap.
+
+# Logging Configuration
+logging:  # Application logging verbosity and colour settings.
+  format: "colored"      # Log output format: "colored" for human-readable ANSI output, "json" for structured JSON lines (production).
+  level: "INFO"          # Global log level: DEBUG, INFO, WARNING, ERROR.
+  colored_output: true    # When true, use ANSI colours in log messages.
+  log_function_names: true  # When true, include function names in log messages for easier tracing.
+
+  colors:
+    function_names: "cyan"        # Colour for function names in logs.
+    parameter_names: "yellow"     # Colour for parameter names in logs.
+    parameter_values: "green"     # Colour for parameter values in logs.
+    info: "green"                 # Colour for INFO messages.
+    warning: "yellow"             # Colour for WARNING messages.
+    error: "red"                  # Colour for ERROR messages.
+    debug: "blue"                 # Colour for DEBUG messages.
+
+# Security Configuration
+security:  # Required environment variables and startup validation behaviour.
+  environment_variables:
+    - "DATABASE_URI"              # URI for the primary GreptimeDB instance.
+    - "MLFLOW_TRACKING_URI"       # MLflow tracking server URI.
+    - "MLFLOW_TRACKING_USERNAME"  # Username for authenticating with MLflow (if required).
+    - "MLFLOW_TRACKING_PASSWORD"  # Password or token for MLflow (if required).
+
+  validation:
+    check_env_vars_at_startup: true  # When true, validate that all listed environment variables are set before proceeding.
+    fail_if_missing: true            # When true, abort startup if any required environment variable is missing.

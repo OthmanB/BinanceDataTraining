@@ -72,15 +72,13 @@ def _build_base_config(snapshot_dir: str) -> dict:
                 }
             },
             "cnn": {
-                "num_layers": 1,
-                "filters": [8],
-                "kernel_sizes": [[3, 3]],
-                "pool_sizes": [[2, 2]],
                 "activation": "relu",
-                "dropout_rates": [0.0],
+                "layers": [
+                    {"filters": 8, "kernel_size": [3, 3], "pool_size": [2, 2], "normalization": None, "dropout": 0.0},
+                ],
             },
-            "lstm": {"units": 4, "dropout": 0.0, "recurrent_dropout": 0.0},
-            "dense": {"layers": [], "dropout_rates": []},
+            "lstm": {"layers": [{"units": 4, "dropout": 0.0, "recurrent_dropout": 0.0, "post_dropout": 0.0}]},
+            "dense": {"layers": []},
             "long_term": {
                 "enabled": False,
                 "windows_days": [7, 30, 90],
@@ -89,7 +87,10 @@ def _build_base_config(snapshot_dir: str) -> dict:
                 "summary_method": "mean",
                 "ewma_halflife_days": 7.0,
                 "input_dim": None,
-                "dense": {"layers": [32], "dropout_rates": [0.2]},
+                "architecture": {
+                    "conv1d": {"activation": "relu", "layers": []},
+                    "dense": {"layers": [{"units": 32, "dropout": 0.2}]},
+                },
             },
             "output": {"type": "two_head_intensity", "num_classes": 2, "activation": "softmax"},
             "compilation": {

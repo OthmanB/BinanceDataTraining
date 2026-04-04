@@ -1,8 +1,8 @@
-"""Model evaluation skeleton."""
+"""Model evaluation utilities."""
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 import json
 import logging
 from pathlib import Path
@@ -11,12 +11,12 @@ import os
 
 import numpy as np
 
-from preprocessing.train_test_split import chronological_split_indices
+from preprocessing.train_test_split import chronological_split_indices, compute_split_boundaries
 from training.snapshot_dataset import (
     NormalizationStats,
     compute_normalization_stats,
     get_mask_channel_info,
-    iter_snapshot_batches,
+    iter_snapshot_minibatches,
     load_normalization_stats,
     prepare_snapshot_dataset,
     save_normalization_stats,
@@ -33,6 +33,7 @@ from preprocessing.snapshot_sequence_builder import (
     build_hybrid_depth_sequence_tensor,
 )
 from preprocessing.feature_engineering import FeatureEngineer
+from mlflow_integration.safe_fluent import get_mlflow_if_active
 from .calibration import (
     compute_calibration_metrics,
     fit_temperature,
@@ -48,19 +49,73 @@ CALIBRATION_MEMORY_WARN_THRESHOLD = 1_000_000
 BACKTEST_MEMORY_WARN_THRESHOLD = 1_000_000
 
 
-def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, Any]) -> None:
-    """Evaluate a trained model.
+def _resolve_min_predict_batch_size(model: Any) -> int:
+    """Return the minimum safe batch size for ``model.predict``.
 
-    Phase 3: placeholder that logs invocation only.
+    Under mirrored/distributed strategies, very small batches can produce empty
+    per-replica tensors on some devices, which may fail inside Conv kernels.
     """
+    try:
+        strategy = getattr(model, "distribute_strategy", None)
+    except Exception:  # noqa: BLE001
+        # Model introspection may fail on non-TF models or custom wrappers
+        strategy = None
 
-    metadata = data_object["metadata"]
-    n_samples = int(metadata["num_samples"])
+    if strategy is None:
+        return 1
 
-    if n_samples <= 0:
-        logger.info("evaluate_model invoked with num_samples=0, skipping evaluation.")
-        return
+    try:
+        replicas = int(getattr(strategy, "num_replicas_in_sync", 1))
+    except Exception:  # noqa: BLE001
+        # Strategy attribute access may fail on custom or incompatible strategies
+        replicas = 1
 
+    return max(1, replicas)
+
+
+def _predict_two_head_with_safe_batching(
+    model: Any,
+    x_batch: np.ndarray,
+    *,
+    lt_batch: Optional[np.ndarray],
+    batch_size: int,
+    min_predict_batch_size: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Predict two-head probabilities with optional padding for tiny batches."""
+    sample_count = int(x_batch.shape[0])
+    if sample_count <= 0:
+        raise ValueError("Cannot run prediction on an empty batch")
+
+    x_input = x_batch
+    lt_input = lt_batch
+
+    if sample_count < int(min_predict_batch_size):
+        pad_count = int(min_predict_batch_size) - sample_count
+        x_pad = np.repeat(x_batch[-1:], pad_count, axis=0)
+        x_input = np.concatenate([x_batch, x_pad], axis=0)
+
+        if lt_batch is not None:
+            lt_pad = np.repeat(lt_batch[-1:], pad_count, axis=0)
+            lt_input = np.concatenate([lt_batch, lt_pad], axis=0)
+
+    model_input: Any
+    if lt_input is not None:
+        model_input = [x_input, lt_input]
+    else:
+        model_input = x_input
+
+    effective_batch_size = max(1, min(int(batch_size), int(x_input.shape[0])))
+    y_pred = model.predict(model_input, batch_size=effective_batch_size, verbose=0)
+    if not isinstance(y_pred, (list, tuple)) or len(y_pred) != 2:
+        raise ValueError("Expected model.predict to return two outputs for two_head_intensity")
+
+    y_prob_up = np.asarray(y_pred[0], dtype="float64")
+    y_prob_down = np.asarray(y_pred[1], dtype="float64")
+
+    return y_prob_up[:sample_count], y_prob_down[:sample_count]
+
+
+def _resolve_eval_indices(config: Dict[str, Any], n_samples: int) -> List[int]:
     eval_cfg = config["evaluation"]
     missing_snapshot_strategy = str(eval_cfg["missing_snapshot_strategy"])
     if missing_snapshot_strategy not in ("fail", "skip", "synthetic"):
@@ -68,7 +123,6 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
             "evaluation.missing_snapshot_strategy must be one of 'fail', 'skip', or 'synthetic'",
         )
 
-    # Recompute chronological train/validation/test splits from configuration.
     split_cfg = config["preprocessing"]["train_test_split"]
     train_ratio = float(split_cfg["train_ratio"])
     validation_ratio = float(split_cfg["validation_ratio"])
@@ -80,52 +134,57 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
         validation_ratio,
         test_ratio,
     )
-
     if not test_idx:
-        logger.info("No test samples available for evaluation; skipping evaluation.")
-        return
+        return []
 
-    training_cfg = config["training"]
-    debug_max_samples = int(training_cfg["debug_max_samples"])
-
-    # Limit evaluation to a reasonable number of samples.
+    debug_max_samples = int(config["training"]["debug_max_samples"])
     eval_n = min(len(test_idx), debug_max_samples)
+    return list(test_idx[:eval_n])
 
-    model_cfg = config["model"]
+
+def _resolve_eval_input_dimensions(model_cfg: Dict[str, Any]) -> Tuple[int, int, int]:
     output_cfg = model_cfg["output"]
     output_type = str(output_cfg["type"])
     if output_type != "two_head_intensity":
         raise ValueError("Only model.output.type='two_head_intensity' is supported in the evaluation pipeline")
 
     cnn_cfg = model_cfg["cnn"]
-    kernel_sizes = cnn_cfg["kernel_sizes"]
-    pool_sizes = cnn_cfg["pool_sizes"]
+    cnn_layers = cnn_cfg["layers"]
+    if not isinstance(cnn_layers, list) or not cnn_layers:
+        raise ValueError("model.cnn.layers must be a non-empty list in configuration")
 
-    if not isinstance(kernel_sizes, list) or not kernel_sizes:
-        raise ValueError("model.cnn.kernel_sizes must be a non-empty list in configuration")
-    if not isinstance(pool_sizes, list) or not pool_sizes:
-        raise ValueError("model.cnn.pool_sizes must be a non-empty list in configuration")
+    kernel_sizes = [layer["kernel_size"] for layer in cnn_layers]
+    pool_sizes = [layer["pool_size"] for layer in cnn_layers if layer.get("pool_size") is not None]
 
-    heights = [int(k[0]) for k in kernel_sizes]
-    widths = [int(k[1]) for k in kernel_sizes]
-
-    pool_heights = [int(p[0]) for p in pool_sizes]
-    pool_widths = [int(p[1]) for p in pool_sizes]
+    heights = [int(kernel[0]) for kernel in kernel_sizes]
+    widths = [int(kernel[1]) for kernel in kernel_sizes]
+    pool_heights = [int(pool[0]) for pool in pool_sizes] if pool_sizes else [1]
+    pool_widths = [int(pool[1]) for pool in pool_sizes] if pool_sizes else [1]
 
     min_height = 1
-    for ph in pool_heights:
-        min_height *= ph
+    for pool_height in pool_heights:
+        min_height *= pool_height
 
     min_width = 1
-    for pw in pool_widths:
-        min_width *= pw
+    for pool_width in pool_widths:
+        min_width *= pool_width
 
     height = max(max(heights), min_height)
     width = max(max(widths), min_width)
     channels = 1
+    return height, width, channels
 
-    # Map snapshot-level features for the target asset into the evaluation
-    # tensor, using the same snapshot index space as the labels.
+
+def _build_eval_input_tensor(
+    config: Dict[str, Any],
+    data_object: Dict[str, Any],
+    eval_indices: List[int],
+    height: int,
+    width: int,
+    channels: int,
+) -> np.ndarray:
+    metadata = data_object["metadata"]
+    eval_n = len(eval_indices)
     data_cfg = config["data"]
     asset_pairs_cfg = data_cfg["asset_pairs"]
     target_asset = str(asset_pairs_cfg["target_asset"])
@@ -133,25 +192,21 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
     target_book: Dict[str, Any] = order_books.get(target_asset, {})
     snapshot_features: list[Any] = target_book.get("snapshot_features") or []
     snapshot_depth_data: list[Any] = target_book.get("snapshot_depth_data") or []
-
-    eval_indices = test_idx[:eval_n]
-    x_eval = None
-
-    order_book_cfg = data_cfg["order_book"]
-    representation = str(order_book_cfg["representation"])
-
     anchor_indices = metadata.get("anchor_indices")
     if anchor_indices is None:
         raise ValueError(
             "metadata.anchor_indices must be populated by the preprocessing pipeline when snapshot features are present",
         )
 
+    missing_snapshot_strategy = str(config["evaluation"]["missing_snapshot_strategy"])
+    representation = str(data_cfg["order_book"]["representation"])
+
     if representation == "hybrid":
         if snapshot_depth_data:
             logger.info(
                 "Building evaluation inputs from snapshot_depth_data (target_asset=%s). test_samples=%s, eval_n=%s",
                 target_asset,
-                len(test_idx),
+                len(eval_indices),
                 eval_n,
             )
             x_eval = build_hybrid_depth_sequence_tensor(
@@ -166,13 +221,8 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
                     "No snapshot_depth_data available for evaluation inputs for target asset; "
                     "set evaluation.missing_snapshot_strategy to 'skip' or 'synthetic' to change this behavior.",
                 )
-
             if missing_snapshot_strategy == "skip":
-                logger.info(
-                    "No snapshot_depth_data available for evaluation inputs; skipping evaluation stage because "
-                    "evaluation.missing_snapshot_strategy='skip'.",
-                )
-                return
+                raise ValueError("__EVAL_SKIP__")
 
             time_range_cfg = data_cfg["time_range"]
             cadence_seconds = int(time_range_cfg["cadence_seconds"])
@@ -206,10 +256,9 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
             logger.info(
                 "Building evaluation inputs from snapshot_features (target_asset=%s). test_samples=%s, eval_n=%s",
                 target_asset,
-                len(test_idx),
+                len(eval_indices),
                 eval_n,
             )
-
             x_eval = build_top_of_book_sequence_tensor(
                 config=config,
                 snapshot_features=snapshot_features,
@@ -225,13 +274,8 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
                     "No snapshot_features available for evaluation inputs for target asset; "
                     "set evaluation.missing_snapshot_strategy to 'skip' or 'synthetic' to change this behavior.",
                 )
-
             if missing_snapshot_strategy == "skip":
-                logger.info(
-                    "No snapshot_features available for evaluation inputs; skipping evaluation stage because "
-                    "evaluation.missing_snapshot_strategy='skip'.",
-                )
-                return
+                raise ValueError("__EVAL_SKIP__")
 
             time_range_cfg = data_cfg["time_range"]
             cadence_seconds = int(time_range_cfg["cadence_seconds"])
@@ -260,69 +304,87 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
             )
             x_eval = np.random.randn(eval_n, window_steps, height, width, channels).astype("float32")
 
-    if x_eval is None:
-        raise ValueError("Evaluation inputs could not be constructed; x_eval is None")
+    if x_eval.ndim != 5:
+        raise ValueError(
+            "Evaluation input tensor must have shape (N, T, H, W, C); "
+            f"got x_eval.ndim={x_eval.ndim}, shape={x_eval.shape!r}",
+        )
+    return x_eval
 
-    # Optionally integrate feature engineering derived features into the input
-    # channels, mirroring the training pipeline behavior.
+
+def _integrate_feature_engineering_eval_inputs(
+    config: Dict[str, Any],
+    data_object: Dict[str, Any],
+    x_eval: np.ndarray,
+    eval_indices: List[int],
+) -> np.ndarray:
     fe_cfg = config["preprocessing"]["feature_engineering"]
-    if bool(fe_cfg["enabled"]):
-        try:
-            feature_engineer = FeatureEngineer(config)
+    if not bool(fe_cfg["enabled"]):
+        return x_eval
 
-            snapshot_derived_features = target_book.get("snapshot_derived_features")
-            volume_proxy = target_book.get("volume_proxy")
-            mid_prices_list = target_book.get("mid_prices")
+    data_cfg = config["data"]
+    target_asset = str(data_cfg["asset_pairs"]["target_asset"])
+    order_books = data_object.get("order_books", {})
+    target_book: Dict[str, Any] = order_books.get(target_asset, {})
+    snapshot_depth_data: list[Any] = target_book.get("snapshot_depth_data") or []
 
-            if snapshot_derived_features and volume_proxy and mid_prices_list:
-                mid_prices_arr = np.asarray(mid_prices_list, dtype="float64")
-                anchor_indices_list = list(anchor_indices)
-                cadence_seconds = int(data_cfg["time_range"]["cadence_seconds"])
+    try:
+        feature_engineer = FeatureEngineer(config)
+        snapshot_derived_features = target_book.get("snapshot_derived_features")
+        volume_proxy = target_book.get("volume_proxy")
+        mid_prices_list = target_book.get("mid_prices")
+        anchor_indices = list(data_object["metadata"]["anchor_indices"])
 
-                all_features = feature_engineer.compute_all_features(
-                    snapshot_depth_data=snapshot_depth_data,
-                    mid_prices=mid_prices_arr,
-                    anchor_indices=anchor_indices_list,
-                    cadence_seconds=cadence_seconds,
-                )
-
-                if all_features is not None and all_features.shape[0] > 0:
-                    fe_eval = all_features[eval_indices].astype("float32")
-
-                    if x_eval.ndim == 5:
-                        _, t_steps, h_dim, w_dim, _ = x_eval.shape
-                        fe_eval_exp = fe_eval[:, None, None, None, :]
-                        fe_eval_broadcast = np.broadcast_to(
-                            fe_eval_exp,
-                            (fe_eval.shape[0], t_steps, h_dim, w_dim, fe_eval.shape[1]),
-                        )
-                        x_eval = np.concatenate(
-                            [x_eval, fe_eval_broadcast.astype("float32")], axis=-1
-                        )
-
-                        logger.info(
-                            "Integrated feature engineering features into evaluation inputs: "
-                            "n_features=%s, x_eval.shape=%s",
-                            fe_eval.shape[1],
-                            x_eval.shape,
-                        )
-            else:
-                logger.info(
-                    "Feature engineering skipped for evaluation: missing snapshot_derived_features, "
-                    "volume_proxy, or mid_prices from preprocessing."
-                )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "Feature engineering integration failed during evaluation: %s. Continuing without derived features.",
-                exc,
+        if snapshot_derived_features and volume_proxy and mid_prices_list:
+            mid_prices_arr = np.asarray(mid_prices_list, dtype="float64")
+            cadence_seconds = int(data_cfg["time_range"]["cadence_seconds"])
+            all_features = feature_engineer.compute_all_features(
+                snapshot_depth_data=snapshot_depth_data,
+                mid_prices=mid_prices_arr,
+                anchor_indices=anchor_indices,
+                cadence_seconds=cadence_seconds,
             )
 
-    # Optionally integrate temporal features into the evaluation input channels
-    # according to the model.input_representation.temporal_features
-    # configuration.
+            if all_features is not None and all_features.shape[0] > 0:
+                fe_eval = all_features[eval_indices].astype("float32")
+                if x_eval.ndim == 5:
+                    _, t_steps, h_dim, w_dim, _ = x_eval.shape
+                    fe_eval_exp = fe_eval[:, None, None, None, :]
+                    fe_eval_broadcast = np.broadcast_to(
+                        fe_eval_exp,
+                        (fe_eval.shape[0], t_steps, h_dim, w_dim, fe_eval.shape[1]),
+                    )
+                    x_eval = np.concatenate([x_eval, fe_eval_broadcast.astype("float32")], axis=-1)
+                    logger.info(
+                        "Integrated feature engineering features into evaluation inputs: "
+                        "n_features=%s, x_eval.shape=%s",
+                        fe_eval.shape[1],
+                        x_eval.shape,
+                    )
+        else:
+            logger.info(
+                "Feature engineering skipped for evaluation: missing snapshot_derived_features, "
+                "volume_proxy, or mid_prices from preprocessing."
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Feature engineering integration failed during evaluation: %s. Continuing without derived features.",
+            exc,
+        )
+
+    return x_eval
+
+
+def _integrate_temporal_features_eval_inputs(
+    config: Dict[str, Any],
+    data_object: Dict[str, Any],
+    x_eval: np.ndarray,
+    eval_indices: List[int],
+    n_samples: int,
+) -> np.ndarray:
+    model_cfg = config["model"]
     ir_cfg = model_cfg["input_representation"]
     tf_cfg = ir_cfg["temporal_features"]
-
     integration_mode = str(tf_cfg["integration_mode"])
     use_local = bool(tf_cfg["use_local_features"])
     use_global = bool(tf_cfg["use_global_features"])
@@ -333,79 +395,73 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
             f"got {integration_mode!r}",
         )
 
-    if integration_mode == "concat_channels":
-        temporal_features = data_object.get("temporal_features")
-        if not isinstance(temporal_features, dict):
-            raise ValueError(
-                "data_object.temporal_features must be a dict when temporal feature integration is enabled; "
-                f"got {type(temporal_features)!r}",
-            )
+    if integration_mode != "concat_channels":
+        return x_eval
 
-        local_arr = temporal_features.get("local")
-        global_arr = temporal_features.get("global")
+    temporal_features = data_object.get("temporal_features")
+    if not isinstance(temporal_features, dict):
+        raise ValueError(
+            "data_object.temporal_features must be a dict when temporal feature integration is enabled; "
+            f"got {type(temporal_features)!r}",
+        )
 
-        if use_local:
-            if local_arr is None:
-                raise ValueError(
-                    "Temporal feature integration is configured to use_local_features=True but "
-                    "data_object.temporal_features.local is missing.",
-                )
-        if use_global:
-            if global_arr is None:
-                raise ValueError(
-                    "Temporal feature integration is configured to use_global_features=True but "
-                    "data_object.temporal_features.global is missing.",
-                )
+    local_arr = temporal_features.get("local")
+    global_arr = temporal_features.get("global")
+    if use_local and local_arr is None:
+        raise ValueError(
+            "Temporal feature integration is configured to use_local_features=True but "
+            "data_object.temporal_features.local is missing.",
+        )
+    if use_global and global_arr is None:
+        raise ValueError(
+            "Temporal feature integration is configured to use_global_features=True but "
+            "data_object.temporal_features.global is missing.",
+        )
 
-        feature_matrices = []
-        if use_local and local_arr is not None:
-            local_np = np.asarray(local_arr, dtype="float32")
-            feature_matrices.append(local_np)
-        if use_global and global_arr is not None:
-            global_np = np.asarray(global_arr, dtype="float32")
-            feature_matrices.append(global_np)
+    feature_matrices = []
+    if use_local and local_arr is not None:
+        feature_matrices.append(np.asarray(local_arr, dtype="float32"))
+    if use_global and global_arr is not None:
+        feature_matrices.append(np.asarray(global_arr, dtype="float32"))
 
-        if feature_matrices:
-            tf_all = np.concatenate(feature_matrices, axis=1)
-            if tf_all.shape[0] != n_samples:
-                raise ValueError(
-                    "Temporal feature matrices must have one row per sample; "
-                    f"got tf_all.shape={tf_all.shape}, num_samples={n_samples}",
-                )
+    if not feature_matrices:
+        return x_eval
 
-            tf_eval = tf_all[eval_indices]
-            tf_eval = np.asarray(tf_eval, dtype="float32")
+    tf_all = np.concatenate(feature_matrices, axis=1)
+    if tf_all.shape[0] != n_samples:
+        raise ValueError(
+            "Temporal feature matrices must have one row per sample; "
+            f"got tf_all.shape={tf_all.shape}, num_samples={n_samples}",
+        )
 
-            if x_eval.ndim != 5:
-                raise ValueError(
-                    "Evaluation input tensor must have rank 5 before temporal feature integration; "
-                    f"got x_eval.ndim={x_eval.ndim}, shape={x_eval.shape!r}",
-                )
-
-            _, t_steps, h_dim, w_dim, _ = x_eval.shape
-            tf_eval_exp = tf_eval[:, None, None, None, :]
-            tf_eval_broadcast = np.broadcast_to(
-                tf_eval_exp,
-                (tf_eval.shape[0], t_steps, h_dim, w_dim, tf_eval.shape[1]),
-            )
-            x_eval = np.concatenate([x_eval, tf_eval_broadcast.astype("float32")], axis=-1)
-
-            logger.info(
-                "Integrated temporal features into evaluation inputs via concat_channels: "
-                "eval_n=%s, feature_dim=%s",
-                eval_n,
-                tf_all.shape[1],
-            )
-
+    tf_eval = np.asarray(tf_all[eval_indices], dtype="float32")
     if x_eval.ndim != 5:
         raise ValueError(
-            "Evaluation input tensor must have shape (N, T, H, W, C); "
+            "Evaluation input tensor must have rank 5 before temporal feature integration; "
             f"got x_eval.ndim={x_eval.ndim}, shape={x_eval.shape!r}",
         )
 
-    num_classes = int(output_cfg["num_classes"])
+    _, t_steps, h_dim, w_dim, _ = x_eval.shape
+    tf_eval_exp = tf_eval[:, None, None, None, :]
+    tf_eval_broadcast = np.broadcast_to(
+        tf_eval_exp,
+        (tf_eval.shape[0], t_steps, h_dim, w_dim, tf_eval.shape[1]),
+    )
+    x_eval = np.concatenate([x_eval, tf_eval_broadcast.astype("float32")], axis=-1)
+    logger.info(
+        "Integrated temporal features into evaluation inputs via concat_channels: eval_n=%s, feature_dim=%s",
+        len(eval_indices),
+        tf_all.shape[1],
+    )
+    return x_eval
 
-    # Labels are built during preprocessing and stored in the DataObject.
+
+def _extract_eval_targets(
+    data_object: Dict[str, Any],
+    eval_indices: List[int],
+    num_classes: int,
+    split_sample_count: int,
+) -> Tuple[np.ndarray, np.ndarray]:
     targets = data_object.get("targets")
     if targets is None:
         raise ValueError("data_object.targets must be populated by the preprocessing pipeline")
@@ -417,15 +473,14 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
             "data_object.targets.labels_up_intensity and labels_down_intensity must be populated by the preprocessing pipeline",
         )
 
-    if len(labels_up_list) < len(test_idx) or len(labels_down_list) < len(test_idx):
+    if len(labels_up_list) < split_sample_count or len(labels_down_list) < split_sample_count:
         raise ValueError(
             "Intensity label arrays must have length at least the number of samples used for splitting; "
-            f"got labels_up={len(labels_up_list)}, labels_down={len(labels_down_list)}, n_samples={len(test_idx)}",
+            f"got labels_up={len(labels_up_list)}, labels_down={len(labels_down_list)}, n_samples={split_sample_count}",
         )
 
     labels_up_arr = np.asarray(labels_up_list, dtype="int64")
     labels_down_arr = np.asarray(labels_down_list, dtype="int64")
-
     if labels_up_arr.min() < 0 or labels_up_arr.max() >= num_classes:
         raise ValueError(
             "labels_up_intensity values must be in the range [0, num_classes-1]; "
@@ -437,9 +492,424 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
             f"observed min={labels_down_arr.min()}, max={labels_down_arr.max()}, num_classes={num_classes}",
         )
 
-    # Restrict to the evaluation subset defined by the test indices and debug_max_samples.
-    y_true_up = labels_up_arr[eval_indices]
-    y_true_down = labels_down_arr[eval_indices]
+    return labels_up_arr[eval_indices], labels_down_arr[eval_indices]
+
+
+def _compute_prediction_metrics(
+    y_prob: np.ndarray,
+    y_true: np.ndarray,
+    num_classes: int,
+) -> Tuple[np.ndarray, float, np.ndarray, List[float], List[float], List[float], float, float, float]:
+    y_pred = np.argmax(y_prob, axis=1)
+    accuracy = float(np.mean(y_pred == y_true)) if y_true.shape[0] > 0 else 0.0
+    confusion = np.zeros((num_classes, num_classes), dtype=int)
+    for truth, pred in zip(y_true, y_pred):
+        if 0 <= truth < num_classes and 0 <= pred < num_classes:
+            confusion[truth, pred] += 1
+
+    per_class_precision, per_class_recall, per_class_f1 = _compute_class_metrics(confusion)
+    macro_precision = float(np.mean(per_class_precision)) if per_class_precision else 0.0
+    macro_recall = float(np.mean(per_class_recall)) if per_class_recall else 0.0
+    macro_f1 = float(np.mean(per_class_f1)) if per_class_f1 else 0.0
+    return (
+        y_pred,
+        accuracy,
+        confusion,
+        per_class_precision,
+        per_class_recall,
+        per_class_f1,
+        macro_precision,
+        macro_recall,
+        macro_f1,
+    )
+
+
+def _build_evaluation_metrics_payload(
+    accuracy_up: float,
+    macro_precision_up: float,
+    macro_recall_up: float,
+    macro_f1_up: float,
+    accuracy_down: float,
+    macro_precision_down: float,
+    macro_recall_down: float,
+    macro_f1_down: float,
+    per_class_precision_up: List[float],
+    per_class_recall_up: List[float],
+    per_class_f1_up: List[float],
+    per_class_precision_down: List[float],
+    per_class_recall_down: List[float],
+    per_class_f1_down: List[float],
+    calibration_results_up: Optional[Dict[str, Any]],
+    calibration_results_down: Optional[Dict[str, Any]],
+) -> Dict[str, float]:
+    metrics: Dict[str, float] = {
+        "eval_up_accuracy": accuracy_up,
+        "eval_up_macro_precision": macro_precision_up,
+        "eval_up_macro_recall": macro_recall_up,
+        "eval_up_macro_f1": macro_f1_up,
+        "eval_down_accuracy": accuracy_down,
+        "eval_down_macro_precision": macro_precision_down,
+        "eval_down_macro_recall": macro_recall_down,
+        "eval_down_macro_f1": macro_f1_down,
+    }
+
+    for cls, (prec, rec, f1) in enumerate(zip(per_class_precision_up, per_class_recall_up, per_class_f1_up)):
+        metrics[f"eval_up_precision_class_{cls}"] = prec
+        metrics[f"eval_up_recall_class_{cls}"] = rec
+        metrics[f"eval_up_f1_class_{cls}"] = f1
+    for cls, (prec, rec, f1) in enumerate(zip(per_class_precision_down, per_class_recall_down, per_class_f1_down)):
+        metrics[f"eval_down_precision_class_{cls}"] = prec
+        metrics[f"eval_down_recall_class_{cls}"] = rec
+        metrics[f"eval_down_f1_class_{cls}"] = f1
+
+    if calibration_results_up is not None:
+        try:
+            metrics["eval_up_brier_score"] = float(calibration_results_up["brier_score"])
+            metrics["eval_up_ece"] = float(calibration_results_up["ece"])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to extract up-head calibration metrics for MLFlow logging: %s", exc)
+    if calibration_results_down is not None:
+        try:
+            metrics["eval_down_brier_score"] = float(calibration_results_down["brier_score"])
+            metrics["eval_down_ece"] = float(calibration_results_down["ece"])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to extract down-head calibration metrics for MLFlow logging: %s", exc)
+
+    return metrics
+
+
+def _resolve_confusion_matrix_logging(config: Dict[str, Any]) -> bool:
+    try:
+        mlflow_cfg = config["mlflow"]
+        artifact_logging_cfg = mlflow_cfg["artifact_logging"]
+        return bool(artifact_logging_cfg["confusion_matrix"])
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _log_confusion_matrix_artifacts(
+    mlflow: Any,
+    confusion_up: np.ndarray,
+    confusion_down: np.ndarray,
+    *,
+    tmp_prefix: str,
+    success_message: str,
+) -> None:
+    try:
+        with tempfile.TemporaryDirectory(prefix=tmp_prefix) as tmp_dir_str:
+            tmp_dir = Path(tmp_dir_str)
+            cm_up_path = tmp_dir / "confusion_matrix_up.csv"
+            cm_down_path = tmp_dir / "confusion_matrix_down.csv"
+            np.savetxt(cm_up_path, confusion_up, fmt="%d", delimiter=",")
+            np.savetxt(cm_down_path, confusion_down, fmt="%d", delimiter=",")
+            mlflow.log_artifact(str(cm_up_path), artifact_path="evaluation")
+            mlflow.log_artifact(str(cm_down_path), artifact_path="evaluation")
+            logger.info(success_message, cm_up_path, cm_down_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to log confusion matrix artifacts to MLFlow: %s", exc)
+
+
+def _log_evaluation_calibration_curve_artifacts(
+    mlflow: Any,
+    calibration_results_up: Optional[Dict[str, Any]],
+    calibration_results_down: Optional[Dict[str, Any]],
+) -> None:
+    try:
+        with tempfile.TemporaryDirectory(prefix="eval_calibration_curves_") as tmp_dir_str:
+            tmp_dir = Path(tmp_dir_str)
+
+            if calibration_results_up is not None:
+                calib_up_path = tmp_dir / "calibration_curve_up.csv"
+                _write_calibration_curve(calibration_results_up, calib_up_path)
+                mlflow.log_artifact(str(calib_up_path), artifact_path="evaluation")
+                logger.info("Logged evaluation up-head calibration curve artifact to MLFlow at %s", calib_up_path)
+
+            if calibration_results_down is not None:
+                calib_down_path = tmp_dir / "calibration_curve_down.csv"
+                _write_calibration_curve(calibration_results_down, calib_down_path)
+                mlflow.log_artifact(str(calib_down_path), artifact_path="evaluation")
+                logger.info("Logged evaluation down-head calibration curve artifact to MLFlow at %s", calib_down_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to log calibration curve artifacts to MLFlow: %s", exc)
+
+
+def _resolve_snapshot_eval_writer() -> Optional[Any]:
+    writer = None
+    try:
+        from observability.run_state import get_run_state_writer
+
+        writer = get_run_state_writer()
+    except Exception:  # noqa: BLE001
+        # Observability module is optional; import may fail in minimal environments
+        writer = None
+    return writer
+
+
+def _map_anchor_timestamps_to_prices(
+    series_timestamps: np.ndarray,
+    series_prices: np.ndarray,
+    anchor_timestamps: np.ndarray,
+) -> np.ndarray:
+    if series_timestamps.ndim != 1 or series_prices.ndim != 1:
+        raise ValueError("Series timestamps and prices must be 1D arrays")
+    if series_timestamps.shape[0] != series_prices.shape[0]:
+        raise ValueError("Series timestamps and prices length mismatch")
+    if series_timestamps.shape[0] == 0:
+        raise ValueError("Series timestamps are empty; cannot map anchor timestamps")
+    if anchor_timestamps.ndim != 1:
+        raise ValueError("Anchor timestamps must be a 1D array")
+    if np.any(series_timestamps[1:] < series_timestamps[:-1]):
+        raise ValueError("Series timestamps must be sorted in ascending order")
+
+    indices = np.searchsorted(series_timestamps, anchor_timestamps)
+    valid = indices < series_timestamps.shape[0]
+    matches = np.zeros_like(valid, dtype=bool)
+    if np.any(valid):
+        matches[valid] = series_timestamps[indices[valid]] == anchor_timestamps[valid]
+    invalid = ~valid | ~matches
+    if np.any(invalid):
+        missing_count = int(np.sum(invalid))
+        raise ValueError(
+            "Anchor timestamps do not align with series timestamps: "
+            f"missing={missing_count}, total={anchor_timestamps.shape[0]}"
+        )
+    return series_prices[indices]
+
+
+def _get_or_compute_snapshot_normalization_stats(
+    context: Any,
+    manifest: Dict[str, Any],
+    snapshot_dataset: Any,
+    *,
+    stats_key: str,
+    start_index: int,
+    end_index: int,
+    batch_size: int,
+    method: str,
+    mask_start: int,
+    mask_count: int,
+) -> NormalizationStats:
+    stats_path = os.path.join(context.snapshot_dir, f"normalization_stats_{stats_key}.npz")
+    if os.path.exists(stats_path):
+        stats = load_normalization_stats(stats_path)
+    else:
+        stats = compute_normalization_stats(
+            snapshot_dataset,
+            start_index,
+            end_index,
+            batch_size,
+            method,
+            mask_start=mask_start,
+            mask_count=mask_count,
+        )
+        save_normalization_stats(stats_path, stats)
+
+    stats_meta = manifest.get("normalization_stats", {})
+    stats_meta[stats_key] = {
+        "method": stats.method,
+        "path": stats_path,
+        "start_index": int(start_index),
+        "end_index": int(end_index),
+    }
+    manifest["normalization_stats"] = stats_meta
+    save_manifest(context, manifest)
+    return stats
+
+
+def _collect_calibration_predictions_to_memmap(
+    snapshot_dataset: Any,
+    start_index: int,
+    end_index: int,
+    lt_features: Optional[np.ndarray],
+    stats: NormalizationStats,
+    *,
+    buffer_dir: str,
+    model: Any,
+    batch_size: int,
+    min_predict_batch_size: int,
+    num_classes: int,
+    mask_start: int,
+    mask_count: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    expected_len = end_index - start_index
+    if lt_features is not None and lt_features.shape[0] != expected_len:
+        raise ValueError(
+            "Long-term feature slice length does not match calibration range: "
+            f"features={lt_features.shape[0]}, expected={expected_len}"
+        )
+    if expected_len <= 0:
+        raise ValueError("Calibration range is empty")
+
+    logits_up = cast(
+        np.memmap,
+        np.lib.format.open_memmap(
+            os.path.join(buffer_dir, "calibration_logits_up.npy"),
+            mode="w+",
+            dtype="float64",
+            shape=(expected_len, num_classes),
+        ),
+    )
+    logits_down = cast(
+        np.memmap,
+        np.lib.format.open_memmap(
+            os.path.join(buffer_dir, "calibration_logits_down.npy"),
+            mode="w+",
+            dtype="float64",
+            shape=(expected_len, num_classes),
+        ),
+    )
+    labels_up = cast(
+        np.memmap,
+        np.lib.format.open_memmap(
+            os.path.join(buffer_dir, "calibration_labels_up.npy"),
+            mode="w+",
+            dtype="int64",
+            shape=(expected_len,),
+        ),
+    )
+    labels_down = cast(
+        np.memmap,
+        np.lib.format.open_memmap(
+            os.path.join(buffer_dir, "calibration_labels_down.npy"),
+            mode="w+",
+            dtype="int64",
+            shape=(expected_len,),
+        ),
+    )
+
+    current_idx = 0
+    for x_batch, y_true_up, y_true_down, _, _ in iter_snapshot_minibatches(
+        snapshot_dataset,
+        start_index,
+        end_index,
+        batch_size=batch_size,
+        drop_remainder=False,
+    ):
+        x_batch = _apply_normalization_snapshot(x_batch, stats, mask_start, mask_count)
+        if x_batch.shape[0] == 0:
+            continue
+
+        lt_batch: Optional[np.ndarray] = None
+        if lt_features is not None:
+            lt_batch = lt_features[current_idx : current_idx + x_batch.shape[0]]
+            if lt_batch.shape[0] != x_batch.shape[0]:
+                raise ValueError("Long-term feature batch size mismatch during calibration")
+
+        y_prob_up, y_prob_down = _predict_two_head_with_safe_batching(
+            model,
+            x_batch,
+            lt_batch=lt_batch,
+            batch_size=batch_size,
+            min_predict_batch_size=min_predict_batch_size,
+        )
+        if y_prob_up.shape[1] != num_classes or y_prob_down.shape[1] != num_classes:
+            raise ValueError("Prediction output classes do not match model.output.num_classes")
+
+        batch_len = int(x_batch.shape[0])
+        next_idx = current_idx + batch_len
+        if next_idx > expected_len:
+            raise ValueError(
+                "Calibration range overrun while buffering predictions: "
+                f"next_idx={next_idx}, expected_len={expected_len}"
+            )
+
+        logits_up[current_idx:next_idx] = probs_to_logits_proxy(y_prob_up)
+        logits_down[current_idx:next_idx] = probs_to_logits_proxy(y_prob_down)
+        labels_up[current_idx:next_idx] = np.asarray(y_true_up, dtype="int64")
+        labels_down[current_idx:next_idx] = np.asarray(y_true_down, dtype="int64")
+        current_idx = next_idx
+
+    if current_idx != expected_len:
+        raise ValueError(
+            "Calibration prediction count mismatch: processed={processed} expected={expected}".format(
+                processed=current_idx,
+                expected=expected_len,
+            )
+        )
+    if current_idx <= 0:
+        raise ValueError("No predictions collected for post-hoc calibration fitting")
+
+    try:
+        logits_up.flush()
+        logits_down.flush()
+        labels_up.flush()
+        labels_down.flush()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to flush calibration prediction buffers: %s", exc)
+
+    return logits_up, logits_down, labels_up, labels_down
+
+
+def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, Any]) -> None:
+    """Evaluate a trained model."""
+
+    metadata = data_object["metadata"]
+    n_samples = int(metadata["num_samples"])
+
+    if n_samples <= 0:
+        logger.info("evaluate_model invoked with num_samples=0, skipping evaluation.")
+        return
+
+    eval_cfg = config["evaluation"]
+    eval_indices = _resolve_eval_indices(config, n_samples)
+    if not eval_indices:
+        logger.info("No test samples available for evaluation; skipping evaluation.")
+        return
+
+    model_cfg = config["model"]
+    output_cfg = model_cfg["output"]
+    height, width, channels = _resolve_eval_input_dimensions(model_cfg)
+    try:
+        x_eval = _build_eval_input_tensor(
+            config,
+            data_object,
+            eval_indices,
+            height,
+            width,
+            channels,
+        )
+    except ValueError as exc:
+        if str(exc) == "__EVAL_SKIP__":
+            missing_snapshot_strategy = str(eval_cfg["missing_snapshot_strategy"])
+            if str(config["data"]["order_book"]["representation"]) == "hybrid":
+                logger.info(
+                    "No snapshot_depth_data available for evaluation inputs; skipping evaluation stage because "
+                    "evaluation.missing_snapshot_strategy='%s'.",
+                    missing_snapshot_strategy,
+                )
+            else:
+                logger.info(
+                    "No snapshot_features available for evaluation inputs; skipping evaluation stage because "
+                    "evaluation.missing_snapshot_strategy='%s'.",
+                    missing_snapshot_strategy,
+                )
+            return
+        raise
+
+    x_eval = _integrate_feature_engineering_eval_inputs(config, data_object, x_eval, eval_indices)
+    x_eval = _integrate_temporal_features_eval_inputs(config, data_object, x_eval, eval_indices, n_samples)
+
+    data_cfg = config["data"]
+    target_asset = str(data_cfg["asset_pairs"]["target_asset"])
+    order_books = data_object.get("order_books", {})
+    target_book: Dict[str, Any] = order_books.get(target_asset, {})
+    anchor_indices = metadata.get("anchor_indices")
+
+    num_classes = int(output_cfg["num_classes"])
+    split_sample_count = len(
+        chronological_split_indices(
+            n_samples,
+            float(config["preprocessing"]["train_test_split"]["train_ratio"]),
+            float(config["preprocessing"]["train_test_split"]["validation_ratio"]),
+            float(config["preprocessing"]["train_test_split"]["test_ratio"]),
+        )[2]
+    )
+    y_true_up, y_true_down = _extract_eval_targets(
+        data_object,
+        eval_indices,
+        num_classes,
+        split_sample_count,
+    )
 
     try:
         y_pred = model.predict(x_eval, verbose=0)
@@ -467,71 +937,34 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
         )
         return
 
-    # Up-intensity head metrics.
-    y_pred_up = np.argmax(y_prob_up, axis=1)
-    accuracy_up = float(np.mean(y_pred_up == y_true_up)) if eval_n > 0 else 0.0
-
-    per_class_precision_up = []
-    per_class_recall_up = []
-    per_class_f1_up = []
-
-    confusion_up = np.zeros((num_classes, num_classes), dtype=int)
-    for t, p in zip(y_true_up, y_pred_up):
-        if 0 <= t < num_classes and 0 <= p < num_classes:
-            confusion_up[t, p] += 1
-
-    for cls in range(num_classes):
-        tp = float(confusion_up[cls, cls])
-        fp = float(confusion_up[:, cls].sum() - tp)
-        fn = float(confusion_up[cls, :].sum() - tp)
-
-        precision = tp / (tp + fp) if (tp + fp) > 0.0 else 0.0
-        recall = tp / (tp + fn) if (tp + fn) > 0.0 else 0.0
-        f1 = (2.0 * precision * recall / (precision + recall)) if (precision + recall) > 0.0 else 0.0
-
-        per_class_precision_up.append(precision)
-        per_class_recall_up.append(recall)
-        per_class_f1_up.append(f1)
-
-    macro_precision_up = float(np.mean(per_class_precision_up)) if per_class_precision_up else 0.0
-    macro_recall_up = float(np.mean(per_class_recall_up)) if per_class_recall_up else 0.0
-    macro_f1_up = float(np.mean(per_class_f1_up)) if per_class_f1_up else 0.0
-
-    # Down-intensity head metrics.
-    y_pred_down = np.argmax(y_prob_down, axis=1)
-    accuracy_down = float(np.mean(y_pred_down == y_true_down)) if eval_n > 0 else 0.0
-
-    per_class_precision_down = []
-    per_class_recall_down = []
-    per_class_f1_down = []
-
-    confusion_down = np.zeros((num_classes, num_classes), dtype=int)
-    for t, p in zip(y_true_down, y_pred_down):
-        if 0 <= t < num_classes and 0 <= p < num_classes:
-            confusion_down[t, p] += 1
-
-    for cls in range(num_classes):
-        tp = float(confusion_down[cls, cls])
-        fp = float(confusion_down[:, cls].sum() - tp)
-        fn = float(confusion_down[cls, :].sum() - tp)
-
-        precision = tp / (tp + fp) if (tp + fp) > 0.0 else 0.0
-        recall = tp / (tp + fn) if (tp + fn) > 0.0 else 0.0
-        f1 = (2.0 * precision * recall / (precision + recall)) if (precision + recall) > 0.0 else 0.0
-
-        per_class_precision_down.append(precision)
-        per_class_recall_down.append(recall)
-        per_class_f1_down.append(f1)
-
-    macro_precision_down = float(np.mean(per_class_precision_down)) if per_class_precision_down else 0.0
-    macro_recall_down = float(np.mean(per_class_recall_down)) if per_class_recall_down else 0.0
-    macro_f1_down = float(np.mean(per_class_f1_down)) if per_class_f1_down else 0.0
+    eval_n = len(eval_indices)
+    (
+        _y_pred_up,
+        accuracy_up,
+        confusion_up,
+        per_class_precision_up,
+        per_class_recall_up,
+        per_class_f1_up,
+        macro_precision_up,
+        macro_recall_up,
+        macro_f1_up,
+    ) = _compute_prediction_metrics(y_prob_up, y_true_up, num_classes)
+    (
+        _y_pred_down,
+        accuracy_down,
+        confusion_down,
+        per_class_precision_down,
+        per_class_recall_down,
+        per_class_f1_down,
+        macro_precision_down,
+        macro_recall_down,
+        macro_f1_down,
+    ) = _compute_prediction_metrics(y_prob_down, y_true_down, num_classes)
 
     calib_cfg = eval_cfg["calibration_analysis"]
     calib_enabled = bool(calib_cfg["enabled"])
     calibration_results_up: Dict[str, Any] | None = None
     calibration_results_down: Dict[str, Any] | None = None
-    calibration_fit_summary: Dict[str, Any] | None = None  # Only populated in evaluate_snapshot_model
 
     if calib_enabled:
         n_bins = int(calib_cfg["n_bins"])
@@ -573,50 +1006,29 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
         macro_f1_down,
     )
 
-    try:
-        import mlflow  # type: ignore[import]
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to import MLFlow for evaluation metric logging: %s", exc)
+    mlflow = get_mlflow_if_active()
+    if mlflow is None:
+        logger.debug("Skipping MLFlow evaluation metric logging: no active run.")
         return
 
-    metrics = {
-        "eval_up_accuracy": accuracy_up,
-        "eval_up_macro_precision": macro_precision_up,
-        "eval_up_macro_recall": macro_recall_up,
-        "eval_up_macro_f1": macro_f1_up,
-        "eval_down_accuracy": accuracy_down,
-        "eval_down_macro_precision": macro_precision_down,
-        "eval_down_macro_recall": macro_recall_down,
-        "eval_down_macro_f1": macro_f1_down,
-    }
-
-    for cls, (prec, rec, f1) in enumerate(
-        zip(per_class_precision_up, per_class_recall_up, per_class_f1_up),
-    ):
-        metrics[f"eval_up_precision_class_{cls}"] = prec
-        metrics[f"eval_up_recall_class_{cls}"] = rec
-        metrics[f"eval_up_f1_class_{cls}"] = f1
-
-    for cls, (prec, rec, f1) in enumerate(
-        zip(per_class_precision_down, per_class_recall_down, per_class_f1_down),
-    ):
-        metrics[f"eval_down_precision_class_{cls}"] = prec
-        metrics[f"eval_down_recall_class_{cls}"] = rec
-        metrics[f"eval_down_f1_class_{cls}"] = f1
-
-    if calibration_results_up is not None:
-        try:
-            metrics["eval_up_brier_score"] = float(calibration_results_up["brier_score"])
-            metrics["eval_up_ece"] = float(calibration_results_up["ece"])
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to extract up-head calibration metrics for MLFlow logging: %s", exc)
-
-    if calibration_results_down is not None:
-        try:
-            metrics["eval_down_brier_score"] = float(calibration_results_down["brier_score"])
-            metrics["eval_down_ece"] = float(calibration_results_down["ece"])
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to extract down-head calibration metrics for MLFlow logging: %s", exc)
+    metrics = _build_evaluation_metrics_payload(
+        accuracy_up,
+        macro_precision_up,
+        macro_recall_up,
+        macro_f1_up,
+        accuracy_down,
+        macro_precision_down,
+        macro_recall_down,
+        macro_f1_down,
+        per_class_precision_up,
+        per_class_recall_up,
+        per_class_f1_up,
+        per_class_precision_down,
+        per_class_recall_down,
+        per_class_f1_down,
+        calibration_results_up,
+        calibration_results_down,
+    )
 
     for name, value in metrics.items():
         try:
@@ -624,92 +1036,21 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to log MLFlow evaluation metric %s: %s", name, exc)
 
-    if calibration_fit_summary is not None:
-        try:
-            tmp_dir = Path(tempfile.mkdtemp())
-            summary_path = tmp_dir / "post_hoc_calibration_summary.json"
-            with summary_path.open("w", encoding="utf-8") as handle:
-                json.dump(calibration_fit_summary, handle, indent=2, sort_keys=True)
-            mlflow.log_artifact(str(summary_path), artifact_path="evaluation")
-            logger.info(
-                "Logged post-hoc calibration summary artifact to MLFlow at %s",
-                summary_path,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to log post-hoc calibration summary artifact to MLFlow: %s", exc)
-
-    # Optional confusion matrix artifact logging.
-    try:
-        mlflow_cfg = config["mlflow"]
-        artifact_logging_cfg = mlflow_cfg["artifact_logging"]
-        log_confusion = bool(artifact_logging_cfg["confusion_matrix"])
-    except Exception:  # noqa: BLE001
-        log_confusion = False
-
-    if log_confusion:
-        tmp_dir = Path(tempfile.mkdtemp())
-        cm_up_path = tmp_dir / "confusion_matrix_up.csv"
-        cm_down_path = tmp_dir / "confusion_matrix_down.csv"
-        try:
-            np.savetxt(cm_up_path, confusion_up, fmt="%d", delimiter=",")
-            np.savetxt(cm_down_path, confusion_down, fmt="%d", delimiter=",")
-            mlflow.log_artifact(str(cm_up_path), artifact_path="evaluation")
-            mlflow.log_artifact(str(cm_down_path), artifact_path="evaluation")
-            logger.info("Logged evaluation up/down confusion matrix artifacts to MLFlow at %s and %s", cm_up_path, cm_down_path)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to log confusion matrix artifacts to MLFlow: %s", exc)
+    if _resolve_confusion_matrix_logging(config):
+        _log_confusion_matrix_artifacts(
+            mlflow,
+            confusion_up,
+            confusion_down,
+            tmp_prefix="eval_confusion_matrix_",
+            success_message="Logged evaluation up/down confusion matrix artifacts to MLFlow at %s and %s",
+        )
 
     if calib_enabled and (calibration_results_up is not None or calibration_results_down is not None):
-        try:
-            tmp_dir = Path(tempfile.mkdtemp())
-
-            if calibration_results_up is not None:
-                calib_up_path = tmp_dir / "calibration_curve_up.csv"
-                edges = calibration_results_up["bin_edges"]
-                conf = calibration_results_up["bin_confidence"]
-                acc = calibration_results_up["bin_accuracy"]
-                count = calibration_results_up["bin_count"]
-
-                left_edges = edges[:-1]
-                right_edges = edges[1:]
-                data = np.column_stack([left_edges, right_edges, conf, acc, count])
-                header = "left_edge,right_edge,bin_confidence,bin_accuracy,bin_count"
-                np.savetxt(
-                    calib_up_path,
-                    data,
-                    fmt=["%.6f", "%.6f", "%.6f", "%.6f", "%d"],
-                    delimiter=",",
-                    header=header,
-                    comments="",
-                )
-
-                mlflow.log_artifact(str(calib_up_path), artifact_path="evaluation")
-                logger.info("Logged evaluation up-head calibration curve artifact to MLFlow at %s", calib_up_path)
-
-            if calibration_results_down is not None:
-                calib_down_path = tmp_dir / "calibration_curve_down.csv"
-                edges = calibration_results_down["bin_edges"]
-                conf = calibration_results_down["bin_confidence"]
-                acc = calibration_results_down["bin_accuracy"]
-                count = calibration_results_down["bin_count"]
-
-                left_edges = edges[:-1]
-                right_edges = edges[1:]
-                data = np.column_stack([left_edges, right_edges, conf, acc, count])
-                header = "left_edge,right_edge,bin_confidence,bin_accuracy,bin_count"
-                np.savetxt(
-                    calib_down_path,
-                    data,
-                    fmt=["%.6f", "%.6f", "%.6f", "%.6f", "%d"],
-                    delimiter=",",
-                    header=header,
-                    comments="",
-                )
-
-                mlflow.log_artifact(str(calib_down_path), artifact_path="evaluation")
-                logger.info("Logged evaluation down-head calibration curve artifact to MLFlow at %s", calib_down_path)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to log calibration curve artifacts to MLFlow: %s", exc)
+        _log_evaluation_calibration_curve_artifacts(
+            mlflow,
+            calibration_results_up,
+            calibration_results_down,
+        )
 
     # Backtesting integration
     backtest_cfg = eval_cfg["backtesting"]
@@ -754,6 +1095,8 @@ def evaluate_model(config: Dict[str, Any], model: Any, data_object: Dict[str, An
 def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
     """Evaluate a trained model using snapshot datasets."""
 
+    writer = _resolve_snapshot_eval_writer()
+
     snapshot_dataset = prepare_snapshot_dataset(config)
     n_samples = int(snapshot_dataset.total_samples)
     if n_samples <= 0:
@@ -765,16 +1108,13 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
     validation_ratio = float(split_cfg["validation_ratio"])
     test_ratio = float(split_cfg["test_ratio"])
 
-    ratio_sum = train_ratio + validation_ratio + test_ratio
-    if abs(ratio_sum - 1.0) > 1e-6:
-        raise ValueError("train_ratio + validation_ratio + test_ratio must equal 1.0")
-
-    train_end = int(n_samples * train_ratio)
-    val_end = train_end + int(n_samples * validation_ratio)
-    if val_end > n_samples:
-        val_end = n_samples
+    train_end, val_end, test_end = compute_split_boundaries(
+        n_samples,
+        train_ratio,
+        validation_ratio,
+        test_ratio,
+    )
     test_start = val_end
-    test_end = n_samples
 
     if test_end <= test_start:
         logger.info("No test samples available for snapshot evaluation; skipping.")
@@ -818,7 +1158,8 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
 
     try:
         input_count = len(getattr(model, "inputs", []))
-    except Exception:
+    except Exception:  # noqa: BLE001
+        # Model introspection may fail on non-Keras models or custom architectures
         input_count = 1
     if long_term_features is not None and input_count != 2:
         raise ValueError(
@@ -840,39 +1181,74 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
 
     mask_start, mask_count = get_mask_channel_info(config)
 
-    stats_path = os.path.join(context.snapshot_dir, "normalization_stats_train.npz")
-    if os.path.exists(stats_path):
-        train_stats = load_normalization_stats(stats_path)
-    else:
-        train_stats = compute_normalization_stats(
-            snapshot_dataset,
-            0,
-            train_end,
-            method,
-            mask_start=mask_start,
-            mask_count=mask_count,
-        )
-        save_normalization_stats(stats_path, train_stats)
-
-    stats_meta = manifest.get("normalization_stats", {})
-    stats_meta["train"] = {
-        "method": train_stats.method,
-        "path": stats_path,
-        "start_index": 0,
-        "end_index": train_end,
-    }
-    manifest["normalization_stats"] = stats_meta
-    save_manifest(context, manifest)
-
-    eval_stats: NormalizationStats
-    if fit_on_train_only:
-        eval_stats = train_stats
-    else:
-        eval_stats = train_stats
-
     batch_size = int(training_cfg["batch_size"])
     if batch_size <= 0:
         raise ValueError("training.batch_size must be positive")
+
+    train_stats = _get_or_compute_snapshot_normalization_stats(
+        context,
+        manifest,
+        snapshot_dataset,
+        stats_key="train",
+        start_index=0,
+        end_index=train_end,
+        batch_size=batch_size,
+        method=method,
+        mask_start=mask_start,
+        mask_count=mask_count,
+    )
+    val_stats: Optional[NormalizationStats] = None
+    test_stats = train_stats
+    if fit_on_train_only:
+        logger.info("Normalization fit_on_train_only=true: using train stats for val/test evaluation")
+    else:
+        val_count = int(val_end - train_end)
+        if val_count > 0:
+            val_stats = _get_or_compute_snapshot_normalization_stats(
+                context,
+                manifest,
+                snapshot_dataset,
+                stats_key="val",
+                start_index=train_end,
+                end_index=val_end,
+                batch_size=batch_size,
+                method=method,
+                mask_start=mask_start,
+                mask_count=mask_count,
+            )
+        test_stats = _get_or_compute_snapshot_normalization_stats(
+            context,
+            manifest,
+            snapshot_dataset,
+            stats_key="test",
+            start_index=test_start,
+            end_index=test_end,
+            batch_size=batch_size,
+            method=method,
+            mask_start=mask_start,
+            mask_count=mask_count,
+        )
+        logger.info("Normalization fit_on_train_only=false: using per-split stats for evaluation")
+
+    min_predict_batch_size = _resolve_min_predict_batch_size(model)
+
+    total_eval_samples = test_end - test_start
+    total_eval_batches = 0
+    if total_eval_samples > 0:
+        for chunk in getattr(snapshot_dataset, "chunks", []) or []:
+            chunk_start = int(getattr(chunk, "start_index", 0))
+            chunk_end = chunk_start + int(getattr(chunk, "num_samples", 0))
+            overlap_start = max(test_start, chunk_start)
+            overlap_end = min(test_end, chunk_end)
+            overlap_len = overlap_end - overlap_start
+            if overlap_len > 0:
+                total_eval_batches += int(np.ceil(overlap_len / float(batch_size)))
+    eval_batches_done = 0
+    if writer is not None:
+        try:
+            writer.update_eval_progress(processed=0, total=total_eval_batches)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to publish initial eval progress: %s", exc)
 
     eval_cfg = config["evaluation"]
     calib_cfg = eval_cfg["calibration_analysis"]
@@ -901,40 +1277,9 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
 
     backtest_prices: Optional[np.ndarray] = None
     backtest_timestamps: Optional[np.ndarray] = None
-    backtest_prob_up_parts: List[np.ndarray] = []
-    backtest_prob_down_parts: List[np.ndarray] = []
-
-    def _map_anchor_timestamps_to_prices(
-        series_timestamps: np.ndarray,
-        series_prices: np.ndarray,
-        anchor_timestamps: np.ndarray,
-    ) -> np.ndarray:
-        if series_timestamps.ndim != 1 or series_prices.ndim != 1:
-            raise ValueError("Series timestamps and prices must be 1D arrays")
-        if series_timestamps.shape[0] != series_prices.shape[0]:
-            raise ValueError("Series timestamps and prices length mismatch")
-        if series_timestamps.shape[0] == 0:
-            raise ValueError("Series timestamps are empty; cannot map anchor timestamps")
-        if anchor_timestamps.ndim != 1:
-            raise ValueError("Anchor timestamps must be a 1D array")
-
-        if np.any(series_timestamps[1:] < series_timestamps[:-1]):
-            raise ValueError("Series timestamps must be sorted in ascending order")
-
-        indices = np.searchsorted(series_timestamps, anchor_timestamps)
-        valid = indices < series_timestamps.shape[0]
-        matches = np.zeros_like(valid, dtype=bool)
-        if np.any(valid):
-            matches[valid] = series_timestamps[indices[valid]] == anchor_timestamps[valid]
-        invalid = ~valid | ~matches
-        if np.any(invalid):
-            missing_count = int(np.sum(invalid))
-            raise ValueError(
-                "Anchor timestamps do not align with series timestamps: "
-                f"missing={missing_count}, total={anchor_timestamps.shape[0]}"
-            )
-
-        return series_prices[indices]
+    backtest_prob_up: Optional[np.memmap] = None
+    backtest_prob_down: Optional[np.memmap] = None
+    backtest_prob_tmp_dir: Optional[tempfile.TemporaryDirectory] = None
 
     if backtest_enabled:
         series_timestamps, series_mid_prices, _ = load_snapshot_series(snapshot_dataset)
@@ -957,9 +1302,29 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
 
         if backtest_prices.shape[0] > BACKTEST_MEMORY_WARN_THRESHOLD:
             logger.warning(
-                "Backtesting will buffer %s samples in memory; consider reducing evaluation range",
+                "Backtesting will buffer %s samples for prices and write probabilities to temporary files; consider reducing evaluation range",
                 backtest_prices.shape[0],
             )
+
+        backtest_prob_tmp_dir = tempfile.TemporaryDirectory(prefix="snapshot_backtest_buffers_")
+        backtest_prob_up = cast(
+            np.memmap,
+            np.lib.format.open_memmap(
+                os.path.join(backtest_prob_tmp_dir.name, "backtest_prob_up.npy"),
+                mode="w+",
+                dtype="float64",
+                shape=(int(backtest_prices.shape[0]), num_classes),
+            ),
+        )
+        backtest_prob_down = cast(
+            np.memmap,
+            np.lib.format.open_memmap(
+                os.path.join(backtest_prob_tmp_dir.name, "backtest_prob_down.npy"),
+                mode="w+",
+                dtype="float64",
+                shape=(int(backtest_prices.shape[0]), num_classes),
+            ),
+        )
 
     # Temporal degradation configuration
     temporal_cfg = eval_cfg["temporal_degradation"]
@@ -1030,76 +1395,6 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
             temporal_confusions_down.append(np.zeros((num_classes, num_classes), dtype=np.int64))
             temporal_counts.append(0)
 
-    def _collect_calibration_predictions(
-        start_index: int,
-        end_index: int,
-        lt_features: Optional[np.ndarray],
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        probs_up_parts = []
-        probs_down_parts = []
-        labels_up_parts = []
-        labels_down_parts = []
-
-        expected_len = end_index - start_index
-        if lt_features is not None and lt_features.shape[0] != expected_len:
-            raise ValueError(
-                "Long-term feature slice length does not match calibration range: "
-                f"features={lt_features.shape[0]}, expected={expected_len}"
-            )
-
-        current_idx = 0
-
-        for x_chunk, y_up_chunk, y_down_chunk, _, _ in iter_snapshot_batches(
-            snapshot_dataset, start_index, end_index
-        ):
-            x_chunk = _apply_normalization_snapshot(x_chunk, eval_stats, mask_start, mask_count)
-            n_chunk = x_chunk.shape[0]
-
-            for offset in range(0, n_chunk, batch_size):
-                x_batch = x_chunk[offset : offset + batch_size]
-                y_true_up = y_up_chunk[offset : offset + batch_size]
-                y_true_down = y_down_chunk[offset : offset + batch_size]
-
-                model_input: Any
-                if lt_features is not None:
-                    lt_batch = lt_features[current_idx : current_idx + x_batch.shape[0]]
-                    if lt_batch.shape[0] != x_batch.shape[0]:
-                        raise ValueError("Long-term feature batch size mismatch during calibration")
-                    model_input = [x_batch, lt_batch]
-                else:
-                    model_input = x_batch
-
-                y_pred = model.predict(model_input, batch_size=batch_size, verbose=0)
-                if not isinstance(y_pred, (list, tuple)) or len(y_pred) != 2:
-                    raise ValueError("Expected model.predict to return two outputs for two_head_intensity")
-
-                y_prob_up, y_prob_down = y_pred
-                y_prob_up = np.asarray(y_prob_up, dtype="float64")
-                y_prob_down = np.asarray(y_prob_down, dtype="float64")
-
-                if y_prob_up.shape[1] != num_classes or y_prob_down.shape[1] != num_classes:
-                    raise ValueError("Prediction output classes do not match model.output.num_classes")
-
-                probs_up_parts.append(y_prob_up)
-                probs_down_parts.append(y_prob_down)
-                labels_up_parts.append(np.asarray(y_true_up, dtype="int64"))
-                labels_down_parts.append(np.asarray(y_true_down, dtype="int64"))
-
-                current_idx += x_batch.shape[0]
-
-        if not probs_up_parts:
-            raise ValueError("No predictions collected for post-hoc calibration fitting")
-
-        probs_up = np.concatenate(probs_up_parts, axis=0)
-        probs_down = np.concatenate(probs_down_parts, axis=0)
-        labels_up = np.concatenate(labels_up_parts, axis=0)
-        labels_down = np.concatenate(labels_down_parts, axis=0)
-
-        if probs_up.shape[0] != labels_up.shape[0] or probs_down.shape[0] != labels_down.shape[0]:
-            raise ValueError("Calibration data size mismatch between predictions and labels")
-
-        return probs_up, probs_down, labels_up, labels_down
-
     if post_hoc_enabled:
         method = str(post_hoc_cfg["method"])
         if method != "temperature_scaling":
@@ -1128,7 +1423,7 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
 
         if fit_count > CALIBRATION_MEMORY_WARN_THRESHOLD:
             logger.warning(
-                "Post-hoc calibration will buffer %s samples in memory; consider reducing evaluation range",
+                "Post-hoc calibration will buffer %s samples to temporary files; consider reducing evaluation range",
                 fit_count,
             )
 
@@ -1136,36 +1431,56 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
         if long_term_features is not None:
             long_term_fit_features = long_term_features[fit_start:fit_end]
 
-        probs_up_fit, probs_down_fit, labels_up_fit, labels_down_fit = _collect_calibration_predictions(
-            fit_start,
-            fit_end,
-            long_term_fit_features,
-        )
+        scaler_up = None
+        scaler_down = None
+        fit_samples = 0
+        with tempfile.TemporaryDirectory(prefix="snapshot_calibration_buffers_") as buffer_dir:
+            fit_stats = train_stats
+            if not fit_on_train_only:
+                if fit_on_validation:
+                    fit_stats = val_stats if val_stats is not None else train_stats
+                else:
+                    fit_stats = test_stats
 
-        fit_samples = int(probs_up_fit.shape[0])
-        if fit_samples < min_samples:
-            raise ValueError(
-                "Post-hoc calibration requires at least {min_samples} samples; got {fit_samples}".format(
-                    min_samples=min_samples,
-                    fit_samples=fit_samples,
-                )
+            logits_up_fit, logits_down_fit, labels_up_fit, labels_down_fit = _collect_calibration_predictions_to_memmap(
+                snapshot_dataset,
+                fit_start,
+                fit_end,
+                long_term_fit_features,
+                fit_stats,
+                buffer_dir=buffer_dir,
+                model=model,
+                batch_size=batch_size,
+                min_predict_batch_size=min_predict_batch_size,
+                num_classes=num_classes,
+                mask_start=mask_start,
+                mask_count=mask_count,
             )
 
-        logits_up = probs_to_logits_proxy(probs_up_fit)
-        logits_down = probs_to_logits_proxy(probs_down_fit)
+            fit_samples = int(logits_up_fit.shape[0])
+            if fit_samples < min_samples:
+                raise ValueError(
+                    "Post-hoc calibration requires at least {min_samples} samples; got {fit_samples}".format(
+                        min_samples=min_samples,
+                        fit_samples=fit_samples,
+                    )
+                )
 
-        scaler_up = fit_temperature(
-            logits_up,
-            labels_up_fit,
-            num_bins=n_bins,
-            bounds=(min_temp, max_temp),
-        )
-        scaler_down = fit_temperature(
-            logits_down,
-            labels_down_fit,
-            num_bins=n_bins,
-            bounds=(min_temp, max_temp),
-        )
+            scaler_up = fit_temperature(
+                logits_up_fit,
+                labels_up_fit,
+                num_bins=n_bins,
+                bounds=(min_temp, max_temp),
+            )
+            scaler_down = fit_temperature(
+                logits_down_fit,
+                labels_down_fit,
+                num_bins=n_bins,
+                bounds=(min_temp, max_temp),
+            )
+
+        if scaler_up is None or scaler_down is None:
+            raise ValueError("Post-hoc calibration failed to produce temperature scalers")
 
         if not scaler_up.fitted or not scaler_down.fitted:
             raise ValueError("Post-hoc calibration failed to fit temperature scalers")
@@ -1184,166 +1499,191 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
 
     sample_offset = 0
 
-    for x_chunk, y_up_chunk, y_down_chunk, _, _ in iter_snapshot_batches(
-        snapshot_dataset, test_start, test_end
+    for x_batch, y_true_up, y_true_down, _, _ in iter_snapshot_minibatches(
+        snapshot_dataset,
+        test_start,
+        test_end,
+        batch_size=batch_size,
+        drop_remainder=False,
     ):
-        x_chunk = _apply_normalization_snapshot(x_chunk, eval_stats, mask_start, mask_count)
-        n_chunk = x_chunk.shape[0]
+        x_batch = _apply_normalization_snapshot(x_batch, test_stats, mask_start, mask_count)
+        if x_batch.shape[0] == 0:
+            continue
 
-        for offset in range(0, n_chunk, batch_size):
-            x_batch = x_chunk[offset : offset + batch_size]
-            y_true_up = y_up_chunk[offset : offset + batch_size]
-            y_true_down = y_down_chunk[offset : offset + batch_size]
+        lt_batch: Optional[np.ndarray] = None
+        if long_term_test_features is not None:
+            lt_batch = long_term_test_features[sample_offset : sample_offset + x_batch.shape[0]]
+            if lt_batch.shape[0] != x_batch.shape[0]:
+                raise ValueError("Long-term feature batch size mismatch during evaluation")
 
-            model_input: Any
-            if long_term_test_features is not None:
-                lt_batch = long_term_test_features[sample_offset : sample_offset + x_batch.shape[0]]
-                if lt_batch.shape[0] != x_batch.shape[0]:
-                    raise ValueError("Long-term feature batch size mismatch during evaluation")
-                model_input = [x_batch, lt_batch]
-            else:
-                model_input = x_batch
+        y_prob_up, y_prob_down = _predict_two_head_with_safe_batching(
+            model,
+            x_batch,
+            lt_batch=lt_batch,
+            batch_size=batch_size,
+            min_predict_batch_size=min_predict_batch_size,
+        )
 
-            y_pred = model.predict(model_input, batch_size=batch_size, verbose=0)
-            if not isinstance(y_pred, (list, tuple)) or len(y_pred) != 2:
-                raise ValueError("Expected model.predict to return two outputs for two_head_intensity")
+        if y_prob_up.shape[1] != num_classes or y_prob_down.shape[1] != num_classes:
+            raise ValueError("Prediction output classes do not match model.output.num_classes")
 
-            y_prob_up, y_prob_down = y_pred
-            y_prob_up = np.asarray(y_prob_up, dtype="float64")
-            y_prob_down = np.asarray(y_prob_down, dtype="float64")
+        y_pred_up = np.argmax(y_prob_up, axis=1)
+        y_pred_down = np.argmax(y_prob_down, axis=1)
 
-            if y_prob_up.shape[1] != num_classes or y_prob_down.shape[1] != num_classes:
-                raise ValueError("Prediction output classes do not match model.output.num_classes")
+        correct_up += int(np.sum(y_pred_up == y_true_up))
+        correct_down += int(np.sum(y_pred_down == y_true_down))
+        total_eval += int(y_true_up.shape[0])
 
-            y_pred_up = np.argmax(y_prob_up, axis=1)
-            y_pred_down = np.argmax(y_prob_down, axis=1)
+        np.add.at(confusion_up, (y_true_up, y_pred_up), 1)
+        np.add.at(confusion_down, (y_true_down, y_pred_down), 1)
 
-            correct_up += int(np.sum(y_pred_up == y_true_up))
-            correct_down += int(np.sum(y_pred_down == y_true_down))
-            total_eval += int(y_true_up.shape[0])
+        batch_start = sample_offset
+        batch_end = batch_start + y_true_up.shape[0]
 
-            np.add.at(confusion_up, (y_true_up, y_pred_up), 1)
-            np.add.at(confusion_down, (y_true_down, y_pred_down), 1)
+        if temporal_enabled and temporal_windows:
+            for window_index, (win_start, win_end) in enumerate(temporal_windows):
+                overlap_start = max(win_start, batch_start)
+                overlap_end = min(win_end, batch_end)
+                if overlap_start >= overlap_end:
+                    continue
 
-            batch_start = sample_offset
-            batch_end = batch_start + y_true_up.shape[0]
+                local_start = overlap_start - batch_start
+                local_end = overlap_end - batch_start
 
-            if temporal_enabled and temporal_windows:
-                for window_index, (win_start, win_end) in enumerate(temporal_windows):
-                    overlap_start = max(win_start, batch_start)
-                    overlap_end = min(win_end, batch_end)
-                    if overlap_start >= overlap_end:
-                        continue
+                y_true_up_slice = y_true_up[local_start:local_end]
+                y_pred_up_slice = y_pred_up[local_start:local_end]
+                y_true_down_slice = y_true_down[local_start:local_end]
+                y_pred_down_slice = y_pred_down[local_start:local_end]
 
-                    local_start = overlap_start - batch_start
-                    local_end = overlap_end - batch_start
+                np.add.at(
+                    temporal_confusions_up[window_index],
+                    (y_true_up_slice, y_pred_up_slice),
+                    1,
+                )
+                np.add.at(
+                    temporal_confusions_down[window_index],
+                    (y_true_down_slice, y_pred_down_slice),
+                    1,
+                )
+                temporal_counts[window_index] += int(local_end - local_start)
 
-                    y_true_up_slice = y_true_up[local_start:local_end]
-                    y_pred_up_slice = y_pred_up[local_start:local_end]
-                    y_true_down_slice = y_true_down[local_start:local_end]
-                    y_pred_down_slice = y_pred_down[local_start:local_end]
+        y_true_up_onehot = np.eye(num_classes, dtype="float64")[y_true_up]
+        y_true_down_onehot = np.eye(num_classes, dtype="float64")[y_true_down]
 
-                    np.add.at(
-                        temporal_confusions_up[window_index],
-                        (y_true_up_slice, y_pred_up_slice),
-                        1,
+        if calib_enabled:
+            up_brier_sum += float(
+                np.sum(np.sum((y_prob_up - y_true_up_onehot) ** 2, axis=1))
+            )
+            down_brier_sum += float(
+                np.sum(np.sum((y_prob_down - y_true_down_onehot) ** 2, axis=1))
+            )
+            up_count += int(y_true_up.shape[0])
+            down_count += int(y_true_down.shape[0])
+
+            up_bins = _assign_calibration_bins_with_truth(
+                y_prob_up,
+                y_true_up_onehot,
+                bin_edges,
+            )
+            down_bins = _assign_calibration_bins_with_truth(
+                y_prob_down,
+                y_true_down_onehot,
+                bin_edges,
+            )
+
+            up_conf_sum += up_bins[0]
+            up_acc_sum += up_bins[1]
+            up_bin_count += up_bins[2]
+
+            down_conf_sum += down_bins[0]
+            down_acc_sum += down_bins[1]
+            down_bin_count += down_bins[2]
+
+        y_prob_up_cal: Optional[np.ndarray] = None
+        y_prob_down_cal: Optional[np.ndarray] = None
+
+        if post_hoc_enabled:
+            if temperature_up is None or temperature_down is None:
+                raise ValueError("Post-hoc calibration is enabled but temperatures are missing")
+
+            y_prob_up_cal = logits_to_calibrated_probs(
+                probs_to_logits_proxy(y_prob_up),
+                temperature_up,
+            )
+            y_prob_down_cal = logits_to_calibrated_probs(
+                probs_to_logits_proxy(y_prob_down),
+                temperature_down,
+            )
+
+            up_brier_sum_cal += float(
+                np.sum(np.sum((y_prob_up_cal - y_true_up_onehot) ** 2, axis=1))
+            )
+            down_brier_sum_cal += float(
+                np.sum(np.sum((y_prob_down_cal - y_true_down_onehot) ** 2, axis=1))
+            )
+            up_count_cal += int(y_true_up.shape[0])
+            down_count_cal += int(y_true_down.shape[0])
+
+            up_bins_cal = _assign_calibration_bins_with_truth(
+                y_prob_up_cal,
+                y_true_up_onehot,
+                bin_edges,
+            )
+            down_bins_cal = _assign_calibration_bins_with_truth(
+                y_prob_down_cal,
+                y_true_down_onehot,
+                bin_edges,
+            )
+
+            up_conf_sum_cal += up_bins_cal[0]
+            up_acc_sum_cal += up_bins_cal[1]
+            up_bin_count_cal += up_bins_cal[2]
+
+            down_conf_sum_cal += down_bins_cal[0]
+            down_acc_sum_cal += down_bins_cal[1]
+            down_bin_count_cal += down_bins_cal[2]
+
+        if backtest_enabled:
+            if backtest_prob_up is None or backtest_prob_down is None:
+                raise ValueError("Backtesting is enabled but probability buffers are not initialized")
+
+            batch_len = int(y_true_up.shape[0])
+            bt_start = int(sample_offset)
+            bt_end = bt_start + batch_len
+            if bt_end > int(backtest_prob_up.shape[0]):
+                raise ValueError(
+                    "Backtesting probability buffer overrun: end={end} buffer_len={buf_len}".format(
+                        end=bt_end,
+                        buf_len=int(backtest_prob_up.shape[0]),
                     )
-                    np.add.at(
-                        temporal_confusions_down[window_index],
-                        (y_true_down_slice, y_pred_down_slice),
-                        1,
-                    )
-                    temporal_counts[window_index] += int(local_end - local_start)
-
-            y_true_up_onehot = np.eye(num_classes, dtype="float64")[y_true_up]
-            y_true_down_onehot = np.eye(num_classes, dtype="float64")[y_true_down]
-
-            if calib_enabled:
-                up_brier_sum += float(
-                    np.sum(np.sum((y_prob_up - y_true_up_onehot) ** 2, axis=1))
                 )
-                down_brier_sum += float(
-                    np.sum(np.sum((y_prob_down - y_true_down_onehot) ** 2, axis=1))
-                )
-                up_count += int(y_true_up.shape[0])
-                down_count += int(y_true_down.shape[0])
-
-                up_bins = _assign_calibration_bins_with_truth(
-                    y_prob_up,
-                    y_true_up_onehot,
-                    bin_edges,
-                )
-                down_bins = _assign_calibration_bins_with_truth(
-                    y_prob_down,
-                    y_true_down_onehot,
-                    bin_edges,
-                )
-
-                up_conf_sum += up_bins[0]
-                up_acc_sum += up_bins[1]
-                up_bin_count += up_bins[2]
-
-                down_conf_sum += down_bins[0]
-                down_acc_sum += down_bins[1]
-                down_bin_count += down_bins[2]
-
-            y_prob_up_cal: Optional[np.ndarray] = None
-            y_prob_down_cal: Optional[np.ndarray] = None
 
             if post_hoc_enabled:
-                if temperature_up is None or temperature_down is None:
-                    raise ValueError("Post-hoc calibration is enabled but temperatures are missing")
+                if y_prob_up_cal is None or y_prob_down_cal is None:
+                    raise ValueError("Backtesting requires calibrated probabilities but none were produced")
+                backtest_prob_up[bt_start:bt_end] = y_prob_up_cal
+                backtest_prob_down[bt_start:bt_end] = y_prob_down_cal
+            else:
+                backtest_prob_up[bt_start:bt_end] = y_prob_up
+                backtest_prob_down[bt_start:bt_end] = y_prob_down
 
-                y_prob_up_cal = logits_to_calibrated_probs(
-                    probs_to_logits_proxy(y_prob_up),
-                    temperature_up,
-                )
-                y_prob_down_cal = logits_to_calibrated_probs(
-                    probs_to_logits_proxy(y_prob_down),
-                    temperature_down,
-                )
-
-                up_brier_sum_cal += float(
-                    np.sum(np.sum((y_prob_up_cal - y_true_up_onehot) ** 2, axis=1))
-                )
-                down_brier_sum_cal += float(
-                    np.sum(np.sum((y_prob_down_cal - y_true_down_onehot) ** 2, axis=1))
-                )
-                up_count_cal += int(y_true_up.shape[0])
-                down_count_cal += int(y_true_down.shape[0])
-
-                up_bins_cal = _assign_calibration_bins_with_truth(
-                    y_prob_up_cal,
-                    y_true_up_onehot,
-                    bin_edges,
-                )
-                down_bins_cal = _assign_calibration_bins_with_truth(
-                    y_prob_down_cal,
-                    y_true_down_onehot,
-                    bin_edges,
-                )
-
-                up_conf_sum_cal += up_bins_cal[0]
-                up_acc_sum_cal += up_bins_cal[1]
-                up_bin_count_cal += up_bins_cal[2]
-
-                down_conf_sum_cal += down_bins_cal[0]
-                down_acc_sum_cal += down_bins_cal[1]
-                down_bin_count_cal += down_bins_cal[2]
-
-            if backtest_enabled:
-                if post_hoc_enabled:
-                    if y_prob_up_cal is None or y_prob_down_cal is None:
-                        raise ValueError("Backtesting requires calibrated probabilities but none were produced")
-                    backtest_prob_up_parts.append(y_prob_up_cal)
-                    backtest_prob_down_parts.append(y_prob_down_cal)
-                else:
-                    backtest_prob_up_parts.append(y_prob_up)
-                    backtest_prob_down_parts.append(y_prob_down)
-
-            sample_offset += int(y_true_up.shape[0])
+        sample_offset += int(y_true_up.shape[0])
+        eval_batches_done += 1
+        if writer is not None:
+            try:
+                writer.update_eval_progress(processed=eval_batches_done, total=total_eval_batches)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to publish eval progress update: %s", exc)
 
     if total_eval <= 0:
+        if backtest_prob_tmp_dir is not None:
+            try:
+                backtest_prob_up = None
+                backtest_prob_down = None
+                backtest_prob_tmp_dir.cleanup()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to cleanup backtest probability temp directory (empty-eval path): %s", exc)
+            backtest_prob_tmp_dir = None
         logger.info("Snapshot evaluation found no samples after batching; skipping.")
         return
 
@@ -1403,18 +1743,28 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
     if backtest_enabled:
         if backtest_prices is None or backtest_timestamps is None:
             raise ValueError("Backtesting is enabled but price data is missing")
-        if not backtest_prob_up_parts or not backtest_prob_down_parts:
-            raise ValueError("Backtesting is enabled but no probabilities were collected")
+        if backtest_prob_up is None or backtest_prob_down is None:
+            raise ValueError("Backtesting is enabled but probability buffers are missing")
 
-        backtest_prob_up = np.concatenate(backtest_prob_up_parts, axis=0)
-        backtest_prob_down = np.concatenate(backtest_prob_down_parts, axis=0)
-
-        expected_len = backtest_prices.shape[0]
-        if backtest_prob_up.shape[0] != expected_len or backtest_prob_down.shape[0] != expected_len:
+        expected_len = int(backtest_prices.shape[0])
+        if int(backtest_prob_up.shape[0]) != expected_len or int(backtest_prob_down.shape[0]) != expected_len:
             raise ValueError(
                 "Backtesting probability length mismatch: "
-                f"up={backtest_prob_up.shape[0]}, down={backtest_prob_down.shape[0]}, expected={expected_len}"
+                f"up={int(backtest_prob_up.shape[0])}, down={int(backtest_prob_down.shape[0])}, expected={expected_len}"
             )
+        if int(sample_offset) != expected_len:
+            raise ValueError(
+                "Backtesting probability fill mismatch: filled={filled} expected={expected}".format(
+                    filled=int(sample_offset),
+                    expected=expected_len,
+                )
+            )
+
+        try:
+            backtest_prob_up.flush()
+            backtest_prob_down.flush()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to flush backtest probability buffers: %s", exc)
 
         from .backtesting import log_backtest_to_mlflow, run_backtest
 
@@ -1427,6 +1777,15 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
             timestamps=backtest_timestamps,
         )
         log_backtest_to_mlflow(backtest_result)
+
+        if backtest_prob_tmp_dir is not None:
+            try:
+                backtest_prob_up = None
+                backtest_prob_down = None
+                backtest_prob_tmp_dir.cleanup()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to cleanup backtest probability temp directory (post-backtest path): %s", exc)
+            backtest_prob_tmp_dir = None
 
     logger.info(
         "Snapshot evaluation metrics. eval_n=%s, up_accuracy=%s, down_accuracy=%s, "
@@ -1443,11 +1802,9 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
         macro_f1_down,
     )
 
-    try:
-        import mlflow  # type: ignore[import]
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to import MLFlow for snapshot evaluation metric logging: %s", exc)
-        return
+    mlflow = get_mlflow_if_active()
+    if mlflow is None:
+        logger.debug("Skipping MLFlow snapshot evaluation metric logging: no active run.")
 
     metrics = {
         "eval_up_accuracy": accuracy_up,
@@ -1498,11 +1855,12 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
         metrics["calibration_fit_down_ece_post"] = float(down_summary.get("post_calibration_ece", 0.0))
         metrics["calibration_fit_samples"] = float(calibration_fit_summary.get("num_samples", 0))
 
-    for name, value in metrics.items():
-        try:
-            mlflow.log_metric(name, float(value))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to log MLFlow evaluation metric %s: %s", name, exc)
+    if mlflow is not None:
+        for name, value in metrics.items():
+            try:
+                mlflow.log_metric(name, float(value))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to log MLFlow evaluation metric %s: %s", name, exc)
 
     # Optional confusion matrix artifact logging.
     try:
@@ -1512,24 +1870,25 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
     except Exception:  # noqa: BLE001
         log_confusion = False
 
-    if log_confusion:
-        tmp_dir = Path(tempfile.mkdtemp())
-        cm_up_path = tmp_dir / "confusion_matrix_up.csv"
-        cm_down_path = tmp_dir / "confusion_matrix_down.csv"
+    if mlflow is not None and log_confusion:
         try:
-            np.savetxt(cm_up_path, confusion_up, fmt="%d", delimiter=",")
-            np.savetxt(cm_down_path, confusion_down, fmt="%d", delimiter=",")
-            mlflow.log_artifact(str(cm_up_path), artifact_path="evaluation")
-            mlflow.log_artifact(str(cm_down_path), artifact_path="evaluation")
-            logger.info(
-                "Logged snapshot evaluation confusion matrices to MLFlow at %s and %s",
-                cm_up_path,
-                cm_down_path,
-            )
+            with tempfile.TemporaryDirectory(prefix="snapshot_eval_confusion_matrix_") as tmp_dir_str:
+                tmp_dir = Path(tmp_dir_str)
+                cm_up_path = tmp_dir / "confusion_matrix_up.csv"
+                cm_down_path = tmp_dir / "confusion_matrix_down.csv"
+                np.savetxt(cm_up_path, confusion_up, fmt="%d", delimiter=",")
+                np.savetxt(cm_down_path, confusion_down, fmt="%d", delimiter=",")
+                mlflow.log_artifact(str(cm_up_path), artifact_path="evaluation")
+                mlflow.log_artifact(str(cm_down_path), artifact_path="evaluation")
+                logger.info(
+                    "Logged snapshot evaluation confusion matrices to MLFlow at %s and %s",
+                    cm_up_path,
+                    cm_down_path,
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to log confusion matrix artifacts to MLFlow: %s", exc)
 
-    if (
+    if mlflow is not None and (
         (calib_enabled and (calibration_results_up is not None or calibration_results_down is not None))
         or (
             post_hoc_enabled
@@ -1537,27 +1896,28 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
         )
     ):
         try:
-            tmp_dir = Path(tempfile.mkdtemp())
+            with tempfile.TemporaryDirectory(prefix="snapshot_eval_calibration_curves_") as tmp_dir_str:
+                tmp_dir = Path(tmp_dir_str)
 
-            if calib_enabled and calibration_results_up is not None:
-                calib_up_path = tmp_dir / "calibration_curve_up.csv"
-                _write_calibration_curve(calibration_results_up, calib_up_path)
-                mlflow.log_artifact(str(calib_up_path), artifact_path="evaluation")
+                if calib_enabled and calibration_results_up is not None:
+                    calib_up_path = tmp_dir / "calibration_curve_up.csv"
+                    _write_calibration_curve(calibration_results_up, calib_up_path)
+                    mlflow.log_artifact(str(calib_up_path), artifact_path="evaluation")
 
-            if calib_enabled and calibration_results_down is not None:
-                calib_down_path = tmp_dir / "calibration_curve_down.csv"
-                _write_calibration_curve(calibration_results_down, calib_down_path)
-                mlflow.log_artifact(str(calib_down_path), artifact_path="evaluation")
+                if calib_enabled and calibration_results_down is not None:
+                    calib_down_path = tmp_dir / "calibration_curve_down.csv"
+                    _write_calibration_curve(calibration_results_down, calib_down_path)
+                    mlflow.log_artifact(str(calib_down_path), artifact_path="evaluation")
 
-            if post_hoc_enabled and calibration_results_up_cal is not None:
-                calib_up_cal_path = tmp_dir / "calibration_curve_up_calibrated.csv"
-                _write_calibration_curve(calibration_results_up_cal, calib_up_cal_path)
-                mlflow.log_artifact(str(calib_up_cal_path), artifact_path="evaluation")
+                if post_hoc_enabled and calibration_results_up_cal is not None:
+                    calib_up_cal_path = tmp_dir / "calibration_curve_up_calibrated.csv"
+                    _write_calibration_curve(calibration_results_up_cal, calib_up_cal_path)
+                    mlflow.log_artifact(str(calib_up_cal_path), artifact_path="evaluation")
 
-            if post_hoc_enabled and calibration_results_down_cal is not None:
-                calib_down_cal_path = tmp_dir / "calibration_curve_down_calibrated.csv"
-                _write_calibration_curve(calibration_results_down_cal, calib_down_cal_path)
-                mlflow.log_artifact(str(calib_down_cal_path), artifact_path="evaluation")
+                if post_hoc_enabled and calibration_results_down_cal is not None:
+                    calib_down_cal_path = tmp_dir / "calibration_curve_down_calibrated.csv"
+                    _write_calibration_curve(calibration_results_down_cal, calib_down_cal_path)
+                    mlflow.log_artifact(str(calib_down_cal_path), artifact_path="evaluation")
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to log calibration curve artifacts to MLFlow: %s", exc)
 
@@ -1688,48 +2048,50 @@ def evaluate_snapshot_model(config: Dict[str, Any], model: Any) -> None:
                 temporal_result_up = _build_temporal_result(window_metrics_up)
                 temporal_result_down = _build_temporal_result(window_metrics_down)
 
-                # Log summary metrics to MLflow
-                mlflow.log_metric("temporal_up_total_degradation", temporal_result_up.total_degradation)
-                mlflow.log_metric("temporal_up_degradation_rate", temporal_result_up.degradation_rate)
-                mlflow.log_metric("temporal_up_overall_trend", temporal_result_up.overall_trend)
-                mlflow.log_metric("temporal_up_first_window_accuracy", temporal_result_up.first_window_accuracy)
-                mlflow.log_metric("temporal_up_last_window_accuracy", temporal_result_up.last_window_accuracy)
+                if mlflow is not None:
+                    # Log summary metrics to MLflow
+                    mlflow.log_metric("temporal_up_total_degradation", temporal_result_up.total_degradation)
+                    mlflow.log_metric("temporal_up_degradation_rate", temporal_result_up.degradation_rate)
+                    mlflow.log_metric("temporal_up_overall_trend", temporal_result_up.overall_trend)
+                    mlflow.log_metric("temporal_up_first_window_accuracy", temporal_result_up.first_window_accuracy)
+                    mlflow.log_metric("temporal_up_last_window_accuracy", temporal_result_up.last_window_accuracy)
 
-                mlflow.log_metric("temporal_down_total_degradation", temporal_result_down.total_degradation)
-                mlflow.log_metric("temporal_down_degradation_rate", temporal_result_down.degradation_rate)
-                mlflow.log_metric("temporal_down_overall_trend", temporal_result_down.overall_trend)
-                mlflow.log_metric("temporal_down_first_window_accuracy", temporal_result_down.first_window_accuracy)
-                mlflow.log_metric("temporal_down_last_window_accuracy", temporal_result_down.last_window_accuracy)
+                    mlflow.log_metric("temporal_down_total_degradation", temporal_result_down.total_degradation)
+                    mlflow.log_metric("temporal_down_degradation_rate", temporal_result_down.degradation_rate)
+                    mlflow.log_metric("temporal_down_overall_trend", temporal_result_down.overall_trend)
+                    mlflow.log_metric("temporal_down_first_window_accuracy", temporal_result_down.first_window_accuracy)
+                    mlflow.log_metric("temporal_down_last_window_accuracy", temporal_result_down.last_window_accuracy)
 
-                # Log per-window metrics if configured
-                if temporal_log_per_window:
-                    for wm in temporal_result_up.window_metrics:
-                        prefix = f"temporal_up_window_{wm.window_index}"
-                        mlflow.log_metric(f"{prefix}_accuracy", wm.accuracy)
-                        mlflow.log_metric(f"{prefix}_f1_macro", wm.f1_macro)
-                        mlflow.log_metric(f"{prefix}_num_samples", float(wm.num_samples))
+                    # Log per-window metrics if configured
+                    if temporal_log_per_window:
+                        for wm in temporal_result_up.window_metrics:
+                            prefix = f"temporal_up_window_{wm.window_index}"
+                            mlflow.log_metric(f"{prefix}_accuracy", wm.accuracy)
+                            mlflow.log_metric(f"{prefix}_f1_macro", wm.f1_macro)
+                            mlflow.log_metric(f"{prefix}_num_samples", float(wm.num_samples))
 
-                    for wm in temporal_result_down.window_metrics:
-                        prefix = f"temporal_down_window_{wm.window_index}"
-                        mlflow.log_metric(f"{prefix}_accuracy", wm.accuracy)
-                        mlflow.log_metric(f"{prefix}_f1_macro", wm.f1_macro)
-                        mlflow.log_metric(f"{prefix}_num_samples", float(wm.num_samples))
+                        for wm in temporal_result_down.window_metrics:
+                            prefix = f"temporal_down_window_{wm.window_index}"
+                            mlflow.log_metric(f"{prefix}_accuracy", wm.accuracy)
+                            mlflow.log_metric(f"{prefix}_f1_macro", wm.f1_macro)
+                            mlflow.log_metric(f"{prefix}_num_samples", float(wm.num_samples))
 
-                # Save full results as JSON artifact
-                tmp_dir = Path(tempfile.mkdtemp())
-                temporal_path = tmp_dir / "temporal_degradation_analysis.json"
-                temporal_artifact = {
-                    "up": temporal_result_up.to_dict(),
-                    "down": temporal_result_down.to_dict(),
-                    "config": {
-                        "num_windows": temporal_num_windows,
-                        "overlap_fraction": temporal_overlap,
-                        "total_samples": expected_samples,
-                    },
-                }
-                with temporal_path.open("w", encoding="utf-8") as f:
-                    json.dump(temporal_artifact, f, indent=2, sort_keys=True)
-                mlflow.log_artifact(str(temporal_path), artifact_path="evaluation")
+                    # Save full results as JSON artifact
+                    with tempfile.TemporaryDirectory(prefix="snapshot_temporal_degradation_") as tmp_dir_str:
+                        tmp_dir = Path(tmp_dir_str)
+                        temporal_path = tmp_dir / "temporal_degradation_analysis.json"
+                        temporal_artifact = {
+                            "up": temporal_result_up.to_dict(),
+                            "down": temporal_result_down.to_dict(),
+                            "config": {
+                                "num_windows": temporal_num_windows,
+                                "overlap_fraction": temporal_overlap,
+                                "total_samples": expected_samples,
+                            },
+                        }
+                        with temporal_path.open("w", encoding="utf-8") as f:
+                            json.dump(temporal_artifact, f, indent=2, sort_keys=True)
+                        mlflow.log_artifact(str(temporal_path), artifact_path="evaluation")
 
                 logger.info(
                     "Temporal degradation analysis complete. Up: degradation=%.4f, Down: degradation=%.4f",

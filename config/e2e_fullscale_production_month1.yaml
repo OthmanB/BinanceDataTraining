@@ -1,0 +1,160 @@
+base_config: "training_config_default.yaml"
+
+run_mode:
+  mode: "production"
+
+data:
+  time_range:
+    start_date: "2024-01-01"
+    end_date: "2024-02-01"
+  asset_pairs:
+    alignment:
+      missing_policy: "forward_fill"
+    target_asset: "BTCUSDT"
+    correlated_assets: ["ETHUSDT"]
+  validation:
+    fail_on_invalid: false
+
+model:
+  cnn:
+    layers:
+      - filters: 16
+        kernel_size: [5, 5]
+        pool_size: [2, 2]
+        normalization: null
+        dropout: 0.
+      - filters: 32
+        kernel_size: [5, 5]
+        pool_size: [2, 2]
+        normalization: null
+        dropout: 0.
+      - filters: 64
+        kernel_size: [5, 5]
+        pool_size: [2, 1]
+        normalization: null
+        dropout: 0.
+#      - filters: 128
+#        kernel_size: [3, 3]
+#        pool_size: [2, 1]
+#        normalization: null
+#        dropout: 0.3
+  lstm:
+    layers:                       # Per-layer configuration; supports stacked LSTMs.
+      - units: 96                 # Number of hidden units in this LSTM layer.
+        dropout: 0.              # Keras LSTM input dropout.
+        recurrent_dropout: 0.0    # Recurrent dropout; keep 0.0 for cuDNN acceleration.
+        post_dropout: 0.2         # Standalone Dropout layer after this LSTM; 0.0 to skip.
+  long_term:
+    enabled: true
+    windows_days: [3, 7]
+
+training:
+  epochs: 10
+  batch_size: 12
+  debug_max_samples: 100000000
+  runtime:
+    device: "gpu"
+    gpu_visible_devices: null
+    gpu_memory_growth: false
+    gpu_allocator: "default"
+    gpu_init_lock_enabled: false
+    gpu_init_stagger_seconds: 0
+    mixed_precision: "float16"
+    distributed:
+      enabled: true
+      strategy: "mirrored"
+      resources: ["gpu:0", "gpu:1"]
+  sequential_training:
+    enabled: true
+    window_days: 2
+    cleanup_completed_windows: false
+    cleanup_keep_last_windows: 0
+    resume_enabled: true
+  sample_weighting:
+    enabled: true
+    method: "exponential_decay"
+    half_life_days: 90
+    apply_to: "loss_function"
+  fine_tuning:
+    enabled: false
+
+hyperparameter_optimization:
+  enabled: true
+  framework: "optuna"
+  n_trials: 6
+  direction: "minimize"
+  metric: "loss"
+  trial_model_logging:
+    enabled: false
+  parallel:
+    enabled: true
+    max_trials_per_worker_process: 1
+    resources: ["gpu:0", "gpu:1"]
+    storage_uri: "sqlite:////home/obenomar/Trade/BinanceAlgo/BinanceDataTraining/tmp/mlflow/optuna/fullscale_month1.db"
+    study_name: "e2e_fullscale_production_month1"
+  regime:
+    enabled: true
+    retry_on_oom: true
+    max_retry_attempts: 2
+    batch_backoff_factor: 0.6
+    min_batch_size: 2
+    failure_policy: "prune"
+    failure_penalty_value: 1000000.0
+    max_vram_fraction: 0.93
+    vram_penalty_weight: 5.0
+    low_utilization_penalty:
+      enabled: false
+      min_samples_per_second: 0.0
+      weight: 0.0
+    safe_envelope:
+      enabled: true
+      min_success_trials: 2
+      headroom_fraction: 1.0
+      persistence_enabled: true
+  search_space:
+    cnn:                            # Per-layer CNN search ranges; list index matches model.cnn.layers index.
+      - filters: [8, 24]         # Integer range [low, high] for CNN layer 0 filters.
+      - filters: [24, 64]         # Integer range for CNN layer 1 filters.
+      - filters: [64, 128]
+    lstm:                           # Per-layer LSTM search ranges; list index matches model.lstm.layers index.
+      - units: [16, 96]           # Integer range for LSTM layer 0 units.
+    learning_rate: [0.0001, 0.01]   # Continuous range [low, high] for learning rate; third entry can be "log" for log scale.
+    batch_size: [2, 4, 8]        # Batch-size candidates; list can encode either a range or categorical set.
+
+
+snapshot:
+  enabled: true
+  root_name: "e2e_prod"
+  name: "fullscale_production_month1"
+
+evaluation:
+  calibration_analysis:
+    enabled: true
+  post_hoc_calibration:
+    enabled: true
+    method: "temperature_scaling"
+    fit_on_validation: true
+    min_samples: 500
+    temperature_bounds:
+      min: 0.1
+      max: 10.0
+  temporal_degradation:
+    enabled: true
+    num_windows: 5
+    overlap_fraction: 0.0
+    log_per_window_metrics: true
+  backtesting:
+    enabled: false
+
+diagnostics:
+  enabled: true
+  visualization:
+    enabled: true
+    time_series: true
+    histograms: true
+    heatmaps:
+      enabled: true
+  label_checks:
+    enabled: true
+  gap_checks:
+    enabled: true

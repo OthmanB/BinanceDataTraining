@@ -1,9 +1,12 @@
-from typing import Any, Sequence
+"""Helpers for timestamp normalization and conversion."""
+
+from collections.abc import Sequence
 
 import numpy as np
+from numpy.typing import NDArray
 
 
-def normalize_timestamp_array(raw_timestamps: Sequence[Any]) -> np.ndarray:
+def normalize_timestamp_array(raw_timestamps: Sequence[object]) -> NDArray[np.datetime64]:
     """Normalize raw Greptime-style timestamps to a datetime64[ns] array.
 
     This centralizes unit inference (seconds / ms / µs / ns) so that all

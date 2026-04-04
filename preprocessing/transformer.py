@@ -1,7 +1,6 @@
-"""Preprocessing pipeline entrypoint (Phase 2 skeleton).
+"""Preprocessing pipeline entrypoint.
 
-Later phases will implement normalization, feature engineering, and other
-transformations based on the YAML configuration.
+Runs preprocessing transformations based on the YAML configuration.
 """
 
 from __future__ import annotations
@@ -24,7 +23,7 @@ def run_preprocessing_pipeline(config: Dict[str, Any], data_object: Dict[str, An
     """
 
     validate_data_object(data_object)
-    logger.info("Preprocessing pipeline executed (Phase 2: validation only).")
+    logger.info("Preprocessing pipeline executed (validation only).")
 
     # Build classification targets from order book rows for the target asset
     # using the configuration-defined labeling scheme.
@@ -210,15 +209,15 @@ def _build_targets_from_order_book(config: Dict[str, Any], data_object: Dict[str
 
     definition_type = str(price_classes_cfg["definition_type"])
     if definition_type != "percentage":
-        raise ValueError("Only percentage-based price_classes.definition_type is supported in this phase")
+        raise ValueError("Only percentage-based price_classes.definition_type is supported")
 
     labeling_scheme = str(labeling_cfg["scheme"])
     if labeling_scheme != "two_head_intensity":
-        raise ValueError("Only targets.labeling.scheme='two_head_intensity' is supported in this phase")
+        raise ValueError("Only targets.labeling.scheme='two_head_intensity' is supported")
 
     use_midpoint = bool(labeling_cfg["use_midpoint"])
     if not use_midpoint:
-        raise ValueError("Only labeling.use_midpoint=true is supported in this phase")
+        raise ValueError("Only labeling.use_midpoint=true is supported")
 
     boundaries = price_classes_cfg["boundaries"]
     if not isinstance(boundaries, list) or not boundaries:
@@ -230,7 +229,7 @@ def _build_targets_from_order_book(config: Dict[str, Any], data_object: Dict[str
     output_cfg = model_cfg["output"]
     output_type = str(output_cfg["type"])
     if output_type != "two_head_intensity":
-        raise ValueError("Only model.output.type='two_head_intensity' is supported in this phase")
+        raise ValueError("Only model.output.type='two_head_intensity' is supported")
 
     num_classes = int(output_cfg["num_classes"])
 

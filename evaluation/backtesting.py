@@ -23,6 +23,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from mlflow_integration.safe_fluent import get_mlflow_if_active
+
 logger = logging.getLogger(__name__)
 
 # Valid signal generation strategies
@@ -618,10 +620,9 @@ def log_backtest_to_mlflow(result: BacktestResult) -> None:
     Args:
         result: BacktestResult to log
     """
-    try:
-        import mlflow  # type: ignore[import]
-    except ImportError:
-        logger.warning("MLflow not available; skipping backtest logging")
+    mlflow = get_mlflow_if_active()
+    if mlflow is None:
+        logger.debug("Skipping MLFlow backtest logging: no active run.")
         return
 
     # Log metrics
@@ -634,49 +635,50 @@ def log_backtest_to_mlflow(result: BacktestResult) -> None:
 
     # Log artifacts
     try:
-        tmp_dir = Path(tempfile.mkdtemp())
+        with tempfile.TemporaryDirectory(prefix="backtest_artifacts_") as tmp_dir_str:
+            tmp_dir = Path(tmp_dir_str)
 
-        # Equity curve CSV
-        if len(result.equity_curve) > 0:
-            equity_path = tmp_dir / "equity_curve.csv"
-            # Compute drawdown for export
-            peak = np.maximum.accumulate(result.equity_curve)
-            drawdown_pct = (peak - result.equity_curve) / peak * 100.0
-            data = np.column_stack([
-                np.arange(len(result.equity_curve)),
-                result.equity_curve,
-                drawdown_pct,
-            ])
-            header = "sample_idx,equity,drawdown_pct"
-            np.savetxt(
-                equity_path,
-                data,
-                fmt=["%d", "%.2f", "%.4f"],
-                delimiter=",",
-                header=header,
-                comments="",
-            )
-            mlflow.log_artifact(str(equity_path), artifact_path="backtest")
+            # Equity curve CSV
+            if len(result.equity_curve) > 0:
+                equity_path = tmp_dir / "equity_curve.csv"
+                # Compute drawdown for export
+                peak = np.maximum.accumulate(result.equity_curve)
+                drawdown_pct = (peak - result.equity_curve) / peak * 100.0
+                data = np.column_stack([
+                    np.arange(len(result.equity_curve)),
+                    result.equity_curve,
+                    drawdown_pct,
+                ])
+                header = "sample_idx,equity,drawdown_pct"
+                np.savetxt(
+                    equity_path,
+                    data,
+                    fmt=["%d", "%.2f", "%.4f"],
+                    delimiter=",",
+                    header=header,
+                    comments="",
+                )
+                mlflow.log_artifact(str(equity_path), artifact_path="backtest")
 
-        # Trades CSV
-        if result.trades:
-            trades_path = tmp_dir / "trades.csv"
-            with open(trades_path, "w") as f:
-                f.write("entry_idx,exit_idx,direction,entry_price,exit_price,pnl_pct,confidence\n")
-                for t in result.trades:
-                    f.write(
-                        f"{t.entry_idx},{t.exit_idx},{t.direction},"
-                        f"{t.entry_price:.6f},{t.exit_price:.6f},{t.pnl_pct:.4f},{t.signal_confidence:.4f}\n"
-                    )
-            mlflow.log_artifact(str(trades_path), artifact_path="backtest")
+            # Trades CSV
+            if result.trades:
+                trades_path = tmp_dir / "trades.csv"
+                with open(trades_path, "w") as f:
+                    f.write("entry_idx,exit_idx,direction,entry_price,exit_price,pnl_pct,confidence\n")
+                    for t in result.trades:
+                        f.write(
+                            f"{t.entry_idx},{t.exit_idx},{t.direction},"
+                            f"{t.entry_price:.6f},{t.exit_price:.6f},{t.pnl_pct:.4f},{t.signal_confidence:.4f}\n"
+                        )
+                mlflow.log_artifact(str(trades_path), artifact_path="backtest")
 
-        # Summary JSON
-        summary_path = tmp_dir / "summary.json"
-        with open(summary_path, "w") as f:
-            json.dump(result.to_dict(), f, indent=2, default=str)
-        mlflow.log_artifact(str(summary_path), artifact_path="backtest")
+            # Summary JSON
+            summary_path = tmp_dir / "summary.json"
+            with open(summary_path, "w") as f:
+                json.dump(result.to_dict(), f, indent=2, default=str)
+            mlflow.log_artifact(str(summary_path), artifact_path="backtest")
 
-        logger.info("Logged backtest artifacts to MLflow: equity_curve, trades, summary")
+            logger.info("Logged backtest artifacts to MLflow: equity_curve, trades, summary")
 
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to log backtest artifacts to MLflow: %s", exc)

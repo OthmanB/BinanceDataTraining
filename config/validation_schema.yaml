@@ -1,5 +1,7 @@
 # Validation schema for training_config.yaml (Phase 1)
 
+strict_unknown_keys: true
+
 required_sections:
   - data
   - targets
@@ -115,13 +117,29 @@ sections:
       price_classes.definition_type:
         type: string
       price_classes.boundaries:
-        type: list
+        # Can be a numeric list (manual boundaries) or the string "auto".
+        type: any
       labeling.scheme:
         type: string
       labeling.use_midpoint:
         type: boolean
       labeling.handle_gaps:
         type: string
+
+    optional_keys:
+      # Only used when targets.price_classes.boundaries == "auto".
+      price_classes.auto.method:
+        type: string
+      price_classes.auto.per_window:
+        type: boolean
+      price_classes.auto.fit_on:
+        type: string
+      price_classes.auto.labeling_criteria:
+        type: string
+      price_classes.auto.max_samples:
+        type: integer
+      price_classes.auto.random_seed:
+        type: integer
 
   preprocessing:
     type: dict
@@ -159,6 +177,20 @@ sections:
       class_balancing.method:
         type: string
 
+    optional_keys:
+      class_balancing.undersampling.labeling_criteria:
+        type: string
+      class_balancing.undersampling.target_distribution:
+        type: any
+      class_balancing.undersampling.selection_policy:
+        type: string
+      class_balancing.undersampling.min_samples_after_balance:
+        type: integer
+      class_balancing.undersampling.min_fraction_after_balance:
+        type: number
+      class_balancing.undersampling.random_seed:
+        type: integer
+
   model:
     type: dict
     required_keys:
@@ -176,32 +208,18 @@ sections:
         type: boolean
       input_representation.temporal_features.use_global_features:
         type: boolean
-      cnn.num_layers:
-        type: integer
-      cnn.filters:
-        type: list
-      cnn.kernel_sizes:
-        type: list
-      cnn.pool_sizes:
-        type: list
       cnn.activation:
         type: string
-      cnn.dropout_rates:
+      cnn.layers:
         type: list
-      lstm.units:
-        type: integer
-      lstm.dropout:
-        type: number
-      lstm.recurrent_dropout:
-        type: number
+      lstm.layers:
+        type: list
       dense.layers:
-        type: list
-      dense.dropout_rates:
         type: list
       output.type:
         type: string
       output.num_classes:
-        type: integer
+        type: any
       output.activation:
         type: string
       compilation.optimizer:
@@ -226,9 +244,11 @@ sections:
         type: number
       long_term.input_dim:
         type: any
-      long_term.dense.layers:
+      long_term.architecture.conv1d.activation:
+        type: string
+      long_term.architecture.conv1d.layers:
         type: list
-      long_term.dense.dropout_rates:
+      long_term.architecture.dense.layers:
         type: list
 
   training:
@@ -238,10 +258,16 @@ sections:
         type: integer
       batch_size:
         type: integer
+      validation_split:
+        type: number
       debug_max_samples:
         type: integer
       missing_snapshot_strategy:
         type: string
+      runtime.device:
+        type: string
+      runtime.gpu_visible_devices:
+        type: any
       callbacks.early_stopping.enabled:
         type: boolean
       callbacks.early_stopping.monitor:
@@ -284,14 +310,35 @@ sections:
         type: string
       fine_tuning.learning_rate_factor:
         type: number
-      dataset_cache.enabled:
+    optional_keys:
+      runtime.gpu_memory_growth:
         type: boolean
-      dataset_cache.directory:
+      runtime.gpu_allocator:
         type: string
-      dataset_cache.filename_pattern:
+      runtime.gpu_init_lock_enabled:
+        type: boolean
+      runtime.gpu_init_stagger_seconds:
+        type: number
+      runtime.mixed_precision:
         type: string
-      dataset_cache.version:
+      runtime.distributed.enabled:
+        type: boolean
+      runtime.distributed.strategy:
         type: string
+      runtime.distributed.resources:
+        type: list
+      callbacks.terminate_on_nan.enabled:
+        type: boolean
+      sequential_training.enabled:
+        type: boolean
+      sequential_training.window_days:
+        type: integer
+      sequential_training.cleanup_completed_windows:
+        type: boolean
+      sequential_training.cleanup_keep_last_windows:
+        type: integer
+      sequential_training.resume_enabled:
+        type: boolean
 
   snapshot:
     type: dict
@@ -325,6 +372,75 @@ sections:
       search_space:
         type: dict
       trial_model_logging.enabled:
+        type: boolean
+      parallel.max_trials_per_worker_process:
+        type: integer
+      parallel.rss_watchdog_enabled:
+        type: boolean
+      parallel.rss_watchdog_max_worker_rss_gb:
+        type: number
+      parallel.rss_watchdog_check_interval_seconds:
+        type: number
+    optional_keys:
+      parallel.enabled:
+        type: boolean
+      parallel.resources:
+        type: list
+      parallel.storage_uri:
+        type: any
+      parallel.study_name:
+        type: any
+      parallel.resume_study:
+        type: boolean
+      parallel.rss_watchdog_startup_grace_seconds:
+        type: number
+      parallel.rss_watchdog_require_trial_start:
+        type: boolean
+      parallel.rss_watchdog_startup_timeout_seconds:
+        type: number
+      parallel.rss_watchdog_single_worker_fallback_enabled:
+        type: boolean
+      parallel.rss_watchdog_max_restarts_before_single_worker:
+        type: integer
+      parallel.adaptive_scheduler_enabled:
+        type: boolean
+      parallel.adaptive_scheduler_min_workers:
+        type: integer
+      parallel.adaptive_scheduler_recovery_waves:
+        type: integer
+      parallel.adaptive_scheduler_min_trials_per_worker_process:
+        type: integer
+      regime.enabled:
+        type: boolean
+      regime.retry_on_oom:
+        type: boolean
+      regime.max_retry_attempts:
+        type: integer
+      regime.batch_backoff_factor:
+        type: number
+      regime.min_batch_size:
+        type: integer
+      regime.failure_policy:
+        type: string
+      regime.failure_penalty_value:
+        type: number
+      regime.max_vram_fraction:
+        type: any
+      regime.vram_penalty_weight:
+        type: number
+      regime.low_utilization_penalty.enabled:
+        type: boolean
+      regime.low_utilization_penalty.min_samples_per_second:
+        type: number
+      regime.low_utilization_penalty.weight:
+        type: number
+      regime.safe_envelope.enabled:
+        type: boolean
+      regime.safe_envelope.min_success_trials:
+        type: integer
+      regime.safe_envelope.headroom_fraction:
+        type: number
+      regime.safe_envelope.persistence_enabled:
         type: boolean
 
   mlflow:
@@ -408,6 +524,8 @@ sections:
   logging:
     type: dict
     required_keys:
+      format:
+        type: string
       level:
         type: string
       colored_output:
@@ -444,6 +562,8 @@ sections:
     required_keys:
       enabled:
         type: boolean
+      execution_mode:
+        type: string
       sampling.method:
         type: string
       sampling.num_samples:

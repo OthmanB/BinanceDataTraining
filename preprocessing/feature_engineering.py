@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 class FeatureEngineer:
     """Compute derived features from order book data.
 
-    This class follows a two-phase pattern:
+    This class follows a two-step pattern:
     - compute_order_book_features(): per-snapshot features from depth data
     - compute_momentum_features(): temporal features requiring historical context
 

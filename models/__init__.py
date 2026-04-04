@@ -1,7 +1,4 @@
-"""Model architectures for Binance ML Training Platform.
-
-Phase 3 exposes the canonical CNN+LSTM model builder.
-"""
+"""Model architectures for Binance ML Training Platform."""
 
 from .cnn_lstm_multiclass import build_cnn_lstm_model
 

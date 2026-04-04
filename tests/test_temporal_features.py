@@ -103,6 +103,56 @@ class TestTemporalFeatures(unittest.TestCase):
         updated = attach_temporal_features(config, data_object)
         self.assertIs(updated, data_object)
 
+    def test_attach_temporal_features_market_session_boundaries(self) -> None:
+        config = self._build_base_config()
+
+        snapshot_timestamps = np.array(
+            [
+                "2024-01-01T07:59:00",
+                "2024-01-01T08:00:00",
+                "2024-01-01T16:00:00",
+            ],
+            dtype="datetime64[ns]",
+        )
+
+        data_object = {
+            "metadata": {"num_samples": 3, "anchor_indices": [0, 1, 2]},
+            "order_books": {"BTCUSDT": {"snapshot_timestamps": snapshot_timestamps}},
+            "temporal_features": {},
+            "targets": {},
+            "external_data": {},
+        }
+
+        updated = attach_temporal_features(config, data_object)
+        sessions = updated["temporal_features"]["global"][:, 1:]
+        expected_sessions = np.array(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype="float32",
+        )
+        np.testing.assert_array_equal(sessions, expected_sessions)
+
+    def test_attach_temporal_features_invalid_market_session_config_raises(self) -> None:
+        config = self._build_base_config()
+        config["data"]["temporal_features"]["market_session"]["sessions"] = [
+            {"name": "broken", "start_hour": 12, "end_hour": 12},
+        ]
+
+        snapshot_timestamps = np.array(["2024-01-01T01:00:00"], dtype="datetime64[ns]")
+        data_object = {
+            "metadata": {"num_samples": 1, "anchor_indices": [0]},
+            "order_books": {"BTCUSDT": {"snapshot_timestamps": snapshot_timestamps}},
+            "temporal_features": {},
+            "targets": {},
+            "external_data": {},
+        }
+
+        with self.assertRaises(ValueError):
+            attach_temporal_features(config, data_object)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

@@ -1,10 +1,9 @@
 """Input normalization for order book features.
 
-This module implements the Normalizer class that supports three scaling methods
+This module implements the Normalizer class that supports two scaling methods
 as defined in the YAML configuration under preprocessing.normalization:
 - min_max: scales features to [0, 1] range
 - standard: zero-mean, unit-variance scaling
-- robust: median-based scaling using IQR (robust to outliers)
 
 All parameters must be provided via configuration; no implicit defaults are used.
 """
@@ -21,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 class Normalizer:
-    """Feature normalizer supporting min_max, standard, and robust scaling.
+    """Feature normalizer supporting min_max and standard scaling.
 
     This class follows the fit/transform pattern:
     - fit(): compute statistics from training data only
@@ -31,7 +30,7 @@ class Normalizer:
     All configuration must come from YAML; this class does not define defaults.
     """
 
-    SUPPORTED_METHODS = ("min_max", "standard", "robust")
+    SUPPORTED_METHODS = ("min_max", "standard")
 
     def __init__(self, method: str) -> None:
         """Initialize normalizer with the specified method.
@@ -39,7 +38,7 @@ class Normalizer:
         Parameters
         ----------
         method:
-            Scaling method. Must be one of: 'min_max', 'standard', 'robust'.
+            Scaling method. Must be one of: 'min_max', 'standard'.
             Raises ValueError if method is not supported.
         """
         if method not in self.SUPPORTED_METHODS:
@@ -55,8 +54,6 @@ class Normalizer:
         self._max: Optional[np.ndarray] = None
         self._mean: Optional[np.ndarray] = None
         self._std: Optional[np.ndarray] = None
-        self._median: Optional[np.ndarray] = None
-        self._iqr: Optional[np.ndarray] = None
 
     @property
     def method(self) -> str:
@@ -94,11 +91,6 @@ class Normalizer:
         elif self._method == "standard":
             self._mean = np.mean(X_flat, axis=0)
             self._std = np.std(X_flat, axis=0)
-        elif self._method == "robust":
-            self._median = np.median(X_flat, axis=0)
-            q75 = np.percentile(X_flat, 75, axis=0)
-            q25 = np.percentile(X_flat, 25, axis=0)
-            self._iqr = q75 - q25
 
         self._is_fitted = True
 
@@ -136,23 +128,23 @@ class Normalizer:
         X_flat = X.reshape(X.shape[0], -1)
 
         if self._method == "min_max":
-            # Avoid division by zero for constant features
+            if self._min is None or self._max is None:
+                raise RuntimeError(
+                    "Normalizer min/max statistics are unavailable; call fit() before transform()",
+                )
             denom = self._max - self._min
             denom = np.where(denom == 0, 1.0, denom)
             X_normalized = (X_flat - self._min) / denom
 
         elif self._method == "standard":
-            # Avoid division by zero for constant features
+            if self._mean is None or self._std is None:
+                raise RuntimeError(
+                    "Normalizer mean/std statistics are unavailable; call fit() before transform()",
+                )
             std = np.where(self._std == 0, 1.0, self._std)
             X_normalized = (X_flat - self._mean) / std
 
-        elif self._method == "robust":
-            # Avoid division by zero for constant features
-            iqr = np.where(self._iqr == 0, 1.0, self._iqr)
-            X_normalized = (X_flat - self._median) / iqr
-
         else:
-            # Should not reach here due to __init__ validation
             raise ValueError(f"Unknown normalization method: {self._method}")
 
         return X_normalized.reshape(original_shape).astype(np.float32)
@@ -188,8 +180,6 @@ class Normalizer:
             return {"min": self._min, "max": self._max}
         elif self._method == "standard":
             return {"mean": self._mean, "std": self._std}
-        elif self._method == "robust":
-            return {"median": self._median, "iqr": self._iqr}
         else:
             return {}
 

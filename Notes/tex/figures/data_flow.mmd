@@ -1,0 +1,17 @@
+flowchart TD
+  DB[GreptimeDB HTTP SQL API] --> S[stream_order_book_chunks_by_time]
+  S --> GH[GapHandler.iter_gap_handled]
+  GH --> SS[Snapshot store chunks and manifest]
+  SS --> PSD[prepare_snapshot_dataset]
+
+  PSD --> NS[NormalizationStats fit on train only]
+  PSD --> FE[FeatureEngineer order book and momentum]
+  PSD --> LT[Long-term context optional]
+
+  PSD --> TG[build_training_generator]
+  TG --> FIT[model.fit]
+  FIT --> EV[evaluate_snapshot_model]
+
+  EV --> CAL[Calibration]
+  EV --> TDG[Temporal degradation optional]
+  EV --> BT[Backtesting optional]

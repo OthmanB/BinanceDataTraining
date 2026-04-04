@@ -515,6 +515,7 @@ class TestSnapshotAlignmentBehavior(unittest.TestCase):
                 dataset,
                 0,
                 4,
+                batch_size=2,
                 method="min_max",
                 mask_start=mask_start,
                 mask_count=mask_count,
@@ -598,6 +599,72 @@ class TestSnapshotAlignmentBehavior(unittest.TestCase):
         base_seconds = int(_BASE_TS.astype("datetime64[s]").astype("int64"))
         anchor_offsets = [s.anchor_ts_seconds - base_seconds for s in samples]
         self.assertEqual(anchor_offsets, [20, 30, 70])
+
+    def test_label_computation_uses_window_slice_only(self) -> None:
+        config = {
+            "data": {
+                "time_range": {"cadence_seconds": 10},
+                "order_book": {"representation": "top_of_book"},
+                "asset_pairs": {
+                    "target_asset": "BTCUSDT",
+                    "correlated_assets": [],
+                    "alignment": {
+                        "method": "interpolate",
+                        "missing_policy": "forward_fill",
+                        "max_gap_seconds": 120,
+                        "bucket_tolerance_seconds": 0.0,
+                        "include_mask_channel": False,
+                    },
+                },
+                "temporal_features": {"local": [], "global": [], "market_session": {}},
+            },
+            "targets": {
+                "visible_window_seconds": 30,
+                "prediction_horizon_seconds": 10,
+                "price_classes": {"boundaries": [0.1, 0.2]},
+            },
+            "model": {
+                "output": {"type": "two_head_intensity", "num_classes": 3},
+                "input_representation": {
+                    "temporal_features": {
+                        "integration_mode": "none",
+                        "use_local_features": False,
+                        "use_global_features": False,
+                    }
+                },
+            },
+            "preprocessing": {"feature_engineering": {"enabled": False}},
+        }
+
+        builder = sd.StreamingSampleBuilder(
+            config=config,
+            representation="top_of_book",
+            height=2,
+            width=2,
+            assets=["BTCUSDT"],
+            target_asset="BTCUSDT",
+        )
+
+        def _make_multi(offset_s: int, mid_price: float) -> sd.MultiAssetSnapshotRecord:
+            bid = float(mid_price - 0.5)
+            ask = float(mid_price + 0.5)
+            rec = _make_record(offset_s, np.array([bid, 1.0, ask, 1.0]))
+            return sd.MultiAssetSnapshotRecord(timestamp=rec.timestamp, asset_snapshots={"BTCUSDT": rec})
+
+        snapshots = [
+            _make_multi(0, 100.0),
+            _make_multi(10, 100.0),
+            _make_multi(20, 100.0),
+            _make_multi(30, 120.0),
+        ]
+
+        samples = []
+        for snapshot in snapshots:
+            samples.extend(builder.add_snapshot(snapshot))
+
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(samples[0].y_up, 2)
+        self.assertEqual(samples[0].y_down, 0)
 
 
 class TestInterpolationPrecisionDiagnostics(unittest.TestCase):

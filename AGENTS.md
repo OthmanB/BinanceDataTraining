@@ -7,17 +7,19 @@ Follow these rules before making changes.
 - Repo: BinanceDataTraining
 - Primary language: Python
 - Entry point: `main.py` (config-driven pipeline)
+- Observability server: `observability/server.py` (stdlib `http.server` + HTMX dashboard + `/metrics`)
 - Tests: `unittest` plus some `pytest`/`hypothesis`
 
 ## Setup
 - Use `bash setup_venv.sh` to create `.venv` and install deps.
-- Required Python: >=3.9 and <3.12 (per `setup_venv.sh`).
+- Required Python: >=3.9 and <3.13 (per `setup_venv.sh`).
 - Dependency install: `pip install --only-binary=pyarrow -r requirements.txt`.
 - Sanity check: `python -m pip check`.
 
 ## Build
 - No explicit build system detected (no Makefile, pyproject, or tox).
 - If you need to run the pipeline, use `python main.py --config <path>`.
+- Observability server: `python -m observability.server --config config/observability.yaml`
 
 ## Lint / Format
 - No lint/format tooling configured in this repo.
@@ -95,6 +97,9 @@ Follow these rules before making changes.
 - Environment placeholders `${VAR}` must resolve or raise `ConfigError`.
 - Update config schema validation when adding new keys.
 - Avoid leaking secrets to logs.
+- Training configs: full baseline in `config/training_config.yaml`; simple editor baseline in `config/training_config_default.yaml`.
+- Observability config: `config/observability.yaml` (non-secrets); Basic Auth via `OBSERVABILITY_USER` / `OBSERVABILITY_PASSWORD`.
+- Runtime device selection: `training.runtime.device` (`cpu` or `gpu`), `training.runtime.gpu_visible_devices`.
 
 ## Data / ML Conventions
 - Validate array shapes and sizes early.

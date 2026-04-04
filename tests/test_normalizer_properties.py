@@ -99,30 +99,6 @@ class TestNormalizerProperties(unittest.TestCase):
                 st.integers(min_value=1, max_value=10),
             ),
             elements=st.floats(
-                min_value=-1e6,
-                max_value=1e6,
-                allow_nan=False,
-                allow_infinity=False,
-                allow_subnormal=False,
-                width=32,
-            ),
-        )
-    )
-    def test_shape_preservation_robust(self, data: np.ndarray) -> None:
-        """Property: output shape always equals input shape for robust."""
-        normalizer = Normalizer("robust")
-        output = normalizer.fit_transform(data)
-        self.assertEqual(output.shape, data.shape)
-
-    @settings(max_examples=_MAX_EXAMPLES, suppress_health_check=[HealthCheck.too_slow])
-    @given(
-        data=arrays(
-            dtype=np.float32,
-            shape=st.tuples(
-                st.integers(min_value=2, max_value=50),
-                st.integers(min_value=1, max_value=10),
-            ),
-            elements=st.floats(
                 min_value=-1e3,
                 max_value=1e3,
                 allow_nan=False,
@@ -230,7 +206,7 @@ class TestNormalizerProperties(unittest.TestCase):
         np.testing.assert_array_equal(output1, output2)
 
     @settings(max_examples=_MAX_EXAMPLES, suppress_health_check=[HealthCheck.too_slow])
-    @given(method=st.sampled_from(["min_max", "standard", "robust"]))
+    @given(method=st.sampled_from(["min_max", "standard"]))
     def test_is_fitted_property(self, method: str) -> None:
         """Property: is_fitted is False before fit, True after."""
         normalizer = Normalizer(method)
@@ -241,13 +217,50 @@ class TestNormalizerProperties(unittest.TestCase):
         self.assertTrue(normalizer.is_fitted)
 
     @settings(max_examples=_MAX_EXAMPLES, suppress_health_check=[HealthCheck.too_slow])
-    @given(method=st.sampled_from(["min_max", "standard", "robust"]))
+    @given(method=st.sampled_from(["min_max", "standard"]))
     def test_create_from_config(self, method: str) -> None:
         """Property: create_normalizer_from_config returns correct method."""
         config = _make_config(method)
         normalizer = create_normalizer_from_config(config)
         self.assertEqual(normalizer.method, method)
         self.assertFalse(normalizer.is_fitted)
+
+
+class TestNormalizerRejection(unittest.TestCase):
+    """Test that unsupported normalization methods are rejected."""
+
+    def test_robust_method_rejected_at_init(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            Normalizer("robust")
+        self.assertIn("robust", str(ctx.exception).lower())
+        self.assertIn("unsupported", str(ctx.exception).lower())
+
+    def test_invalid_method_rejected_at_init(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            Normalizer("invalid_method")
+        self.assertIn("unsupported", str(ctx.exception).lower())
+
+    def test_transform_raises_when_min_max_statistics_missing(self) -> None:
+        normalizer = Normalizer("min_max")
+        normalizer._is_fitted = True
+        normalizer._min = None
+        normalizer._max = None
+
+        with self.assertRaises(RuntimeError) as ctx:
+            normalizer.transform(np.ones((2, 2), dtype=np.float32))
+
+        self.assertIn("fit()", str(ctx.exception))
+
+    def test_transform_raises_when_standard_statistics_missing(self) -> None:
+        normalizer = Normalizer("standard")
+        normalizer._is_fitted = True
+        normalizer._mean = None
+        normalizer._std = None
+
+        with self.assertRaises(RuntimeError) as ctx:
+            normalizer.transform(np.ones((2, 2), dtype=np.float32))
+
+        self.assertIn("fit()", str(ctx.exception))
 
 
 if __name__ == "__main__":

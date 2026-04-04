@@ -3,6 +3,10 @@
 This module tests the model architecture construction, including:
 - Single-input (short-term only) mode
 - Dual-input (short-term + long-term context) mode
+- Multi-LSTM stacking
+- CNN normalization layers
+- Optional pooling per CNN layer
+- Long-term Conv1D + Dense architecture
 - Configuration parsing for long-term branch
 - Input/output shape validation
 """
@@ -19,9 +23,12 @@ import numpy as np
 def _make_minimal_config(
     long_term_cfg: Dict[str, Any] | None = None,
     input_dim_override: int | None = None,
+    cnn_layers: list | None = None,
+    lstm_layers: list | None = None,
+    dense_layers: list | None = None,
 ) -> Dict[str, Any]:
-    """Create a minimal valid config for model building."""
-    lt_defaults = {
+    """Create a minimal valid config for model building (new list-of-dicts format)."""
+    lt_defaults: Dict[str, Any] = {
         "enabled": False,
         "windows_days": [7, 30, 90],
         "resolution_days": 1,
@@ -29,32 +36,44 @@ def _make_minimal_config(
         "summary_method": "mean",
         "ewma_halflife_days": 7.0,
         "input_dim": input_dim_override,
-        "dense": {"layers": [32], "dropout_rates": [0.2]},
+        "architecture": {
+            "conv1d": {"activation": "relu", "layers": []},
+            "dense": {"layers": [{"units": 32, "dropout": 0.2}]},
+        },
     }
     lt_cfg = dict(lt_defaults)
     if long_term_cfg is not None:
         lt_cfg.update(long_term_cfg)
     if input_dim_override is not None:
         lt_cfg["input_dim"] = input_dim_override
-    
+
+    if cnn_layers is None:
+        cnn_layers = [
+            {"filters": 32, "kernel_size": [3, 3], "pool_size": [2, 2], "normalization": None, "dropout": 0.1},
+            {"filters": 64, "kernel_size": [3, 3], "pool_size": [2, 2], "normalization": None, "dropout": 0.2},
+        ]
+
+    if lstm_layers is None:
+        lstm_layers = [
+            {"units": 64, "dropout": 0.2, "recurrent_dropout": 0.0, "post_dropout": 0.0},
+        ]
+
+    if dense_layers is None:
+        dense_layers = [
+            {"units": 32, "dropout": 0.2},
+        ]
+
     return {
         "model": {
             "cnn": {
-                "num_layers": 2,
-                "filters": [32, 64],
-                "kernel_sizes": [[3, 3], [3, 3]],
-                "pool_sizes": [[2, 2], [2, 2]],
                 "activation": "relu",
-                "dropout_rates": [0.1, 0.2],
+                "layers": cnn_layers,
             },
             "lstm": {
-                "units": 64,
-                "dropout": 0.2,
-                "recurrent_dropout": 0.0,
+                "layers": lstm_layers,
             },
             "dense": {
-                "layers": [32],
-                "dropout_rates": [0.2],
+                "layers": dense_layers,
             },
             "output": {
                 "type": "two_head_intensity",
@@ -97,8 +116,6 @@ class TestModelBuilderSingleInput(unittest.TestCase):
 
         # Check two outputs
         self.assertEqual(len(model.outputs), 2)
-        # Check output names contain the head identifiers (Keras 3.x uses different naming)
-        output_names = [o.name for o in model.outputs]
         # Just verify we have two outputs with expected shapes
         self.assertEqual(model.outputs[0].shape[-1], 4)  # num_classes
         self.assertEqual(model.outputs[1].shape[-1], 4)
@@ -165,9 +182,9 @@ class TestModelBuilderDualInput(unittest.TestCase):
             "enabled": True,
             "windows_days": [7, 30],
             "features": ["mean_return", "volatility"],
-            "dense": {
-                "layers": [16],
-                "dropout_rates": [0.1],
+            "architecture": {
+                "conv1d": {"activation": "relu", "layers": []},
+                "dense": {"layers": [{"units": 16, "dropout": 0.1}]},
             },
         })
         input_shape = (10, 8, 8, 4)
@@ -270,6 +287,222 @@ class TestModelBuilderDualInput(unittest.TestCase):
             )
 
 
+class TestModelBuilderMultiLSTM(unittest.TestCase):
+    """Tests for stacked (multi-layer) LSTM support."""
+
+    def test_two_lstm_layers(self) -> None:
+        """Test model with two stacked LSTM layers."""
+        try:
+            from models.cnn_lstm_multiclass import build_cnn_lstm_model
+        except ImportError:
+            self.skipTest("TensorFlow not available")
+
+        config = _make_minimal_config(lstm_layers=[
+            {"units": 64, "dropout": 0.2, "recurrent_dropout": 0.0, "post_dropout": 0.25},
+            {"units": 32, "dropout": 0.1, "recurrent_dropout": 0.0, "post_dropout": 0.0},
+        ])
+        input_shape = (10, 8, 8, 4)
+
+        model = build_cnn_lstm_model(config, input_shape)
+
+        # Verify both LSTM layers exist
+        lstm_layer_names = [l.name for l in model.layers if "lstm" in l.name.lower() and "dropout" not in l.name]
+        self.assertEqual(len(lstm_layer_names), 2)
+
+    def test_three_lstm_forward_pass(self) -> None:
+        """Test forward pass with three stacked LSTMs."""
+        try:
+            from models.cnn_lstm_multiclass import build_cnn_lstm_model
+        except ImportError:
+            self.skipTest("TensorFlow not available")
+
+        config = _make_minimal_config(lstm_layers=[
+            {"units": 32, "dropout": 0.0, "recurrent_dropout": 0.0, "post_dropout": 0.1},
+            {"units": 48, "dropout": 0.0, "recurrent_dropout": 0.0, "post_dropout": 0.1},
+            {"units": 16, "dropout": 0.0, "recurrent_dropout": 0.0, "post_dropout": 0.0},
+        ])
+        input_shape = (10, 8, 8, 4)
+
+        model = build_cnn_lstm_model(config, input_shape)
+
+        batch_size = 2
+        x = np.random.randn(batch_size, *input_shape).astype(np.float32)
+        outputs = model.predict(x, verbose=0)
+
+        self.assertEqual(len(outputs), 2)
+        self.assertEqual(outputs[0].shape, (batch_size, 4))
+
+
+class TestModelBuilderNormalization(unittest.TestCase):
+    """Tests for normalization layers in the CNN stack."""
+
+    def test_batch_normalization(self) -> None:
+        """Test CNN layers with batch normalization."""
+        try:
+            from models.cnn_lstm_multiclass import build_cnn_lstm_model
+        except ImportError:
+            self.skipTest("TensorFlow not available")
+
+        config = _make_minimal_config(cnn_layers=[
+            {"filters": 32, "kernel_size": [3, 3], "pool_size": [2, 2], "normalization": "batch", "dropout": 0.0},
+        ])
+        input_shape = (10, 8, 8, 4)
+
+        model = build_cnn_lstm_model(config, input_shape)
+
+        # Normalization is wrapped in TimeDistributed; check by layer name
+        bn_layers = [l for l in model.layers if "_norm" in l.name]
+        self.assertGreaterEqual(len(bn_layers), 1)
+
+    def test_layer_normalization(self) -> None:
+        """Test CNN layers with layer normalization."""
+        try:
+            from models.cnn_lstm_multiclass import build_cnn_lstm_model
+        except ImportError:
+            self.skipTest("TensorFlow not available")
+
+        config = _make_minimal_config(cnn_layers=[
+            {"filters": 32, "kernel_size": [3, 3], "pool_size": [2, 2], "normalization": "layer", "dropout": 0.0},
+        ])
+        input_shape = (10, 8, 8, 4)
+
+        model = build_cnn_lstm_model(config, input_shape)
+
+        # Normalization is wrapped in TimeDistributed; check by layer name
+        ln_layers = [l for l in model.layers if "_norm" in l.name]
+        self.assertGreaterEqual(len(ln_layers), 1)
+
+    def test_no_normalization(self) -> None:
+        """Test CNN layers with normalization=null (None)."""
+        try:
+            from models.cnn_lstm_multiclass import build_cnn_lstm_model
+        except ImportError:
+            self.skipTest("TensorFlow not available")
+
+        config = _make_minimal_config(cnn_layers=[
+            {"filters": 32, "kernel_size": [3, 3], "pool_size": [2, 2], "normalization": None, "dropout": 0.0},
+        ])
+        input_shape = (10, 8, 8, 4)
+
+        model = build_cnn_lstm_model(config, input_shape)
+
+        # No normalization layers should exist (check by name)
+        norm_layers = [l for l in model.layers if "_norm" in l.name]
+        self.assertEqual(len(norm_layers), 0)
+
+
+class TestModelBuilderOptionalPooling(unittest.TestCase):
+    """Tests for optional pooling (pool_size=null skips pooling)."""
+
+    def test_skip_pooling(self) -> None:
+        """Test CNN layer with pool_size=null (no pooling)."""
+        try:
+            from models.cnn_lstm_multiclass import build_cnn_lstm_model
+        except ImportError:
+            self.skipTest("TensorFlow not available")
+
+        config = _make_minimal_config(cnn_layers=[
+            {"filters": 32, "kernel_size": [3, 3], "pool_size": None, "normalization": None, "dropout": 0.0},
+        ])
+        input_shape = (10, 8, 8, 4)
+
+        model = build_cnn_lstm_model(config, input_shape)
+
+        # Pooling is wrapped in TimeDistributed; check by layer name
+        pool_layers = [l for l in model.layers if "_pool" in l.name]
+        self.assertEqual(len(pool_layers), 0)
+
+    def test_mixed_pooling(self) -> None:
+        """Test mix of layers with and without pooling."""
+        try:
+            from models.cnn_lstm_multiclass import build_cnn_lstm_model
+        except ImportError:
+            self.skipTest("TensorFlow not available")
+
+        config = _make_minimal_config(cnn_layers=[
+            {"filters": 16, "kernel_size": [3, 3], "pool_size": [2, 2], "normalization": None, "dropout": 0.0},
+            {"filters": 32, "kernel_size": [3, 3], "pool_size": None, "normalization": None, "dropout": 0.0},
+            {"filters": 64, "kernel_size": [3, 3], "pool_size": [2, 2], "normalization": None, "dropout": 0.0},
+        ])
+        input_shape = (10, 8, 8, 4)
+
+        model = build_cnn_lstm_model(config, input_shape)
+
+        # Should have exactly 2 pooling layers (layers 0 and 2)
+        pool_layers = [l for l in model.layers if "_pool" in l.name]
+        self.assertEqual(len(pool_layers), 2)
+
+
+class TestModelBuilderLongTermConv1D(unittest.TestCase):
+    """Tests for long-term branch with Conv1D + Dense architecture."""
+
+    def test_long_term_conv1d_forward_pass(self) -> None:
+        """Test forward pass with Conv1D on long-term branch."""
+        try:
+            from models.cnn_lstm_multiclass import build_cnn_lstm_model
+        except ImportError:
+            self.skipTest("TensorFlow not available")
+
+        config = _make_minimal_config(long_term_cfg={
+            "enabled": True,
+            "windows_days": [7, 30, 90],
+            "features": ["mean_return", "volatility", "volume_proxy", "skewness"],
+            "input_dim": None,
+            "architecture": {
+                "conv1d": {
+                    "activation": "relu",
+                    "layers": [
+                        {"filters": 16, "kernel_size": 2, "pool_size": None, "normalization": None, "dropout": 0.0},
+                    ],
+                },
+                "dense": {
+                    "layers": [{"units": 16, "dropout": 0.1}],
+                },
+            },
+        })
+        input_shape = (10, 8, 8, 4)
+        lt_dim = 3 * 4  # 3 windows * 4 features = 12
+
+        model = build_cnn_lstm_model(config, input_shape)
+
+        batch_size = 2
+        x_short = np.random.randn(batch_size, *input_shape).astype(np.float32)
+        x_long = np.random.randn(batch_size, lt_dim).astype(np.float32)
+
+        outputs = model.predict([x_short, x_long], verbose=0)
+
+        self.assertEqual(len(outputs), 2)
+        self.assertEqual(outputs[0].shape, (batch_size, 4))
+
+        # Verify Conv1D layer exists in the model
+        conv1d_layers = [l for l in model.layers if "conv1d" in l.__class__.__name__.lower()]
+        self.assertGreaterEqual(len(conv1d_layers), 1)
+
+    def test_long_term_dense_only(self) -> None:
+        """Test long-term branch with empty Conv1D (dense-only)."""
+        try:
+            from models.cnn_lstm_multiclass import build_cnn_lstm_model
+        except ImportError:
+            self.skipTest("TensorFlow not available")
+
+        config = _make_minimal_config(long_term_cfg={
+            "enabled": True,
+            "windows_days": [7, 30],
+            "features": ["mean_return", "volatility"],
+            "architecture": {
+                "conv1d": {"activation": "relu", "layers": []},
+                "dense": {"layers": [{"units": 16, "dropout": 0.0}]},
+            },
+        })
+        input_shape = (10, 8, 8, 4)
+
+        model = build_cnn_lstm_model(config, input_shape)
+
+        # No Conv1D layers should exist
+        conv1d_layers = [l for l in model.layers if "conv1d" in l.__class__.__name__.lower()]
+        self.assertEqual(len(conv1d_layers), 0)
+
+
 class TestModelBuilderConfigValidation(unittest.TestCase):
     """Tests for configuration validation."""
 
@@ -301,19 +534,47 @@ class TestModelBuilderConfigValidation(unittest.TestCase):
             build_cnn_lstm_model(config, input_shape=(10, 8, 8, 4))
         self.assertIn("two_head_intensity", str(ctx.exception))
 
-    def test_missing_cnn_config(self) -> None:
-        """Test that missing CNN config raises error."""
+    def test_invalid_cnn_layers_type(self) -> None:
+        """Test that non-list CNN layers raises ValueError."""
         try:
             from models.cnn_lstm_multiclass import build_cnn_lstm_model
         except ImportError:
             self.skipTest("TensorFlow not available")
 
         config = _make_minimal_config()
-        config["model"]["cnn"]["filters"] = "not_a_list"
+        config["model"]["cnn"]["layers"] = "not_a_list"
 
         with self.assertRaises(ValueError) as ctx:
             build_cnn_lstm_model(config, input_shape=(10, 8, 8, 4))
-        self.assertIn("must be lists", str(ctx.exception))
+        self.assertIn("must be a list", str(ctx.exception))
+
+    def test_empty_lstm_layers_raises(self) -> None:
+        """Test that empty LSTM layers list raises ValueError."""
+        try:
+            from models.cnn_lstm_multiclass import build_cnn_lstm_model
+        except ImportError:
+            self.skipTest("TensorFlow not available")
+
+        config = _make_minimal_config(lstm_layers=[])
+
+        with self.assertRaises(ValueError) as ctx:
+            build_cnn_lstm_model(config, input_shape=(10, 8, 8, 4))
+        self.assertIn("non-empty list", str(ctx.exception))
+
+    def test_invalid_normalization_type(self) -> None:
+        """Test that invalid normalization type raises ValueError."""
+        try:
+            from models.cnn_lstm_multiclass import build_cnn_lstm_model
+        except ImportError:
+            self.skipTest("TensorFlow not available")
+
+        config = _make_minimal_config(cnn_layers=[
+            {"filters": 32, "kernel_size": [3, 3], "pool_size": [2, 2], "normalization": "invalid", "dropout": 0.0},
+        ])
+
+        with self.assertRaises(ValueError) as ctx:
+            build_cnn_lstm_model(config, input_shape=(10, 8, 8, 4))
+        self.assertIn("Unsupported normalization", str(ctx.exception))
 
 
 class TestLongTermContextHelpers(unittest.TestCase):

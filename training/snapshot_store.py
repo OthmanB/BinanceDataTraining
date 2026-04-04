@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 import hashlib
 import json
 import logging
@@ -16,6 +16,11 @@ import os
 import shutil
 
 from utils.config_loader import ConfigError
+from .manifest_utils import (
+    load_manifest as _load_manifest,
+    sanitize_component as _sanitize_component,
+    write_manifest as _write_manifest,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -64,10 +69,6 @@ def _snapshot_config_subset(config: Dict[str, Any]) -> Dict[str, Any]:
         "model": {
             "architecture": model_cfg["architecture"],
             "input_representation": model_cfg["input_representation"],
-            "cnn": {
-                "kernel_sizes": model_cfg["cnn"]["kernel_sizes"],
-                "pool_sizes": model_cfg["cnn"]["pool_sizes"],
-            },
             "output": model_cfg["output"],
         },
     }
@@ -81,16 +82,6 @@ def compute_config_hash(config: Dict[str, Any]) -> str:
     subset = _snapshot_config_subset(config)
     payload = json.dumps(subset, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def _sanitize_component(value: str) -> str:
-    safe_chars = []
-    for ch in value:
-        if ch.isalnum() or ch in {"-", "_"}:
-            safe_chars.append(ch)
-        else:
-            safe_chars.append("-")
-    return "".join(safe_chars)
 
 
 def _build_auto_snapshot_name(config: Dict[str, Any], root_name: str, config_hash: str) -> str:
@@ -110,24 +101,6 @@ def _build_auto_snapshot_name(config: Dict[str, Any], root_name: str, config_has
         _sanitize_component(end_date),
     ]
     return "_".join(parts)
-
-
-def _load_manifest(path: str) -> Optional[Dict[str, Any]]:
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            return json.load(handle)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to load snapshot manifest %s: %s", path, exc)
-        return None
-
-
-def _write_manifest(path: str, manifest: Dict[str, Any]) -> None:
-    tmp_path = path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as handle:
-        json.dump(manifest, handle, indent=2, sort_keys=True)
-    os.replace(tmp_path, path)
 
 
 def resolve_snapshot_context(config: Dict[str, Any]) -> SnapshotContext:
@@ -164,7 +137,7 @@ def resolve_snapshot_context(config: Dict[str, Any]) -> SnapshotContext:
 
     os.makedirs(root_dir, exist_ok=True)
 
-    manifest = _load_manifest(manifest_path)
+    manifest = _load_manifest(manifest_path, logger, "snapshot")
     if manifest is not None:
         manifest_hash = str(manifest.get("config_hash") or "")
         if manifest_hash and manifest_hash != config_hash:
@@ -219,7 +192,7 @@ def initialize_manifest(context: SnapshotContext, config: Dict[str, Any]) -> Dic
 
 
 def load_or_create_manifest(context: SnapshotContext, config: Dict[str, Any]) -> Dict[str, Any]:
-    manifest = _load_manifest(context.manifest_path)
+    manifest = _load_manifest(context.manifest_path, logger, "snapshot")
     if manifest is None:
         return initialize_manifest(context, config)
     return manifest
@@ -246,7 +219,7 @@ def maybe_evict_snapshots(context: SnapshotContext, max_snapshots: int) -> None:
         manifest_path = os.path.join(snapshot_path, "manifest.json")
         if not os.path.isdir(snapshot_path) or not os.path.exists(manifest_path):
             continue
-        manifest = _load_manifest(manifest_path)
+        manifest = _load_manifest(manifest_path, logger, "snapshot")
         created_at = None
         if manifest is not None:
             created_at = manifest.get("created_at")

@@ -26,7 +26,7 @@ def _make_long_term_config(enabled: bool = True) -> dict:
                 "summary_method": "mean",
                 "ewma_halflife_days": 7.0,
                 "input_dim": None,
-                "dense": {"layers": [32], "dropout_rates": [0.2]},
+                "architecture": {"conv1d": {"activation": "relu", "layers": []}, "dense": {"layers": [{"units": 32, "dropout": 0.2}]}},
             },
         },
         "data": {
@@ -177,9 +177,7 @@ class TestWrapGeneratorWithLongTerm(unittest.TestCase):
         long_term_features = np.random.randn(batch_size, 3).astype(np.float32)
 
         base_gen = self._make_generator([(x, y)])
-        wrapped_gen = wrap_generator_with_long_term(
-            base_gen, long_term_features, start_index=0, batch_size=batch_size
-        )
+        wrapped_gen = wrap_generator_with_long_term(base_gen, long_term_features, start_index=0)
 
         result = next(wrapped_gen)
         self.assertEqual(len(result), 2)  # ([x, lt], y)
@@ -201,9 +199,7 @@ class TestWrapGeneratorWithLongTerm(unittest.TestCase):
         long_term_features = np.random.randn(batch_size, 3).astype(np.float32)
 
         base_gen = self._make_generator([(x, y, sw)], include_sample_weights=True)
-        wrapped_gen = wrap_generator_with_long_term(
-            base_gen, long_term_features, start_index=0, batch_size=batch_size
-        )
+        wrapped_gen = wrap_generator_with_long_term(base_gen, long_term_features, start_index=0)
 
         result = next(wrapped_gen)
         self.assertEqual(len(result), 3)  # ([x, lt], y, sw)
@@ -230,7 +226,7 @@ class TestWrapGeneratorWithLongTerm(unittest.TestCase):
 
         base_gen = self._make_generator([(x, y)])
         wrapped_gen = wrap_generator_with_long_term(
-            base_gen, long_term_features, start_index=start_index, batch_size=batch_size
+            base_gen, long_term_features, start_index=start_index
         )
 
         result = next(wrapped_gen)
@@ -257,9 +253,7 @@ class TestWrapGeneratorWithLongTerm(unittest.TestCase):
         long_term_features = np.arange(total_samples * 2).reshape(total_samples, 2).astype(np.float32)
 
         base_gen = self._make_generator(batches)
-        wrapped_gen = wrap_generator_with_long_term(
-            base_gen, long_term_features, start_index=0, batch_size=batch_size
-        )
+        wrapped_gen = wrap_generator_with_long_term(base_gen, long_term_features, start_index=0)
 
         for batch_idx, result in enumerate(wrapped_gen):
             x_dual, _ = result
@@ -282,9 +276,7 @@ class TestWrapGeneratorWithLongTerm(unittest.TestCase):
         long_term_features = np.random.randn(2, 3).astype(np.float32)
 
         base_gen = self._make_generator([(x, y)])
-        wrapped_gen = wrap_generator_with_long_term(
-            base_gen, long_term_features, start_index=0, batch_size=batch_size
-        )
+        wrapped_gen = wrap_generator_with_long_term(base_gen, long_term_features, start_index=0)
 
         with self.assertRaises(ValueError) as ctx:
             next(wrapped_gen)
@@ -308,20 +300,111 @@ class TestWrapGeneratorWithLongTerm(unittest.TestCase):
 
         base_gen = self._make_generator(batches)
         wrapped_gen = wrap_generator_with_long_term(
-            base_gen, long_term_features, start_index=start_index, batch_size=batch_size
+            base_gen, long_term_features, start_index=start_index
         )
 
         results = list(wrapped_gen)
         self.assertEqual(len(results), num_batches)
 
-        # First batch should have indices [6, 7]
-        np.testing.assert_array_equal(
-            results[0][0][1], long_term_features[6:8]
+    def test_partial_batch_supported(self) -> None:
+        """Partial final batches should be supported without mismatches."""
+        batches = []
+        batches.append((np.random.randn(24, 3, 2).astype(np.float32), np.zeros((24, 1), dtype=np.float32)))
+        batches.append((np.random.randn(8, 3, 2).astype(np.float32), np.zeros((8, 1), dtype=np.float32)))
+
+        long_term_features = np.random.randn(32, 4).astype(np.float32)
+        base_gen = self._make_generator(batches)
+        wrapped_gen = wrap_generator_with_long_term(base_gen, long_term_features, start_index=0)
+
+        results = list(wrapped_gen)
+        self.assertEqual(len(results), 2)
+        first = results[0][0][1]
+        second = results[1][0][1]
+        self.assertEqual(first.shape[0], 24)
+        self.assertEqual(second.shape[0], 8)
+
+        np.testing.assert_array_equal(results[0][0][1], long_term_features[:24])
+        np.testing.assert_array_equal(results[1][0][1], long_term_features[24:32])
+
+    def test_epoch_boundary_reset(self) -> None:
+        """Wrapper resets current_idx at epoch boundary (while-True base generator)."""
+        batch_size = 4
+        total_samples = 8
+        num_epochs = 3
+
+        # Build a base generator that loops infinitely (like build_training_generator)
+        x_batch_1 = np.arange(batch_size * 2).reshape(batch_size, 2).astype(np.float32)
+        y_batch_1 = np.zeros((batch_size, 1), dtype=np.float32)
+        x_batch_2 = np.arange(batch_size * 2, total_samples * 2).reshape(batch_size, 2).astype(np.float32)
+        y_batch_2 = np.ones((batch_size, 1), dtype=np.float32)
+
+        def infinite_gen() -> Iterator[Tuple]:
+            while True:
+                yield (x_batch_1, y_batch_1)
+                yield (x_batch_2, y_batch_2)
+
+        long_term_features = np.arange(total_samples * 3).reshape(total_samples, 3).astype(np.float32)
+
+        wrapped_gen = wrap_generator_with_long_term(
+            infinite_gen(),
+            long_term_features,
+            start_index=0,
+            end_index=total_samples,
         )
-        # Second batch should have indices [8, 9]
-        np.testing.assert_array_equal(
-            results[1][0][1], long_term_features[8:10]
+
+        steps_per_epoch = 2
+        for epoch in range(num_epochs):
+            for step in range(steps_per_epoch):
+                result = next(wrapped_gen)
+                x_dual, y_out = result
+                lt_batch = x_dual[1]
+                expected_start = step * batch_size
+                expected_end = expected_start + batch_size
+                np.testing.assert_array_equal(
+                    lt_batch,
+                    long_term_features[expected_start:expected_end],
+                    err_msg=f"Mismatch at epoch={epoch}, step={step}",
+                )
+
+    def test_epoch_boundary_reset_with_val_offset(self) -> None:
+        """Wrapper resets correctly for validation generators with non-zero start_index."""
+        batch_size = 3
+        val_start = 10
+        val_end = 16
+        num_epochs = 2
+
+        x_batch_1 = np.ones((batch_size, 2), dtype=np.float32)
+        y_batch_1 = np.zeros((batch_size, 1), dtype=np.float32)
+        x_batch_2 = np.ones((batch_size, 2), dtype=np.float32) * 2
+        y_batch_2 = np.ones((batch_size, 1), dtype=np.float32)
+
+        def infinite_gen() -> Iterator[Tuple]:
+            while True:
+                yield (x_batch_1, y_batch_1)
+                yield (x_batch_2, y_batch_2)
+
+        total_features = 20
+        long_term_features = np.arange(total_features * 2).reshape(total_features, 2).astype(np.float32)
+
+        wrapped_gen = wrap_generator_with_long_term(
+            infinite_gen(),
+            long_term_features,
+            start_index=val_start,
+            end_index=val_end,
         )
+
+        steps_per_epoch = 2
+        for epoch in range(num_epochs):
+            for step in range(steps_per_epoch):
+                result = next(wrapped_gen)
+                lt_batch = result[0][1]
+                expected_start = val_start + step * batch_size
+                expected_end = expected_start + batch_size
+                np.testing.assert_array_equal(
+                    lt_batch,
+                    long_term_features[expected_start:expected_end],
+                    err_msg=f"Val mismatch at epoch={epoch}, step={step}",
+                )
 
 
 if __name__ == "__main__":

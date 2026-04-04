@@ -1,0 +1,61 @@
+base_config: "e2e_fullscale_production_month1.yaml"
+
+run_mode:
+  mode: "production"
+
+data:
+  time_range:
+    start_date: "2024-01-01"
+    end_date: "2024-01-20"
+  asset_pairs:
+    alignment:
+      missing_policy: "forward_fill"
+  validation:
+    fail_on_invalid: false
+
+training:
+  epochs: 2
+  debug_max_samples: 100000000
+  sequential_training:
+    enabled: true
+    window_days: 10
+    cleanup_completed_windows: false
+    cleanup_keep_last_windows: 0
+    resume_enabled: true
+  callbacks:
+    terminate_on_nan:
+      enabled: true
+#  runtime:
+#    gpu_memory_growth: true
+#    gpu_allocator: "cuda_malloc_async"
+
+diagnostics:
+  execution_mode: "per_snapshot"
+
+hyperparameter_optimization:
+  n_trials: 2
+  parallel:
+    resources: ["gpu:0", "gpu:1"]
+    max_trials_per_worker_process: 1
+    storage_uri: "sqlite:////home/obenomar/Trade/BinanceAlgo/BinanceDataTraining/tmp/mlflow/optuna/fullscale_preflight_short_extended.db"
+    study_name: "e2e_fullscale_preflight_short_extended"
+    resume_study: false
+  search_space:
+    batch_size: [2, 4, 5]
+
+preprocessing:
+  class_balancing:
+    enabled: true             # When true, evict samples from overrepresented label classes before training.
+    method: "undersampling"   # Currently supported: "undersampling" only.
+
+    # Undersampling is a coarse pre-training filter. It is independent from
+    # training.class_weights and can be combined with it.
+    undersampling:
+      labeling_criteria: "max_intensity"  # One of: "max_intensity" | "up_intensity" | "down_intensity".
+      # Relative class weights; length must equal model.output.num_classes.
+      # Values do not need to sum to 1.0.
+      target_distribution: "auto"
+      selection_policy: "uniform_time"  # One of: "uniform_time" | "kmeans" | "random".
+      min_samples_after_balance: 500  # Fail fast if undersampling keeps fewer samples.
+      min_fraction_after_balance: 0.05  # Fail fast if undersampling keeps a smaller fraction of the train split.
+      #random_seed: 42

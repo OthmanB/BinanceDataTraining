@@ -30,6 +30,7 @@ import os
 
 import numpy as np
 
+from .snapshot_dataset import load_chunk_anchor_timestamps
 from utils.config_loader import ConfigError
 
 
@@ -99,8 +100,7 @@ def _load_anchor_timestamps(snapshot_dataset: Any) -> np.ndarray:
 
     anchor_list = []
     for chunk in snapshot_dataset.chunks:
-        with np.load(chunk.file_path) as npz:
-            anchor_ts = np.asarray(npz["anchor_ts"], dtype="int64")
+        anchor_ts = load_chunk_anchor_timestamps(chunk)
         if anchor_ts.ndim != 1:
             raise ConfigError("Anchor timestamps array must be 1D")
         anchor_list.append(anchor_ts)
@@ -257,7 +257,7 @@ def wrap_generator_with_long_term(
     base_generator: Iterator[Tuple[Any, ...]],
     long_term_features: np.ndarray,
     start_index: int,
-    batch_size: int,
+    end_index: Optional[int] = None,
 ) -> Iterator[Tuple[Any, ...]]:
     """Wrap a training generator to include long-term features.
 
@@ -265,12 +265,16 @@ def wrap_generator_with_long_term(
     ----------
     base_generator:
         Original generator yielding (x, y) or (x, y, sample_weight).
+        Must loop infinitely (``while True``).
     long_term_features:
         Precomputed long-term features array of shape (n_samples, lt_dim).
     start_index:
         Starting sample index for this generator.
-    batch_size:
-        Batch size for indexing into long_term_features.
+    end_index:
+        End sample index (exclusive) for this generator.  When the internal
+        cursor reaches *end_index* it resets to *start_index*, keeping the
+        wrapper in sync with the base generator's epoch-boundary reset.
+        Defaults to ``long_term_features.shape[0]`` when not provided.
 
     Yields
     ------
@@ -281,19 +285,31 @@ def wrap_generator_with_long_term(
     Notes
     -----
     This wrapper assumes that the base generator yields batches in order
-    starting from start_index. The long-term features are sliced accordingly.
+    starting from start_index. The long-term features are sliced according
+    to the actual batch size, so final partial batches are supported.
     """
+    if end_index is None:
+        end_index = int(long_term_features.shape[0])
+
     current_idx = start_index
 
     for batch_data in base_generator:
         batch_len = batch_data[0].shape[0]
+
+        # Detect epoch boundary: the base generator looped back to the
+        # beginning of its range while current_idx is still at the end.
+        if current_idx >= end_index:
+            current_idx = start_index
+
         end_idx = current_idx + batch_len
 
         lt_batch = long_term_features[current_idx:end_idx]
         if lt_batch.shape[0] != batch_len:
             raise ValueError(
                 "Long-term feature batch size mismatch: "
-                f"features={lt_batch.shape[0]}, expected={batch_len}"
+                f"features={lt_batch.shape[0]}, expected={batch_len}. "
+                f"current_idx={current_idx}, end_index={end_index}, "
+                f"lt_features_len={long_term_features.shape[0]}"
             )
         current_idx = end_idx
 
@@ -331,6 +347,59 @@ def get_long_term_input_dim(config: Dict[str, Any]) -> int:
     return lt_config.input_dim
 
 
+def wrap_generator_with_long_term_for_indices(
+    base_generator: Iterator[Tuple[Any, ...]],
+    long_term_features: np.ndarray,
+    indices: np.ndarray,
+) -> Iterator[Tuple[Any, ...]]:
+    """Wrap a training generator to include long-term features for index-selected samples.
+
+    This is analogous to :func:`wrap_generator_with_long_term` but uses an
+    explicit index list instead of a contiguous [start_index, end_index) span.
+    The wrapper assumes the base generator yields batches in the same order as
+    ``indices`` (and restarts from the beginning when it loops).
+    """
+    indices = np.asarray(indices, dtype="int64")
+    if indices.ndim != 1:
+        raise ValueError("indices must be rank 1")
+    if indices.size == 0:
+        raise ValueError("indices must be non-empty")
+
+    cursor = 0
+    total = int(indices.shape[0])
+
+    for batch_data in base_generator:
+        batch_len = int(batch_data[0].shape[0])
+        if batch_len <= 0:
+            raise ValueError("Base generator yielded an empty batch")
+
+        if cursor >= total:
+            cursor = 0
+
+        end = cursor + batch_len
+        if end > total:
+            raise ValueError(
+                "Index-selected long-term wrapper encountered an incomplete tail batch. "
+                f"cursor={cursor}, batch_len={batch_len}, total_indices={total}"
+            )
+
+        batch_indices = indices[cursor:end]
+        lt_batch = long_term_features[batch_indices]
+        if int(lt_batch.shape[0]) != batch_len:
+            raise ValueError("Long-term feature batch size mismatch during index-wrapped training")
+        cursor = end
+
+        x_short = batch_data[0]
+        x_dual = (x_short, lt_batch)
+
+        if len(batch_data) == 2:
+            yield (x_dual, batch_data[1])
+        elif len(batch_data) == 3:
+            yield (x_dual, batch_data[1], batch_data[2])
+        else:
+            yield (x_dual,) + batch_data[1:]
+
+
 def is_long_term_enabled(config: Dict[str, Any]) -> bool:
     """Check if long-term context is enabled in configuration.
 
@@ -354,6 +423,7 @@ __all__ = [
     "load_anchor_timestamps",
     "load_snapshot_series",
     "wrap_generator_with_long_term",
+    "wrap_generator_with_long_term_for_indices",
     "get_long_term_input_dim",
     "is_long_term_enabled",
 ]
