@@ -9,6 +9,13 @@ import unittest
 from observability.server import ServerConfig, _render_ui_page
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _repo_path(*parts: str) -> Path:
+    return REPO_ROOT.joinpath(*parts)
+
+
 class TestObservabilityUiRendering(unittest.TestCase):
     def test_ui_shell_references_extracted_javascript(self) -> None:
         html = _render_ui_page(cast(ServerConfig, None))
@@ -31,7 +38,7 @@ class TestObservabilityUiRendering(unittest.TestCase):
         self.assertIn("</html>", html)
 
     def test_extracted_app_js_contains_interactive_ui_logic(self) -> None:
-        app_js = Path("static/app.js").read_text(encoding="utf-8")
+        app_js = _repo_path("static", "app.js").read_text(encoding="utf-8")
 
         self.assertIn("function switchTab(btn, name)", app_js)
         self.assertIn("function syncConnectionsTextarea()", app_js)
@@ -50,7 +57,7 @@ class TestObservabilityUiRendering(unittest.TestCase):
         self.assertIn('<script src="/static/charts.js"></script>', html)
 
     def test_charts_js_contains_initialization_logic(self) -> None:
-        charts_js = Path("static/charts.js").read_text(encoding="utf-8")
+        charts_js = _repo_path("static", "charts.js").read_text(encoding="utf-8")
 
         self.assertIn("function initChart(canvas)", charts_js)
         self.assertIn("function initAllCharts()", charts_js)
@@ -61,11 +68,11 @@ class TestObservabilityUiRendering(unittest.TestCase):
         self.assertIn('window.initAllCharts = initAllCharts;', charts_js)
 
     def test_server_no_inline_chart_constructors(self) -> None:
-        server_py = Path("observability/server.py").read_text(encoding="utf-8")
+        server_py = _repo_path("observability", "server.py").read_text(encoding="utf-8")
         self.assertNotIn("new Chart(", server_py)
 
     def test_app_css_contains_responsive_rules(self) -> None:
-        app_css = Path("static/app.css").read_text(encoding="utf-8")
+        app_css = _repo_path("static", "app.css").read_text(encoding="utf-8")
         self.assertIn("@media (max-width: 768px)", app_css)
         self.assertIn(".header { flex-direction: column;", app_css)
         self.assertIn(".header-controls { width: 100%; justify-content: space-between; flex-wrap: wrap; }", app_css)

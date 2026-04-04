@@ -16,6 +16,7 @@ from pathlib import Path
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Generator
 from typing import TYPE_CHECKING, Any
@@ -141,66 +142,87 @@ def observability_server(
     ]
     
     logger.info(f"Starting observability server: {' '.join(cmd)}")
+    log_file = tempfile.NamedTemporaryFile(
+        mode="w+",
+        encoding="utf-8",
+        prefix="observability-server-",
+        suffix=".log",
+        delete=False,
+    )
+    log_path = Path(log_file.name)
     process = subprocess.Popen(
         cmd,
         cwd=str(repo_root),
         env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        text=True,
     )
-    
-    # Wait for server to be healthy
-    import requests
-    healthz_url = f"{base_url}/healthz"
-    start_time = time.time()
-    ready = False
-    
-    while time.time() - start_time < STARTUP_TIMEOUT_S:
-        # Check if process crashed
-        if process.poll() is not None:
-            stdout, stderr = process.communicate(timeout=1)
+    try:
+        # Wait for server to be healthy
+        import requests
+
+        healthz_url = f"{base_url}/healthz"
+        start_time = time.time()
+        ready = False
+
+        while time.time() - start_time < STARTUP_TIMEOUT_S:
+            # Check if process crashed
+            if process.poll() is not None:
+                log_file.flush()
+                log_file.seek(0)
+                output = log_file.read()
+                raise RuntimeError(
+                    f"Server process exited with code {process.returncode}\n"
+                    f"LOG ({log_path}):\n{output}"
+                )
+
+            # Check health endpoint
+            try:
+                response = requests.get(healthz_url, timeout=2)
+                if response.status_code == 200:
+                    ready = True
+                    logger.info(f"Server healthy at {healthz_url} after {time.time() - start_time:.1f}s")
+                    break
+            except requests.RequestException:
+                pass  # Not ready yet
+
+            time.sleep(HEALTH_CHECK_INTERVAL_S)
+
+        if not ready:
+            process.terminate()
+            try:
+                process.wait(timeout=SERVER_SHUTDOWN_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            log_file.flush()
+            log_file.seek(0)
+            output = log_file.read()
             raise RuntimeError(
-                f"Server process exited with code {process.returncode}\n"
-                f"STDOUT:\n{stdout}\n"
-                f"STDERR:\n{stderr}"
+                f"Server failed to become healthy at {healthz_url} within {STARTUP_TIMEOUT_S}s\n"
+                f"LOG ({log_path}):\n{output}"
             )
-        
-        # Check health endpoint
-        try:
-            response = requests.get(healthz_url, timeout=2)
-            if response.status_code == 200:
-                ready = True
-                logger.info(f"Server healthy at {healthz_url} after {time.time() - start_time:.1f}s")
-                break
-        except requests.RequestException:
-            pass  # Not ready yet
-        
-        time.sleep(HEALTH_CHECK_INTERVAL_S)
-    
-    if not ready:
+
+        # Yield to tests
+        yield process
+
+        # Teardown: terminate server
+        logger.info("Terminating observability server")
         process.terminate()
         try:
             process.wait(timeout=SERVER_SHUTDOWN_TIMEOUT_S)
+            logger.info(f"Server terminated with exit code {process.returncode}")
         except subprocess.TimeoutExpired:
+            logger.warning(f"Server did not terminate within {SERVER_SHUTDOWN_TIMEOUT_S}s, killing")
             process.kill()
-        raise RuntimeError(
-            f"Server failed to become healthy at {healthz_url} within {STARTUP_TIMEOUT_S}s"
-        )
-    
-    # Yield to tests
-    yield process
-    
-    # Teardown: terminate server
-    logger.info("Terminating observability server")
-    process.terminate()
-    try:
-        process.wait(timeout=SERVER_SHUTDOWN_TIMEOUT_S)
-        logger.info(f"Server terminated with exit code {process.returncode}")
-    except subprocess.TimeoutExpired:
-        logger.warning(f"Server did not terminate within {SERVER_SHUTDOWN_TIMEOUT_S}s, killing")
-        process.kill()
-        process.wait()
+            process.wait()
+    finally:
+        log_file.close()
+        try:
+            log_path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Failed to remove Playwright server log file: %s", log_path)
 
 
 @pytest.fixture(scope="session")

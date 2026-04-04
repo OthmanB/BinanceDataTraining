@@ -17,6 +17,13 @@ from observability.server import (
 )
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _repo_path(*parts: str) -> Path:
+    return REPO_ROOT.joinpath(*parts)
+
+
 class TestStaticAssetAuthBypass(unittest.TestCase):
     """Test that /static/* paths bypass authentication correctly."""
 
@@ -172,12 +179,12 @@ class TestChartDataAttributeContract(unittest.TestCase):
 
     def test_server_code_no_inline_chart_constructors(self) -> None:
         """Server source should not contain 'new Chart(' inline constructors."""
-        server_py = Path("observability/server.py").read_text(encoding="utf-8")
+        server_py = _repo_path("observability", "server.py").read_text(encoding="utf-8")
         self.assertNotIn("new Chart(", server_py)
 
     def test_charts_js_defines_init_functions(self) -> None:
         """charts.js should export initChart and initAllCharts functions."""
-        charts_js_path = Path("static/charts.js")
+        charts_js_path = _repo_path("static", "charts.js")
         if not charts_js_path.exists():
             self.skipTest("charts.js not present; skipping")
         charts_js = charts_js_path.read_text(encoding="utf-8")
@@ -186,7 +193,7 @@ class TestChartDataAttributeContract(unittest.TestCase):
 
     def test_charts_js_reads_data_chart_config_attribute(self) -> None:
         """charts.js should read configuration from data-chart-config attribute."""
-        charts_js_path = Path("static/charts.js")
+        charts_js_path = _repo_path("static", "charts.js")
         if not charts_js_path.exists():
             self.skipTest("charts.js not present; skipping")
         charts_js = charts_js_path.read_text(encoding="utf-8")
@@ -200,7 +207,7 @@ class TestStaticServingBehavior(unittest.TestCase):
         """Static asset handler must set Cache-Control header for browser caching."""
         from observability.server import ObservabilityHandler
 
-        static_file = Path("static/test-cache.css")
+        static_file = _repo_path("static", "test-cache.css")
         static_file.parent.mkdir(parents=True, exist_ok=True)
         static_file.write_text("/* test */", encoding="utf-8")
 
@@ -208,7 +215,7 @@ class TestStaticServingBehavior(unittest.TestCase):
             with patch.object(ObservabilityHandler, "__init__", lambda x, *args, **kwargs: None):
                 handler = ObservabilityHandler()
                 cfg = cast(ServerConfig, Mock(spec=ServerConfig))
-                cfg.static_dir = "static"
+                cfg.static_dir = str(_repo_path("static"))
                 handler.server_state = ServerState(config=cfg)
                 handler.path = "/static/test-cache.css"
                 handler.send_response = Mock()
@@ -228,7 +235,7 @@ class TestStaticServingBehavior(unittest.TestCase):
         """Static asset handler must set correct Content-Type based on file extension."""
         from observability.server import ObservabilityHandler
 
-        static_file = Path("static/test-mime.js")
+        static_file = _repo_path("static", "test-mime.js")
         static_file.parent.mkdir(parents=True, exist_ok=True)
         static_file.write_text("// js", encoding="utf-8")
 
@@ -236,7 +243,7 @@ class TestStaticServingBehavior(unittest.TestCase):
             with patch.object(ObservabilityHandler, "__init__", lambda x, *args, **kwargs: None):
                 handler = ObservabilityHandler()
                 cfg = cast(ServerConfig, Mock(spec=ServerConfig))
-                cfg.static_dir = "static"
+                cfg.static_dir = str(_repo_path("static"))
                 handler.server_state = ServerState(config=cfg)
                 handler.path = "/static/test-mime.js"
                 handler.send_response = Mock()

@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import tempfile
-import time
 import types
 import unittest
 from unittest import mock
@@ -92,60 +91,66 @@ class TestObservabilitySqliteRunState(unittest.TestCase):
     def test_load_run_state_ttl_cache_reduces_sqlite_reads(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             db_uri = f"sqlite:///{tmp_dir}/run_state.db"
-            writer = RunStateWriter(db_uri)
-            writer.start(run_id="run-cache-test")
-            
-            run_state_module._RUN_STATE_CACHE.clear()
-            run_state_module._RUN_STATE_CACHE_TIME.clear()
-            
-            state1 = load_run_state(db_uri)
-            self.assertIsInstance(state1, dict)
-            assert state1 is not None
-            self.assertEqual(state1.get("run_id"), "run-cache-test")
-            initial_stage = state1.get("stage")
-            
-            writer.set_stage("training")
-            
-            state2 = load_run_state(db_uri)
-            self.assertIsInstance(state2, dict)
-            assert state2 is not None
-            self.assertEqual(state2.get("stage"), initial_stage)
-            
-            time.sleep(2.1)
-            
-            state3 = load_run_state(db_uri)
-            self.assertIsInstance(state3, dict)
-            assert state3 is not None
-            self.assertEqual(state3.get("stage"), "training")
+            fake_time = [1000.0]
 
-    def test_load_run_state_ttl_configurable_via_env(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            db_uri = f"sqlite:///{tmp_dir}/run_state.db"
-            writer = RunStateWriter(db_uri)
-            writer.start(run_id="run-config-test")
-            
-            with mock.patch.dict(os.environ, {"RUN_STATE_CACHE_TTL_SECONDS": "0.5"}, clear=False):
+            with mock.patch("observability.run_state.time.time", side_effect=lambda: fake_time[0]):
+                writer = RunStateWriter(db_uri)
+                writer.start(run_id="run-cache-test")
+
                 run_state_module._RUN_STATE_CACHE.clear()
                 run_state_module._RUN_STATE_CACHE_TIME.clear()
-                
+
                 state1 = load_run_state(db_uri)
                 self.assertIsInstance(state1, dict)
                 assert state1 is not None
+                self.assertEqual(state1.get("run_id"), "run-cache-test")
                 initial_stage = state1.get("stage")
-                
-                writer.set_stage("evaluation")
-                
+
+                writer.set_stage("training")
+
                 state2 = load_run_state(db_uri)
                 self.assertIsInstance(state2, dict)
                 assert state2 is not None
                 self.assertEqual(state2.get("stage"), initial_stage)
-                
-                time.sleep(0.6)
-                
+
+                fake_time[0] += 2.1
+
                 state3 = load_run_state(db_uri)
                 self.assertIsInstance(state3, dict)
                 assert state3 is not None
-                self.assertEqual(state3.get("stage"), "evaluation")
+                self.assertEqual(state3.get("stage"), "training")
+
+    def test_load_run_state_ttl_configurable_via_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_uri = f"sqlite:///{tmp_dir}/run_state.db"
+            fake_time = [2000.0]
+
+            with mock.patch("observability.run_state.time.time", side_effect=lambda: fake_time[0]):
+                writer = RunStateWriter(db_uri)
+                writer.start(run_id="run-config-test")
+
+                with mock.patch.dict(os.environ, {"RUN_STATE_CACHE_TTL_SECONDS": "0.5"}, clear=False):
+                    run_state_module._RUN_STATE_CACHE.clear()
+                    run_state_module._RUN_STATE_CACHE_TIME.clear()
+
+                    state1 = load_run_state(db_uri)
+                    self.assertIsInstance(state1, dict)
+                    assert state1 is not None
+                    initial_stage = state1.get("stage")
+
+                    writer.set_stage("evaluation")
+
+                    state2 = load_run_state(db_uri)
+                    self.assertIsInstance(state2, dict)
+                    assert state2 is not None
+                    self.assertEqual(state2.get("stage"), initial_stage)
+
+                    fake_time[0] += 0.6
+
+                    state3 = load_run_state(db_uri)
+                    self.assertIsInstance(state3, dict)
+                    assert state3 is not None
+                    self.assertEqual(state3.get("stage"), "evaluation")
 
 
 class TestObservabilityServerConfigValidation(unittest.TestCase):
