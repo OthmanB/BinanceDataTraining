@@ -28,6 +28,30 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def build_metrics_for_head(metric_specs: Any, keras: Any) -> List[Any]:
+    if isinstance(metric_specs, (list, tuple)):
+        metrics_list = list(metric_specs)
+    else:
+        metrics_list = [metric_specs]
+
+    metric_objects = []
+    for metric in metrics_list:
+        if isinstance(metric, str):
+            name_lower = metric.lower()
+            if name_lower in {"accuracy", "acc", "categorical_accuracy"}:
+                metric_objects.append(keras.metrics.CategoricalAccuracy(name=metric))
+            elif name_lower == "precision":
+                metric_objects.append(keras.metrics.Precision(name=metric))
+            elif name_lower == "recall":
+                metric_objects.append(keras.metrics.Recall(name=metric))
+            else:
+                metric_objects.append(keras.metrics.get(metric))
+        else:
+            metric_objects.append(keras.metrics.get(metric))
+
+    return metric_objects
+
+
 def _add_normalization_layer(x: Any, norm_type: Optional[str], filters: int, layers: Any,
                              *, time_distributed: bool = False, name_prefix: str = "") -> Any:
     """Add a normalization layer if requested.
@@ -431,29 +455,6 @@ def build_cnn_lstm_model(
 
     optimizer = keras.optimizers.get({"class_name": optimizer_name, "config": {"learning_rate": learning_rate}})
 
-    def _build_metrics_for_head(metric_specs):
-        if isinstance(metric_specs, (list, tuple)):
-            metrics_list = list(metric_specs)
-        else:
-            metrics_list = [metric_specs]
-
-        metric_objects = []
-        for m in metrics_list:
-            if isinstance(m, str):
-                name_lower = m.lower()
-                if name_lower in {"accuracy", "acc", "categorical_accuracy"}:
-                    metric_objects.append(keras.metrics.CategoricalAccuracy(name=m))
-                elif name_lower == "precision":
-                    metric_objects.append(keras.metrics.Precision(name=m))
-                elif name_lower == "recall":
-                    metric_objects.append(keras.metrics.Recall(name=m))
-                else:
-                    metric_objects.append(keras.metrics.get(m))
-            else:
-                metric_objects.append(keras.metrics.get(m))
-
-        return metric_objects
-
     metrics = None
     if isinstance(metrics_cfg, dict):
         metrics = metrics_cfg
@@ -461,8 +462,8 @@ def build_cnn_lstm_model(
         metrics = None
     else:
         metrics = {
-            "up_intensity": _build_metrics_for_head(metrics_cfg),
-            "down_intensity": _build_metrics_for_head(metrics_cfg),
+            "up_intensity": build_metrics_for_head(metrics_cfg, keras),
+            "down_intensity": build_metrics_for_head(metrics_cfg, keras),
         }
 
     model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
@@ -478,4 +479,4 @@ def build_cnn_lstm_model(
     return model
 
 
-__all__ = ["build_cnn_lstm_model"]
+__all__ = ["build_cnn_lstm_model", "build_metrics_for_head"]
