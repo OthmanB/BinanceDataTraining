@@ -115,7 +115,7 @@ main.py
   ├── preprocessing/
   │     ├── transformer.py          (pipeline entry)
   │     ├── feature_engineering.py  (derived features)
-  │     ├── normalizer.py           (min_max, standard, robust)
+  │     ├── normalizer.py           (min_max, standard)
   │     ├── depth_aggregator.py     (hybrid depth bins)
   │     ├── temporal_features.py    (time encodings)
   │     ├── long_term_features.py   (multi-horizon context)

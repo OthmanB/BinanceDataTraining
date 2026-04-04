@@ -276,7 +276,7 @@ pip install --only-binary=pyarrow pyarrow
 
 ### Python version incompatibility
 
-**Requirement:** Python >=3.9 and <3.12
+**Requirement:** Python >=3.9 and <3.13
 
 **Check:**
 ```bash

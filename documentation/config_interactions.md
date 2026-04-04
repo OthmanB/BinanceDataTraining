@@ -117,7 +117,7 @@ training:
 ```yaml
 preprocessing:
   normalization:
-    method: "min_max"          # min_max | standard | robust
+    method: "min_max"          # min_max | standard
     fit_on_train_only: true    # RECOMMENDED: prevents data leakage
 ```
 
