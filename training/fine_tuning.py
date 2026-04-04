@@ -15,6 +15,7 @@ import os
 import re
 
 import numpy as np
+from models.cnn_lstm_multiclass import build_metrics_for_head
 
 
 logger = logging.getLogger(__name__)
@@ -488,30 +489,6 @@ def validate_output_compatibility(
     )
 
 
-def _build_metrics_for_head(metric_specs: Any, keras: Any) -> List[Any]:
-    if isinstance(metric_specs, (list, tuple)):
-        metrics_list = list(metric_specs)
-    else:
-        metrics_list = [metric_specs]
-
-    metric_objects = []
-    for metric in metrics_list:
-        if isinstance(metric, str):
-            name_lower = metric.lower()
-            if name_lower in {"accuracy", "acc", "categorical_accuracy"}:
-                metric_objects.append(keras.metrics.CategoricalAccuracy(name=metric))
-            elif name_lower == "precision":
-                metric_objects.append(keras.metrics.Precision(name=metric))
-            elif name_lower == "recall":
-                metric_objects.append(keras.metrics.Recall(name=metric))
-            else:
-                metric_objects.append(keras.metrics.get(metric))
-        else:
-            metric_objects.append(keras.metrics.get(metric))
-
-    return metric_objects
-
-
 def _build_metrics_config(
     metrics_cfg: Any,
     keras: Any,
@@ -522,7 +499,7 @@ def _build_metrics_config(
     if metrics_cfg is None:
         return None
 
-    metrics_for_head = _build_metrics_for_head(metrics_cfg, keras)
+    metrics_for_head = build_metrics_for_head(metrics_cfg, keras)
     if output_names and len(output_names) == 2:
         return {output_names[0]: metrics_for_head, output_names[1]: metrics_for_head}
     return {

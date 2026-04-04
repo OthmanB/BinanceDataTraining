@@ -11,6 +11,7 @@ from training.pipeline import (
     _cleanup_completed_window_dirs,
     _resolve_sequential_resume_paths,
     _run_snapshot_training_pipeline_sequential,
+    _run_snapshot_training_pipeline_sequential_result,
     _save_sequential_resume_state,
 )
 from utils.config_loader import ConfigError
@@ -136,13 +137,14 @@ class TestSequentialResume(unittest.TestCase):
             mock_prepare_snapshot.return_value = object()
             mock_fit_once.return_value = ("UPDATED_MODEL", 1, 0.40, 80.0)
 
-            model = _run_snapshot_training_pipeline_sequential(config, windows)
+            result = _run_snapshot_training_pipeline_sequential_result(config, windows)
+            model = result.model
 
             self.assertEqual(model, "UPDATED_MODEL")
             self.assertEqual(mock_fit_once.call_count, 1)
             fit_args = mock_fit_once.call_args.args
             self.assertEqual(fit_args[2], "RESUMED_MODEL")
-            self.assertAlmostEqual(float(config["_hpo_last_metric"]), 0.29333333333333333)
+            self.assertAlmostEqual(float(result.hpo_metric_value or 0.0), 0.29333333333333333)
             self.assertFalse(os.path.exists(state_path))
             self.assertFalse(os.path.exists(model_path))
             self.assertGreaterEqual(mock_save_model.call_count, 1)

@@ -96,13 +96,13 @@ def get_minimal_config() -> Dict[str, Any]:
             },
         },
         "preprocessing": {
-            "normalization": {"method": "zscore", "per_asset": False, "fit_on_train_only": True},
+            "normalization": {"method": "standard", "per_asset": False, "fit_on_train_only": True},
             "feature_engineering": {
                 "enabled": True,
                 "order_book_features": ["bid_ask_spread", "mid_price"],
                 "derived_features": [],
                 "momentum_window_seconds": 10,
-                "volume_proxy_method": "total_quantity",
+                "volume_proxy_method": "top_of_book",
                 "edge_decay": {"enabled": False, "method": "exponential"},
             },
             "train_test_split": {
@@ -111,7 +111,7 @@ def get_minimal_config() -> Dict[str, Any]:
                 "validation_ratio": 0.15,
                 "test_ratio": 0.15,
             },
-            "class_balancing": {"enabled": False, "method": "class_weights"},
+            "class_balancing": {"enabled": False, "method": "undersampling"},
         },
         "model": {
             "framework": "tensorflow",
@@ -120,7 +120,7 @@ def get_minimal_config() -> Dict[str, Any]:
             "input_representation": {
                 "strategy": "hybrid",
                 "temporal_features": {
-                    "integration_mode": "append_channels",
+                    "integration_mode": "concat_channels",
                     "use_local_features": True,
                     "use_global_features": True,
                 },
@@ -174,7 +174,7 @@ def get_minimal_config() -> Dict[str, Any]:
             "directory": "snapshots",
             "root_name": "test_snapshots",
             "name": "test_run",
-            "on_config_mismatch": "warn",
+            "on_config_mismatch": "create_new",
             "max_snapshots": 100,
         },
         "hyperparameter_optimization": {
@@ -268,6 +268,7 @@ class TestModelBuildIntegration(unittest.TestCase):
         """Test forward pass with single input."""
         from models.cnn_lstm_multiclass import build_cnn_lstm_model
 
+        np.random.seed(42)
         config = get_minimal_config()
         input_shape = (6, 10, 4, 5)
 
@@ -284,6 +285,7 @@ class TestModelBuildIntegration(unittest.TestCase):
         """Test forward pass with dual inputs."""
         from models.cnn_lstm_multiclass import build_cnn_lstm_model
 
+        np.random.seed(42)
         config = get_minimal_config()
         config["model"]["long_term"]["enabled"] = True
         long_term_dim = 12
@@ -317,6 +319,7 @@ class TestNormalizationIntegration(unittest.TestCase):
         """Normalizer fit and transform on sample data."""
         from preprocessing.normalizer import create_normalizer_from_config
 
+        np.random.seed(42)
         config = get_minimal_config()
         config["preprocessing"]["normalization"]["method"] = "standard"
         normalizer = create_normalizer_from_config(config)
@@ -374,6 +377,7 @@ class TestLongTermFeaturesIntegration(unittest.TestCase):
         """When disabled, returns zero-dim features."""
         from preprocessing.long_term_features import LongTermConfig, compute_long_term_features
 
+        np.random.seed(42)
         config = get_minimal_config()
         # Keep long_term.enabled = False (disabled by default)
 

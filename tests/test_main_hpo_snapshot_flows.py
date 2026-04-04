@@ -77,7 +77,7 @@ class TestMainSnapshotHPOFlows(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         mock_validate_env.assert_called_once()
         mock_run_diagnostics.assert_called_once_with(config)
-        mock_run_hpo.assert_called_once_with(config, None)
+        mock_run_hpo.assert_called_once_with(config, None, snapshot_prebuild_completed=False)
         mock_run_training.assert_not_called()
         mock_eval_seq.assert_not_called()
         mock_end_run.assert_called_once()
@@ -125,7 +125,7 @@ class TestMainSnapshotHPOFlows(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         mock_validate_env.assert_called_once()
         mock_run_diagnostics.assert_called_once_with(config)
-        mock_run_hpo.assert_called_once_with(config, None)
+        mock_run_hpo.assert_called_once_with(config, None, snapshot_prebuild_completed=False)
         mock_run_training.assert_called_once_with(best_config, None)
         mock_eval_seq.assert_called_once()
 
@@ -174,7 +174,7 @@ class TestMainSnapshotHPOFlows(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         mock_run_diagnostics.assert_not_called()
-        mock_run_hpo.assert_called_once_with(config, None)
+        mock_run_hpo.assert_called_once_with(config, None, snapshot_prebuild_completed=False)
         mock_run_training.assert_not_called()
         mock_eval_seq.assert_not_called()
         mock_end_run.assert_called_once()

@@ -23,13 +23,14 @@ import traceback
 from utils.config_loader import ConfigError, load_config
 from utils.env_validator import validate_environment
 from utils.colored_logging import setup_colored_logging
+from utils.production_checks import enforce_production_sample_cap
 from diagnostics import (
     DIAGNOSTICS_MODE_PER_SNAPSHOT,
     resolve_diagnostics_execution_mode,
     run_snapshot_diagnostics,
 )
 from training import run_training_pipeline
-from training.pipeline import _resolve_sequential_windows
+from training.pipeline import resolve_sequential_windows
 from training.snapshot_store import resolve_snapshot_context
 from evaluation import evaluate_snapshot_model
 from mlflow_integration import start_run, end_run
@@ -37,18 +38,7 @@ from models.hyperparameter_tuning import run_hyperparameter_search
 
 
 def _enforce_production_sample_cap(config: Dict[str, Any], n_samples: int) -> None:
-    run_mode_cfg = config["run_mode"]  # Required by schema
-    mode = str(run_mode_cfg["mode"])  # Required by schema
-    if mode != "production":
-        return
-
-    training_cfg = config["training"]  # Required by schema
-    debug_max_samples = int(training_cfg["debug_max_samples"])  # Required by schema
-    if debug_max_samples < n_samples:
-        raise ConfigError(
-            "training.debug_max_samples must be >= metadata.num_samples when run_mode.mode='production'. "
-            f"debug_max_samples={debug_max_samples}, num_samples={n_samples}."
-        )
+    enforce_production_sample_cap(config, n_samples)
 
 
 def _format_visible_devices(value: Any) -> Optional[str]:
@@ -232,7 +222,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _evaluate_snapshot_sequential(config: Dict[str, Any], model: Any, logger: logging.Logger) -> None:
-    windows = _resolve_sequential_windows(config)
+    windows = resolve_sequential_windows(config)
     if windows is None or len(windows) <= 1:
         evaluate_snapshot_model(config, model)
         return
@@ -312,10 +302,15 @@ def main() -> int:
     writer = None
     try:
         from observability.run_state import get_run_state_writer
-
-        writer = get_run_state_writer()
-    except Exception:
-        writer = None
+    except ImportError as exc:
+        logger.debug("Run-state writer helper unavailable; observability module import failed: %s", exc)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Unexpected failure importing run-state writer helper: %s", exc, exc_info=True)
+    else:
+        try:
+            writer = get_run_state_writer()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to initialize run-state writer; continuing without writer: %s", exc)
     if writer is not None:
         try:
             writer.start()
@@ -340,7 +335,7 @@ def main() -> int:
     try:
         validate_environment(config)
     except ConfigError as exc:
-        logger.error(f"Environment validation failed: {exc}")
+        logger.error("Environment validation failed: %s", exc)
         if writer is not None:
             writer.set_error(f"Environment validation failed: {exc}", traceback_text=None)
         return 1
@@ -403,6 +398,7 @@ def main() -> int:
 
         diagnostics_cfg = config["diagnostics"]
         diagnostics_mode = resolve_diagnostics_execution_mode(config)
+        snapshot_prebuild_completed = False
         if bool(diagnostics_cfg["enabled"]):
             if diagnostics_mode == DIAGNOSTICS_MODE_PER_SNAPSHOT:
                 logger.info(
@@ -415,13 +411,13 @@ def main() -> int:
                         "Running snapshot pre-build now to execute per-snapshot diagnostics before training.",
                     )
                     pre_build_snapshots(config_for_training)
-                    config_for_training["_snapshot_prebuild_complete"] = True
+                    snapshot_prebuild_completed = True
             else:
                 run_snapshot_diagnostics(config_for_training)
 
         if hpo_enabled:
             if mode == "trial":
-                windows = _resolve_sequential_windows(config_for_training)
+                windows = resolve_sequential_windows(config_for_training)
                 if windows is None or len(windows) <= 1:
                     message = (
                         "Snapshot HPO in trial mode requires bounded sequential windows. "
@@ -433,7 +429,11 @@ def main() -> int:
                     return 1
 
             logger.info("Starting snapshot-compatible hyperparameter optimization.")
-            best_config = run_hyperparameter_search(config_for_training, data_object)
+            best_config = run_hyperparameter_search(
+                config_for_training,
+                data_object,
+                snapshot_prebuild_completed=snapshot_prebuild_completed,
+            )
             if best_config is not None:
                 config_for_training = best_config
 

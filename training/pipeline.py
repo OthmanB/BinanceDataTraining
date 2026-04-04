@@ -5,6 +5,7 @@ artifacts to MLflow when configured.
 """
 
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 import contextlib
 import copy
@@ -17,6 +18,8 @@ import shutil
 import numpy as np
 
 from utils.config_loader import ConfigError
+from utils.formatting import _fmt_compact
+from utils.production_checks import enforce_production_sample_cap
 from preprocessing.snapshot_sequence_builder import (
     build_top_of_book_sequence_tensor,
     build_hybrid_depth_sequence_tensor,
@@ -58,9 +61,40 @@ from .long_term_context import (
     wrap_generator_with_long_term,
     wrap_generator_with_long_term_for_indices,
 )
+from .pipeline_result import PipelineResult
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _AggregatedLabelDistribution:
+    num_classes: int
+    total_samples: int
+    up_counts: Dict[int, int]
+    down_counts: Dict[int, int]
+
+
+@dataclass
+class _SnapshotTrainingMetadata:
+    generator_batch_size: int
+    n_samples: int
+    effective_train_n: int
+    val_start: int
+    val_end: int
+    val_count: int
+    input_shape: Tuple[int, ...]
+    num_classes: int
+    train_stats: NormalizationStats
+    val_stats: NormalizationStats
+    mask_start: int
+    mask_count: int
+    long_term_features: Optional[np.ndarray]
+    long_term_input_dim: Optional[int]
+    balanced_train_indices: Optional[np.ndarray]
+    effective_train_used_n: int
+    class_weights_up: Optional[Dict[int, float]]
+    class_weights_down: Optional[Dict[int, float]]
 
 
 def _format_intensity_class_labels(config: Dict[str, Any], *, num_classes: Optional[int] = None) -> List[str]:
@@ -87,16 +121,12 @@ def _format_intensity_class_labels(config: Dict[str, Any], *, num_classes: Optio
     if any(boundaries_f[i] >= boundaries_f[i + 1] for i in range(len(boundaries_f) - 1)):
         raise ConfigError("targets.price_classes.boundaries must be strictly increasing")
 
-    def _fmt(v: float) -> str:
-        s = f"{v:g}"
-        return s if s else str(v)
-
     labels: List[str] = []
     first = boundaries_f[0]
-    labels.append(f"0 < x <= {_fmt(first)}")
+    labels.append(f"0 < x <= {_fmt_compact(first)}")
     for left, right in zip(boundaries_f[:-1], boundaries_f[1:]):
-        labels.append(f"{_fmt(left)} < x <= {_fmt(right)}")
-    labels.append(f"x > {_fmt(boundaries_f[-1])}")
+        labels.append(f"{_fmt_compact(left)} < x <= {_fmt_compact(right)}")
+    labels.append(f"x > {_fmt_compact(boundaries_f[-1])}")
 
     if num_classes is not None and int(num_classes) != len(labels):
         raise ConfigError(
@@ -161,13 +191,12 @@ def _emit_label_distribution_tables(
         logger.debug("Failed to render label distribution table", exc_info=True)
 
 
-def _emit_hpo_phase_memory_probe(
-    config: Dict[str, Any],
+def _emit_phase_memory_probe(
+    phase_memory_probe: Optional[Callable[[str, Optional[Dict[str, Any]]], Any]],
     phase: str,
     details: Optional[Dict[str, Any]] = None,
 ) -> None:
-    probe = config.get("_hpo_phase_memory_probe")
-    if not callable(probe):
+    if not callable(phase_memory_probe):
         return
 
     payload: Dict[str, Any] = {}
@@ -178,16 +207,17 @@ def _emit_hpo_phase_memory_probe(
 
     try:
         if payload:
-            probe(str(phase), payload)
+            phase_memory_probe(str(phase), payload)
         else:
-            probe(str(phase), None)
+            phase_memory_probe(str(phase), None)
     except Exception:  # noqa: BLE001
-        logger.warning("Failed to publish HPO phase memory probe for phase=%s", phase, exc_info=True)
+        logger.warning("Failed to publish phase memory probe for phase=%s", phase, exc_info=True)
 
 
-def _create_first_batch_probe_callback(config: Dict[str, Any]) -> Optional[Any]:
-    probe = config.get("_hpo_phase_memory_probe")
-    if not callable(probe):
+def _create_first_batch_probe_callback(
+    phase_memory_probe: Optional[Callable[[str, Optional[Dict[str, Any]]], Any]],
+) -> Optional[Any]:
+    if not callable(phase_memory_probe):
         return None
 
     try:
@@ -215,7 +245,7 @@ def _create_first_batch_probe_callback(config: Dict[str, Any]) -> Optional[Any]:
             except Exception:  # noqa: BLE001
                 logger.warning("Failed to publish first-batch memory probe", exc_info=True)
 
-    return _FirstBatchProbeCallback(probe)
+    return _FirstBatchProbeCallback(phase_memory_probe)
 
 
 def _resolve_snapshot_training_indices(
@@ -474,18 +504,7 @@ def _precompute_trial_invariant_snapshot_artifacts(config: Dict[str, Any], snaps
 
 
 def _enforce_production_sample_cap_snapshot(config: Dict[str, Any], n_samples: int) -> None:
-    run_mode_cfg = config["run_mode"]
-    mode = str(run_mode_cfg["mode"])
-    if mode != "production":
-        return
-
-    training_cfg = config["training"]
-    debug_max_samples = int(training_cfg["debug_max_samples"])
-    if debug_max_samples < n_samples:
-        raise ConfigError(
-            "training.debug_max_samples must be >= metadata.num_samples when run_mode.mode='production'. "
-            f"debug_max_samples={debug_max_samples}, num_samples={n_samples}."
-        )
+    enforce_production_sample_cap(config, n_samples)
 
 
 def _get_normalization_stats(
@@ -573,6 +592,513 @@ def _aggregate_hpo_window_metrics(window_metrics: List[Tuple[float, float]]) -> 
     return float(sum(simple_values) / len(simple_values))
 
 
+def _validate_snapshot_training_output_type(config: Dict[str, Any]) -> int:
+    model_cfg = config["model"]
+    output_cfg = model_cfg["output"]
+    output_type = str(output_cfg["type"])
+    if output_type != "two_head_intensity":
+        raise ValueError(
+            "Only model.output.type='two_head_intensity' is supported in snapshot training",
+        )
+    return int(output_cfg["num_classes"])
+
+
+def _resolve_snapshot_generator_batch_size(
+    training_cfg: Dict[str, Any],
+    dist_ctx: Optional[DistributedContext],
+) -> int:
+    batch_size = int(training_cfg["batch_size"])
+    if dist_ctx is None:
+        return batch_size
+    return dist_ctx.global_batch_size(batch_size)
+
+
+def _prepare_snapshot_training_metadata(
+    config: Dict[str, Any],
+    snapshot_dataset: Any,
+    *,
+    dist_ctx: Optional[DistributedContext] = None,
+    phase_memory_probe: Optional[Callable[[str, Optional[Dict[str, Any]]], Any]] = None,
+) -> Optional[_SnapshotTrainingMetadata]:
+    training_cfg = config["training"]
+    generator_batch_size = _resolve_snapshot_generator_batch_size(training_cfg, dist_ctx)
+    num_classes = _validate_snapshot_training_output_type(config)
+    use_class_weights = bool(training_cfg["class_weights"]["compute_from_train"])
+
+    n_samples = int(snapshot_dataset.total_samples)
+    if n_samples <= 0:
+        logger.info("Snapshot training window skipped: snapshot dataset has no samples.")
+        return None
+
+    _emit_phase_memory_probe(
+        phase_memory_probe,
+        "after_snapshot_load",
+        {
+            "n_samples": int(n_samples),
+            "n_chunks": int(len(getattr(snapshot_dataset, "chunks", []) or [])),
+        },
+    )
+
+    _enforce_production_sample_cap_snapshot(config, n_samples)
+
+    split_indices = _resolve_snapshot_training_indices(config, n_samples)
+    if split_indices is None:
+        logger.info("Snapshot training window skipped: no effective training samples available.")
+        return None
+    effective_train_n, val_start, val_end = split_indices
+    val_count = max(0, val_end - val_start)
+
+    if not snapshot_dataset.chunks:
+        logger.info("Snapshot training window skipped: no chunk files found.")
+        return None
+
+    first_chunk = snapshot_dataset.chunks[0]
+    x_shape = get_chunk_x_shape(first_chunk)
+    if len(x_shape) != 5:
+        raise ValueError("Snapshot input tensors must have rank 5")
+    input_shape = tuple(int(d) for d in x_shape[1:])
+
+    long_term_features = None
+    long_term_input_dim: Optional[int] = None
+    if is_long_term_enabled(config):
+        cadence_seconds = int(config["data"]["time_range"]["cadence_seconds"])
+        long_term_features = compute_long_term_features_for_dataset(
+            config,
+            snapshot_dataset,
+            cadence_seconds=cadence_seconds,
+        )
+        if long_term_features is None:
+            raise ConfigError("Long-term features enabled but computation returned None")
+        if long_term_features.shape[0] != n_samples:
+            raise ConfigError(
+                "Long-term feature rows do not match snapshot dataset sample count: "
+                f"features={long_term_features.shape[0]}, samples={n_samples}"
+            )
+        long_term_input_dim = int(long_term_features.shape[1])
+
+    _emit_phase_memory_probe(
+        phase_memory_probe,
+        "after_long_term_features",
+        {
+            "long_term_enabled": bool(long_term_features is not None),
+            "long_term_dim": int(long_term_input_dim or 0),
+        },
+    )
+
+    context = resolve_snapshot_context(config)
+    manifest = load_or_create_manifest(context, config)
+
+    normalization_cfg = config["preprocessing"]["normalization"]
+    fit_on_train_only = bool(normalization_cfg["fit_on_train_only"])
+    train_stats = _get_normalization_stats(
+        config,
+        context,
+        manifest,
+        snapshot_dataset,
+        0,
+        effective_train_n,
+        "train",
+    )
+    mask_start, mask_count = get_mask_channel_info(config)
+    if fit_on_train_only or val_count <= 0:
+        val_stats = train_stats
+    else:
+        val_stats = _get_normalization_stats(
+            config,
+            context,
+            manifest,
+            snapshot_dataset,
+            val_start,
+            val_end,
+            "val",
+        )
+
+    _emit_phase_memory_probe(
+        phase_memory_probe,
+        "after_normalization_stats",
+        {
+            "fit_on_train_only": bool(fit_on_train_only),
+            "val_count": int(val_count),
+        },
+    )
+
+    balanced_train_indices = _resolve_undersampled_train_indices(
+        config,
+        snapshot_dataset,
+        train_end=effective_train_n,
+        batch_size=generator_batch_size,
+        num_classes=num_classes,
+    )
+    effective_train_used_n = int(balanced_train_indices.shape[0]) if balanced_train_indices is not None else int(
+        effective_train_n
+    )
+
+    try:
+        if balanced_train_indices is not None:
+            train_dist = compute_label_distribution_for_indices(
+                snapshot_dataset,
+                indices=balanced_train_indices,
+                num_classes=num_classes,
+            )
+            _emit_label_distribution_tables(
+                config,
+                split_name="train(undersampled)",
+                dist=train_dist,
+                title="Label distribution (effective train after undersampling)",
+            )
+        else:
+            train_dist = compute_label_distribution(
+                snapshot_dataset,
+                start_index=0,
+                end_index=effective_train_n,
+                num_classes=num_classes,
+            )
+            _emit_label_distribution_tables(
+                config,
+                split_name="train",
+                dist=train_dist,
+                title="Label distribution (train)",
+            )
+
+        if val_count > 0:
+            val_dist = compute_label_distribution(
+                snapshot_dataset,
+                start_index=val_start,
+                end_index=val_end,
+                num_classes=num_classes,
+            )
+            _emit_label_distribution_tables(
+                config,
+                split_name="val",
+                dist=val_dist,
+                title="Label distribution (val)",
+            )
+    except Exception:  # noqa: BLE001
+        logger.debug("Failed to compute label distributions", exc_info=True)
+
+    class_weights_up: Optional[Dict[int, float]] = None
+    class_weights_down: Optional[Dict[int, float]] = None
+    if use_class_weights:
+        if balanced_train_indices is not None:
+            train_label_dist = compute_label_distribution_for_indices(
+                snapshot_dataset,
+                indices=balanced_train_indices,
+                num_classes=num_classes,
+            )
+        else:
+            train_label_dist = load_label_stats_from_manifest(manifest, "train")
+            if train_label_dist is None:
+                train_label_dist = compute_label_distribution(
+                    snapshot_dataset,
+                    start_index=0,
+                    end_index=effective_train_n,
+                    num_classes=num_classes,
+                )
+                save_label_stats_to_manifest(context, manifest, train_label_dist, "train")
+
+        class_weights_up = compute_class_weights_from_counts(train_label_dist.up_counts, num_classes)
+        class_weights_down = compute_class_weights_from_counts(train_label_dist.down_counts, num_classes)
+
+    return _SnapshotTrainingMetadata(
+        generator_batch_size=generator_batch_size,
+        n_samples=n_samples,
+        effective_train_n=effective_train_n,
+        val_start=val_start,
+        val_end=val_end,
+        val_count=val_count,
+        input_shape=input_shape,
+        num_classes=num_classes,
+        train_stats=train_stats,
+        val_stats=val_stats,
+        mask_start=mask_start,
+        mask_count=mask_count,
+        long_term_features=long_term_features,
+        long_term_input_dim=long_term_input_dim,
+        balanced_train_indices=balanced_train_indices,
+        effective_train_used_n=effective_train_used_n,
+        class_weights_up=class_weights_up,
+        class_weights_down=class_weights_down,
+    )
+
+
+def _initialize_snapshot_training_model(
+    config: Dict[str, Any],
+    model: Optional[Any],
+    *,
+    input_shape: Tuple[int, ...],
+    long_term_input_dim: Optional[int],
+    dist_ctx: Optional[DistributedContext] = None,
+) -> Any:
+    training_cfg = config["training"]
+    strategy_scope = dist_ctx.scope() if dist_ctx is not None else contextlib.nullcontext()
+
+    with strategy_scope:
+        if model is None:
+            fine_tuning_cfg = training_cfg["fine_tuning"]
+            fine_tuning_enabled = bool(fine_tuning_cfg["enabled"])
+            if fine_tuning_enabled:
+                from .fine_tuning import (
+                    FineTuningError,
+                    load_model_from_registry,
+                    load_model_from_run,
+                    prepare_fine_tuning,
+                )
+
+                use_registry = bool(fine_tuning_cfg["use_model_registry"])
+                if use_registry:
+                    registry_name = fine_tuning_cfg["registry_name"]
+                    if not registry_name:
+                        raise ConfigError(
+                            "training.fine_tuning.registry_name is required when use_model_registry is true"
+                        )
+                    stage = str(fine_tuning_cfg["base_model_stage"])
+                    try:
+                        model = load_model_from_registry(registry_name, stage=stage)
+                    except FineTuningError as exc:
+                        raise ConfigError(f"Failed to load base model for fine-tuning: {exc}") from exc
+                else:
+                    run_id = fine_tuning_cfg["base_model_run_id"]
+                    if not run_id:
+                        raise ConfigError(
+                            "training.fine_tuning.base_model_run_id is required when fine_tuning.enabled is true "
+                            "and use_model_registry is false"
+                        )
+                    try:
+                        model = load_model_from_run(run_id)
+                    except FineTuningError as exc:
+                        raise ConfigError(f"Failed to load base model for fine-tuning: {exc}") from exc
+
+                try:
+                    model = prepare_fine_tuning(
+                        config,
+                        model,
+                        input_shape=input_shape,
+                        long_term_input_dim=long_term_input_dim,
+                    )
+                except FineTuningError as exc:
+                    raise ConfigError(f"Failed to prepare model for fine-tuning: {exc}") from exc
+            else:
+                from models.cnn_lstm_multiclass import build_cnn_lstm_model
+
+                model = build_cnn_lstm_model(
+                    config,
+                    input_shape=input_shape,
+                    long_term_input_dim=long_term_input_dim,
+                )
+
+    return model
+
+
+def _build_snapshot_train_generator_factory(
+    snapshot_dataset: Any,
+    *,
+    metadata: _SnapshotTrainingMetadata,
+    sample_weight_cfg: Dict[str, Any],
+) -> Callable[[], Iterator[Tuple[Any, ...]]]:
+    def _make_train_gen() -> Iterator[Tuple[Any, ...]]:
+        if metadata.balanced_train_indices is not None:
+            gen, _ = build_training_generator_for_indices(
+                dataset=snapshot_dataset,
+                indices=metadata.balanced_train_indices,
+                batch_size=metadata.generator_batch_size,
+                num_classes=metadata.num_classes,
+                normalization=metadata.train_stats,
+                sample_weight_cfg=sample_weight_cfg,
+                mask_start=metadata.mask_start,
+                mask_count=metadata.mask_count,
+                class_weights_up=metadata.class_weights_up,
+                class_weights_down=metadata.class_weights_down,
+            )
+        else:
+            gen, _ = build_training_generator(
+                dataset=snapshot_dataset,
+                start_index=0,
+                end_index=metadata.effective_train_n,
+                batch_size=metadata.generator_batch_size,
+                num_classes=metadata.num_classes,
+                normalization=metadata.train_stats,
+                sample_weight_cfg=sample_weight_cfg,
+                mask_start=metadata.mask_start,
+                mask_count=metadata.mask_count,
+                class_weights_up=metadata.class_weights_up,
+                class_weights_down=metadata.class_weights_down,
+            )
+        if metadata.long_term_features is not None:
+            if metadata.balanced_train_indices is not None:
+                gen = wrap_generator_with_long_term_for_indices(
+                    gen,
+                    metadata.long_term_features,
+                    indices=metadata.balanced_train_indices,
+                )
+            else:
+                gen = wrap_generator_with_long_term(
+                    gen,
+                    metadata.long_term_features,
+                    start_index=0,
+                    end_index=metadata.effective_train_n,
+                )
+        return gen
+
+    return _make_train_gen
+
+
+def _build_snapshot_val_generator_factory(
+    snapshot_dataset: Any,
+    *,
+    metadata: _SnapshotTrainingMetadata,
+) -> Callable[[], Iterator[Tuple[Any, ...]]]:
+    def _make_val_gen() -> Iterator[Tuple[Any, ...]]:
+        gen, _ = build_training_generator(
+            dataset=snapshot_dataset,
+            start_index=metadata.val_start,
+            end_index=metadata.val_end,
+            batch_size=metadata.generator_batch_size,
+            num_classes=metadata.num_classes,
+            normalization=metadata.val_stats,
+            sample_weight_cfg=None,
+            mask_start=metadata.mask_start,
+            mask_count=metadata.mask_count,
+            class_weights_up=None,
+            class_weights_down=None,
+        )
+        if metadata.long_term_features is not None:
+            gen = wrap_generator_with_long_term(
+                gen,
+                metadata.long_term_features,
+                start_index=metadata.val_start,
+                end_index=metadata.val_end,
+            )
+        return gen
+
+    return _make_val_gen
+
+
+def _build_snapshot_training_data(
+    config: Dict[str, Any],
+    snapshot_dataset: Any,
+    *,
+    metadata: _SnapshotTrainingMetadata,
+    dist_ctx: Optional[DistributedContext] = None,
+) -> Tuple[Any, int, Optional[Any], Optional[int]]:
+    training_cfg = config["training"]
+    train_generator_factory = _build_snapshot_train_generator_factory(
+        snapshot_dataset,
+        metadata=metadata,
+        sample_weight_cfg=training_cfg["sample_weighting"],
+    )
+
+    if metadata.balanced_train_indices is not None:
+        train_steps = int(metadata.effective_train_used_n) // int(metadata.generator_batch_size)
+    else:
+        _, train_steps = build_training_generator(
+            dataset=snapshot_dataset,
+            start_index=0,
+            end_index=metadata.effective_train_n,
+            batch_size=metadata.generator_batch_size,
+            num_classes=metadata.num_classes,
+            normalization=metadata.train_stats,
+            sample_weight_cfg=training_cfg["sample_weighting"],
+            mask_start=metadata.mask_start,
+            mask_count=metadata.mask_count,
+            class_weights_up=metadata.class_weights_up,
+            class_weights_down=metadata.class_weights_down,
+        )
+
+    if dist_ctx is not None:
+        train_data: Any = wrap_generator_as_dataset(
+            generator_factory=train_generator_factory,
+            input_shape=metadata.input_shape,
+            num_classes=metadata.num_classes,
+            long_term_dim=metadata.long_term_input_dim,
+            global_batch_size=metadata.generator_batch_size,
+            steps_per_epoch=train_steps,
+            distributed_ctx=dist_ctx,
+        )
+    else:
+        train_data = train_generator_factory()
+
+    val_data: Optional[Any] = None
+    val_steps: Optional[int] = None
+    if metadata.val_count > 0:
+        val_generator_factory = _build_snapshot_val_generator_factory(snapshot_dataset, metadata=metadata)
+        _, val_steps = build_training_generator(
+            dataset=snapshot_dataset,
+            start_index=metadata.val_start,
+            end_index=metadata.val_end,
+            batch_size=metadata.generator_batch_size,
+            num_classes=metadata.num_classes,
+            normalization=metadata.val_stats,
+            sample_weight_cfg=None,
+            mask_start=metadata.mask_start,
+            mask_count=metadata.mask_count,
+            class_weights_up=None,
+            class_weights_down=None,
+        )
+        if dist_ctx is not None:
+            val_data = wrap_generator_as_dataset(
+                generator_factory=val_generator_factory,
+                input_shape=metadata.input_shape,
+                num_classes=metadata.num_classes,
+                long_term_dim=metadata.long_term_input_dim,
+                global_batch_size=metadata.generator_batch_size,
+                steps_per_epoch=val_steps,
+                distributed_ctx=dist_ctx,
+            )
+        else:
+            val_data = val_generator_factory()
+
+    return train_data, train_steps, val_data, val_steps
+
+
+def _create_snapshot_fit_kwargs(
+    config: Dict[str, Any],
+    train_data: Any,
+    *,
+    train_steps: int,
+    val_data: Optional[Any],
+    val_steps: Optional[int],
+    phase_memory_probe: Optional[Callable[[str, Optional[Dict[str, Any]]], Any]] = None,
+) -> Dict[str, Any]:
+    callbacks = create_callbacks(config)
+    first_batch_probe_cb = _create_first_batch_probe_callback(phase_memory_probe)
+    if first_batch_probe_cb is not None:
+        callbacks.append(first_batch_probe_cb)
+
+    fit_kwargs: Dict[str, Any] = {
+        "x": train_data,
+        "epochs": int(config["training"]["epochs"]),
+        "steps_per_epoch": train_steps,
+        "callbacks": callbacks,
+        "verbose": 1,
+    }
+    if val_data is not None and val_steps is not None:
+        fit_kwargs["validation_data"] = val_data
+        fit_kwargs["validation_steps"] = val_steps
+    return fit_kwargs
+
+
+def _log_snapshot_history_to_mlflow(history: Any, *, epoch_step_offset: int) -> None:
+    mlflow = get_mlflow_if_active()
+    if mlflow is None:
+        return
+    if hasattr(history, "history") and isinstance(history.history, dict):
+        for metric_name, values in history.history.items():
+            try:
+                series = list(values)  # type: ignore[arg-type]
+            except TypeError:
+                continue
+            for step, value in enumerate(series):
+                try:
+                    mlflow.log_metric(metric_name, float(value), step=epoch_step_offset + step)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Failed to log MLFlow metric %s at step %s: %s",
+                        metric_name,
+                        epoch_step_offset + step,
+                        exc,
+                    )
+
+
 def _sanitize_resume_component(value: str) -> str:
     safe_chars: List[str] = []
     for ch in value:
@@ -646,8 +1172,9 @@ def _save_sequential_resume_state(state_path: str, payload: Dict[str, Any]) -> N
 
 
 def _load_sequential_resume_model(model_path: str) -> Any:
-    tf_keras_models = __import__("tensorflow.keras.models", fromlist=["load_model"])
-    return tf_keras_models.load_model(model_path)
+    from tensorflow.keras.models import load_model  # type: ignore[import]
+
+    return load_model(model_path)
 
 
 def _save_sequential_resume_model(model: Any, model_path: str) -> None:
@@ -716,6 +1243,10 @@ def _resolve_sequential_windows(config: Dict[str, Any]) -> Optional[List[Tuple[s
     return windows
 
 
+def resolve_sequential_windows(config: Dict[str, Any]) -> Optional[List[Tuple[str, str]]]:
+    return _resolve_sequential_windows(config)
+
+
 def _fit_snapshot_model_once(
     config: Dict[str, Any],
     snapshot_dataset: Any,
@@ -723,408 +1254,46 @@ def _fit_snapshot_model_once(
     *,
     epoch_step_offset: int,
     dist_ctx: Optional[DistributedContext] = None,
+    phase_memory_probe: Optional[Callable[[str, Optional[Dict[str, Any]]], Any]] = None,
 ) -> Tuple[Optional[Any], int, Optional[float], float]:
     training_cfg = config["training"]
     epochs = int(training_cfg["epochs"])
-    batch_size = int(training_cfg["batch_size"])
-    # MirroredStrategy splits each dataset element across replicas, so the
-    # generator must yield global-batch-size samples per step.
-    generator_batch_size = (
-        dist_ctx.global_batch_size(batch_size) if dist_ctx is not None
-        else batch_size
-    )
-
-    model_cfg = config["model"]
-    output_cfg = model_cfg["output"]
-    output_type = str(output_cfg["type"])
-    if output_type != "two_head_intensity":
-        raise ValueError(
-            "Only model.output.type='two_head_intensity' is supported in snapshot training",
-        )
-
-    class_weights_cfg = training_cfg["class_weights"]
-    use_class_weights = bool(class_weights_cfg["compute_from_train"])
-
-    n_samples = int(snapshot_dataset.total_samples)
-    if n_samples <= 0:
-        logger.info("Snapshot training window skipped: snapshot dataset has no samples.")
-        return model, 0, None, 0.0
-
-    _emit_hpo_phase_memory_probe(
-        config,
-        "after_snapshot_load",
-        {
-            "n_samples": int(n_samples),
-            "n_chunks": int(len(getattr(snapshot_dataset, "chunks", []) or [])),
-        },
-    )
-
-    _enforce_production_sample_cap_snapshot(config, n_samples)
-
-    split_indices = _resolve_snapshot_training_indices(config, n_samples)
-    if split_indices is None:
-        logger.info("Snapshot training window skipped: no effective training samples available.")
-        return model, 0, None, 0.0
-    effective_train_n, val_start, val_end = split_indices
-
-    val_count = max(0, val_end - val_start)
-
-    if not snapshot_dataset.chunks:
-        logger.info("Snapshot training window skipped: no chunk files found.")
-        return model, 0, None, 0.0
-
-    first_chunk = snapshot_dataset.chunks[0]
-    x_shape = get_chunk_x_shape(first_chunk)
-    if len(x_shape) != 5:
-        raise ValueError("Snapshot input tensors must have rank 5")
-    input_shape = tuple(int(d) for d in x_shape[1:])
-
-    long_term_features = None
-    long_term_input_dim: Optional[int] = None
-    if is_long_term_enabled(config):
-        cadence_seconds = int(config["data"]["time_range"]["cadence_seconds"])
-        long_term_features = compute_long_term_features_for_dataset(
-            config,
-            snapshot_dataset,
-            cadence_seconds=cadence_seconds,
-        )
-        if long_term_features is None:
-            raise ConfigError("Long-term features enabled but computation returned None")
-        if long_term_features.shape[0] != n_samples:
-            raise ConfigError(
-                "Long-term feature rows do not match snapshot dataset sample count: "
-                f"features={long_term_features.shape[0]}, samples={n_samples}"
-            )
-        long_term_input_dim = int(long_term_features.shape[1])
-
-    _emit_hpo_phase_memory_probe(
-        config,
-        "after_long_term_features",
-        {
-            "long_term_enabled": bool(long_term_features is not None),
-            "long_term_dim": int(long_term_input_dim or 0),
-        },
-    )
-
-    context = resolve_snapshot_context(config)
-    manifest = load_or_create_manifest(context, config)
-
-    normalization_cfg = config["preprocessing"]["normalization"]
-    fit_on_train_only = bool(normalization_cfg["fit_on_train_only"])
-
-    train_stats = _get_normalization_stats(
-        config,
-        context,
-        manifest,
-        snapshot_dataset,
-        0,
-        effective_train_n,
-        "train",
-    )
-
-    mask_start, mask_count = get_mask_channel_info(config)
-
-    if fit_on_train_only or val_count <= 0:
-        val_stats = train_stats
-    else:
-        val_stats = _get_normalization_stats(
-            config,
-            context,
-            manifest,
-            snapshot_dataset,
-            val_start,
-            val_end,
-            "val",
-        )
-
-    _emit_hpo_phase_memory_probe(
-        config,
-        "after_normalization_stats",
-        {
-            "fit_on_train_only": bool(fit_on_train_only),
-            "val_count": int(val_count),
-        },
-    )
-
-    num_classes = int(output_cfg["num_classes"])
-    balanced_train_indices = _resolve_undersampled_train_indices(
+    metadata = _prepare_snapshot_training_metadata(
         config,
         snapshot_dataset,
-        train_end=effective_train_n,
-        batch_size=generator_batch_size,
-        num_classes=num_classes,
+        dist_ctx=dist_ctx,
+        phase_memory_probe=phase_memory_probe,
     )
-    effective_train_used_n = int(balanced_train_indices.shape[0]) if balanced_train_indices is not None else int(
-        effective_train_n
+    if metadata is None:
+        return model, 0, None, 0.0
+
+    model = _initialize_snapshot_training_model(
+        config,
+        model,
+        input_shape=metadata.input_shape,
+        long_term_input_dim=metadata.long_term_input_dim,
+        dist_ctx=dist_ctx,
     )
-
-    # Emit label distributions regardless of whether constraints were violated.
-    try:
-        if balanced_train_indices is not None:
-            train_dist = compute_label_distribution_for_indices(
-                snapshot_dataset,
-                indices=balanced_train_indices,
-                num_classes=num_classes,
-            )
-            _emit_label_distribution_tables(
-                config,
-                split_name="train(undersampled)",
-                dist=train_dist,
-                title="Label distribution (effective train after undersampling)",
-            )
-        else:
-            train_dist = compute_label_distribution(
-                snapshot_dataset,
-                start_index=0,
-                end_index=effective_train_n,
-                num_classes=num_classes,
-            )
-            _emit_label_distribution_tables(
-                config,
-                split_name="train",
-                dist=train_dist,
-                title="Label distribution (train)",
-            )
-
-        if val_count > 0:
-            val_dist = compute_label_distribution(
-                snapshot_dataset,
-                start_index=val_start,
-                end_index=val_end,
-                num_classes=num_classes,
-            )
-            _emit_label_distribution_tables(
-                config,
-                split_name="val",
-                dist=val_dist,
-                title="Label distribution (val)",
-            )
-    except Exception:  # noqa: BLE001
-        logger.debug("Failed to compute label distributions", exc_info=True)
-
-    class_weights_up: Optional[Dict[int, float]] = None
-    class_weights_down: Optional[Dict[int, float]] = None
-    if use_class_weights:
-        if balanced_train_indices is not None:
-            train_label_dist = compute_label_distribution_for_indices(
-                snapshot_dataset,
-                indices=balanced_train_indices,
-                num_classes=num_classes,
-            )
-        else:
-            train_label_dist = load_label_stats_from_manifest(manifest, "train")
-            if train_label_dist is None:
-                train_label_dist = compute_label_distribution(
-                    snapshot_dataset,
-                    start_index=0,
-                    end_index=effective_train_n,
-                    num_classes=num_classes,
-                )
-                save_label_stats_to_manifest(context, manifest, train_label_dist, "train")
-
-        class_weights_up = compute_class_weights_from_counts(train_label_dist.up_counts, num_classes)
-        class_weights_down = compute_class_weights_from_counts(train_label_dist.down_counts, num_classes)
-
-    # When distributed, model must be built/compiled inside strategy.scope().
-    strategy_scope = dist_ctx.scope() if dist_ctx is not None else contextlib.nullcontext()
-
-    with strategy_scope:
-        if model is None:
-            fine_tuning_cfg = training_cfg["fine_tuning"]
-            fine_tuning_enabled = bool(fine_tuning_cfg["enabled"])
-            if fine_tuning_enabled:
-                from .fine_tuning import (
-                    FineTuningError,
-                    load_model_from_registry,
-                    load_model_from_run,
-                    prepare_fine_tuning,
-                )
-
-                use_registry = bool(fine_tuning_cfg["use_model_registry"])
-                if use_registry:
-                    registry_name = fine_tuning_cfg["registry_name"]
-                    if not registry_name:
-                        raise ConfigError(
-                            "training.fine_tuning.registry_name is required when use_model_registry is true"
-                        )
-                    stage = str(fine_tuning_cfg["base_model_stage"])
-                    try:
-                        model = load_model_from_registry(registry_name, stage=stage)
-                    except FineTuningError as exc:
-                        raise ConfigError(f"Failed to load base model for fine-tuning: {exc}") from exc
-                else:
-                    run_id = fine_tuning_cfg["base_model_run_id"]
-                    if not run_id:
-                        raise ConfigError(
-                            "training.fine_tuning.base_model_run_id is required when fine_tuning.enabled is true "
-                            "and use_model_registry is false"
-                        )
-                    try:
-                        model = load_model_from_run(run_id)
-                    except FineTuningError as exc:
-                        raise ConfigError(f"Failed to load base model for fine-tuning: {exc}") from exc
-
-                try:
-                    model = prepare_fine_tuning(
-                        config,
-                        model,
-                        input_shape=input_shape,
-                        long_term_input_dim=long_term_input_dim,
-                    )
-                except FineTuningError as exc:
-                    raise ConfigError(f"Failed to prepare model for fine-tuning: {exc}") from exc
-            else:
-                from models.cnn_lstm_multiclass import build_cnn_lstm_model
-
-                model = build_cnn_lstm_model(
-                    config,
-                    input_shape=input_shape,
-                    long_term_input_dim=long_term_input_dim,
-                )
-
-    def _make_train_gen() -> Iterator[Tuple[Any, ...]]:
-        if balanced_train_indices is not None:
-            gen, _ = build_training_generator_for_indices(
-                dataset=snapshot_dataset,
-                indices=balanced_train_indices,
-                batch_size=generator_batch_size,
-                num_classes=num_classes,
-                normalization=train_stats,
-                sample_weight_cfg=training_cfg["sample_weighting"],
-                mask_start=mask_start,
-                mask_count=mask_count,
-                class_weights_up=class_weights_up,
-                class_weights_down=class_weights_down,
-            )
-        else:
-            gen, _ = build_training_generator(
-                dataset=snapshot_dataset,
-                start_index=0,
-                end_index=effective_train_n,
-                batch_size=generator_batch_size,
-                num_classes=num_classes,
-                normalization=train_stats,
-                sample_weight_cfg=training_cfg["sample_weighting"],
-                mask_start=mask_start,
-                mask_count=mask_count,
-                class_weights_up=class_weights_up,
-                class_weights_down=class_weights_down,
-            )
-        if long_term_features is not None:
-            if balanced_train_indices is not None:
-                gen = wrap_generator_with_long_term_for_indices(
-                    gen,
-                    long_term_features,
-                    indices=balanced_train_indices,
-                )
-            else:
-                gen = wrap_generator_with_long_term(
-                    gen,
-                    long_term_features,
-                    start_index=0,
-                    end_index=effective_train_n,
-                )
-        return gen
-
-    if balanced_train_indices is not None:
-        train_steps = int(effective_train_used_n) // int(generator_batch_size)
-    else:
-        _, train_steps = build_training_generator(
-            dataset=snapshot_dataset,
-            start_index=0,
-            end_index=effective_train_n,
-            batch_size=generator_batch_size,
-            num_classes=num_classes,
-            normalization=train_stats,
-            sample_weight_cfg=training_cfg["sample_weighting"],
-            mask_start=mask_start,
-            mask_count=mask_count,
-            class_weights_up=class_weights_up,
-            class_weights_down=class_weights_down,
-        )
-
-    if dist_ctx is not None:
-        global_batch_size = generator_batch_size
-        train_data: Any = wrap_generator_as_dataset(
-            generator_factory=_make_train_gen,
-            input_shape=input_shape,
-            num_classes=num_classes,
-            long_term_dim=long_term_input_dim,
-            global_batch_size=global_batch_size,
-            steps_per_epoch=train_steps,
-            distributed_ctx=dist_ctx,
-        )
-    else:
-        train_data = _make_train_gen()
-
-    callbacks = create_callbacks(config)
-    first_batch_probe_cb = _create_first_batch_probe_callback(config)
-    if first_batch_probe_cb is not None:
-        callbacks.append(first_batch_probe_cb)
-    fit_kwargs: Dict[str, Any] = {
-        "x": train_data,
-        "epochs": epochs,
-        "steps_per_epoch": train_steps,
-        "callbacks": callbacks,
-        "verbose": 1,
-    }
-
-    if val_count > 0:
-        def _make_val_gen() -> Iterator[Tuple[Any, ...]]:
-            gen, _ = build_training_generator(
-                dataset=snapshot_dataset,
-                start_index=val_start,
-                end_index=val_end,
-                batch_size=generator_batch_size,
-                num_classes=num_classes,
-                normalization=val_stats,
-                sample_weight_cfg=None,
-                mask_start=mask_start,
-                mask_count=mask_count,
-                class_weights_up=None,
-                class_weights_down=None,
-            )
-            if long_term_features is not None:
-                gen = wrap_generator_with_long_term(
-                    gen, long_term_features, start_index=val_start, end_index=val_end,
-                )
-            return gen
-
-        _, val_steps = build_training_generator(
-            dataset=snapshot_dataset,
-            start_index=val_start,
-            end_index=val_end,
-            batch_size=generator_batch_size,
-            num_classes=num_classes,
-            normalization=val_stats,
-            sample_weight_cfg=None,
-            mask_start=mask_start,
-            mask_count=mask_count,
-            class_weights_up=None,
-            class_weights_down=None,
-        )
-
-        if dist_ctx is not None:
-            val_data: Any = wrap_generator_as_dataset(
-                generator_factory=_make_val_gen,
-                input_shape=input_shape,
-                num_classes=num_classes,
-                long_term_dim=long_term_input_dim,
-                global_batch_size=generator_batch_size,
-                steps_per_epoch=val_steps,
-                distributed_ctx=dist_ctx,
-            )
-        else:
-            val_data = _make_val_gen()
-
-        fit_kwargs["validation_data"] = val_data
-        fit_kwargs["validation_steps"] = val_steps
+    train_data, train_steps, val_data, val_steps = _build_snapshot_training_data(
+        config,
+        snapshot_dataset,
+        metadata=metadata,
+        dist_ctx=dist_ctx,
+    )
+    fit_kwargs = _create_snapshot_fit_kwargs(
+        config,
+        train_data,
+        train_steps=train_steps,
+        val_data=val_data,
+        val_steps=val_steps,
+        phase_memory_probe=phase_memory_probe,
+    )
 
     if model is None:
         raise ConfigError("Model is not initialized for snapshot training window")
 
-    _emit_hpo_phase_memory_probe(
-        config,
+    _emit_phase_memory_probe(
+        phase_memory_probe,
         "before_first_fit_batch",
         {
             "train_steps": int(train_steps),
@@ -1137,38 +1306,49 @@ def _fit_snapshot_model_once(
     hpo_metric_value = _extract_hpo_metric_from_history(config, history)
     hpo_metric_weight = 0.0
     if hpo_metric_value is not None:
-        config["_hpo_last_metric"] = hpo_metric_value
         metric_name = str(config["hyperparameter_optimization"]["metric"])
-        hpo_metric_weight = _resolve_hpo_metric_weight(metric_name, effective_train_used_n, val_count)
+        hpo_metric_weight = _resolve_hpo_metric_weight(
+            metric_name,
+            metadata.effective_train_used_n,
+            metadata.val_count,
+        )
 
-    mlflow = get_mlflow_if_active()
-    if mlflow is not None:
-        if hasattr(history, "history") and isinstance(history.history, dict):
-            for metric_name, values in history.history.items():
-                try:
-                    series = list(values)  # type: ignore[arg-type]
-                except TypeError:
-                    continue
-                for step, value in enumerate(series):
-                    try:
-                        mlflow.log_metric(metric_name, float(value), step=epoch_step_offset + step)
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "Failed to log MLFlow metric %s at step %s: %s",
-                            metric_name,
-                            epoch_step_offset + step,
-                            exc,
-                        )
-
+    _log_snapshot_history_to_mlflow(history, epoch_step_offset=epoch_step_offset)
     return model, epochs, hpo_metric_value, hpo_metric_weight
 
 
-def _run_snapshot_training_pipeline_sequential(
+def _fit_snapshot_model_once_result(
+    config: Dict[str, Any],
+    snapshot_dataset: Any,
+    model: Optional[Any],
+    *,
+    epoch_step_offset: int,
+    dist_ctx: Optional[DistributedContext] = None,
+    phase_memory_probe: Optional[Callable[[str, Optional[Dict[str, Any]]], Any]] = None,
+) -> PipelineResult:
+    model_out, epochs_ran, hpo_metric_value, hpo_metric_weight = _fit_snapshot_model_once(
+        config,
+        snapshot_dataset,
+        model,
+        epoch_step_offset=epoch_step_offset,
+        dist_ctx=dist_ctx,
+        phase_memory_probe=phase_memory_probe,
+    )
+    return PipelineResult(
+        model=model_out,
+        epochs_ran=int(epochs_ran),
+        hpo_metric_value=hpo_metric_value,
+        hpo_metric_weight=float(hpo_metric_weight),
+    )
+
+
+def _run_snapshot_training_pipeline_sequential_result(
     config: Dict[str, Any],
     windows: List[Tuple[str, str]],
     *,
     dist_ctx: Optional[DistributedContext] = None,
-) -> Optional[Any]:
+    phase_memory_probe: Optional[Callable[[str, Optional[Dict[str, Any]]], Any]] = None,
+) -> PipelineResult:
     sequential_cfg = config["training"].get("sequential_training") or {}
     cleanup_completed = bool(sequential_cfg.get("cleanup_completed_windows", False))
     cleanup_keep_last_windows = int(sequential_cfg.get("cleanup_keep_last_windows", 0))
@@ -1326,13 +1506,18 @@ def _run_snapshot_training_pipeline_sequential(
         except Exception:  # noqa: BLE001
             logger.debug("Failed to compute per-window label distributions", exc_info=True)
 
-        model, epochs_ran, hpo_metric_value, hpo_metric_weight = _fit_snapshot_model_once(
+        window_result = _fit_snapshot_model_once_result(
             window_config,
             snapshot_dataset,
             model,
             epoch_step_offset=epoch_offset,
             dist_ctx=dist_ctx,
+            phase_memory_probe=phase_memory_probe,
         )
+        model = window_result.model
+        epochs_ran = int(window_result.epochs_ran)
+        hpo_metric_value = window_result.hpo_metric_value
+        hpo_metric_weight = float(window_result.hpo_metric_weight)
         if hpo_metric_value is not None:
             hpo_window_metrics.append((hpo_metric_value, hpo_metric_weight))
         epoch_offset += epochs_ran
@@ -1366,17 +1551,18 @@ def _run_snapshot_training_pipeline_sequential(
 
     if model is None:
         logger.info("Sequential snapshot training completed with no trainable windows.")
-        return None
+        return PipelineResult(model=None)
 
     # Emit aggregated label distribution across processed windows.
     try:
         if aggregated_train_up is not None and aggregated_train_down is not None:
             class_count = len(aggregated_train_up)
-            train_dist = type("_AggDist", (), {})()
-            setattr(train_dist, "num_classes", class_count)
-            setattr(train_dist, "total_samples", int(aggregated_train_total))
-            setattr(train_dist, "up_counts", dict(aggregated_train_up))
-            setattr(train_dist, "down_counts", dict(aggregated_train_down))
+            train_dist = _AggregatedLabelDistribution(
+                num_classes=class_count,
+                total_samples=int(aggregated_train_total),
+                up_counts=dict(aggregated_train_up),
+                down_counts=dict(aggregated_train_down),
+            )
             _emit_label_distribution_tables(
                 config,
                 split_name="train",
@@ -1385,11 +1571,12 @@ def _run_snapshot_training_pipeline_sequential(
             )
         if aggregated_val_up is not None and aggregated_val_down is not None and aggregated_val_total > 0:
             class_count = len(aggregated_val_up)
-            val_dist = type("_AggDist", (), {})()
-            setattr(val_dist, "num_classes", class_count)
-            setattr(val_dist, "total_samples", int(aggregated_val_total))
-            setattr(val_dist, "up_counts", dict(aggregated_val_up))
-            setattr(val_dist, "down_counts", dict(aggregated_val_down))
+            val_dist = _AggregatedLabelDistribution(
+                num_classes=class_count,
+                total_samples=int(aggregated_val_total),
+                up_counts=dict(aggregated_val_up),
+                down_counts=dict(aggregated_val_down),
+            )
             _emit_label_distribution_tables(
                 config,
                 split_name="val",
@@ -1401,7 +1588,6 @@ def _run_snapshot_training_pipeline_sequential(
 
     aggregated_hpo_metric = _aggregate_hpo_window_metrics(hpo_window_metrics)
     if aggregated_hpo_metric is not None:
-        config["_hpo_last_metric"] = aggregated_hpo_metric
         logger.info(
             "Aggregated sequential HPO metric across windows: metric=%s, windows=%s",
             aggregated_hpo_metric,
@@ -1474,674 +1660,99 @@ def _run_snapshot_training_pipeline_sequential(
         processed_windows,
         epoch_offset,
     )
-    return model
-
-
-def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
-    training_cfg = config["training"]
-    epochs = int(training_cfg["epochs"])
-    batch_size = int(training_cfg["batch_size"])  # per-replica batch size
-
-    # Distributed training setup (opt-in via config)
-    runtime_cfg = training_cfg.get("runtime") or {}
-    dist_ctx: Optional[DistributedContext] = build_distributed_context(runtime_cfg)
-    # MirroredStrategy splits each dataset element across replicas, so the
-    # generator must yield global-batch-size samples per step.
-    generator_batch_size = (
-        dist_ctx.global_batch_size(batch_size) if dist_ctx is not None
-        else batch_size
+    return PipelineResult(
+        model=model,
+        epochs_ran=int(epoch_offset),
+        hpo_metric_value=aggregated_hpo_metric,
+        hpo_metric_weight=0.0,
     )
 
-    model_cfg = config["model"]
-    output_cfg = model_cfg["output"]
-    output_type = str(output_cfg["type"])
-    if output_type != "two_head_intensity":
-        raise ValueError(
-            "Only model.output.type='two_head_intensity' is supported in snapshot training",
-        )
+
+def _run_snapshot_training_pipeline_sequential(
+    config: Dict[str, Any],
+    windows: List[Tuple[str, str]],
+    *,
+    dist_ctx: Optional[DistributedContext] = None,
+) -> Optional[Any]:
+    result = _run_snapshot_training_pipeline_sequential_result(config, windows, dist_ctx=dist_ctx)
+    return result.model
+
+
+def _run_snapshot_training_pipeline_result(
+    config: Dict[str, Any],
+    *,
+    phase_memory_probe: Optional[Callable[[str, Optional[Dict[str, Any]]], Any]] = None,
+) -> PipelineResult:
+    training_cfg = config["training"]
+    runtime_cfg = training_cfg.get("runtime") or {}
+    dist_ctx: Optional[DistributedContext] = build_distributed_context(runtime_cfg)
 
     windows = _resolve_sequential_windows(config)
     if windows is not None and len(windows) > 1:
-        return _run_snapshot_training_pipeline_sequential(config, windows, dist_ctx=dist_ctx)
-
-    class_weights_cfg = training_cfg["class_weights"]
-    use_class_weights = bool(class_weights_cfg["compute_from_train"])
+        return _run_snapshot_training_pipeline_sequential_result(
+            config,
+            windows,
+            dist_ctx=dist_ctx,
+            phase_memory_probe=phase_memory_probe,
+        )
 
     snapshot_dataset = prepare_snapshot_dataset(config)
-    n_samples = int(snapshot_dataset.total_samples)
-    if n_samples <= 0:
-        logger.info("Snapshot training skipped: snapshot dataset has no samples.")
-        return None
-
-    _emit_hpo_phase_memory_probe(
-        config,
-        "after_snapshot_load",
-        {
-            "n_samples": int(n_samples),
-            "n_chunks": int(len(getattr(snapshot_dataset, "chunks", []) or [])),
-        },
-    )
-
-    _enforce_production_sample_cap_snapshot(config, n_samples)
-
-    split_indices = _resolve_snapshot_training_indices(config, n_samples)
-    if split_indices is None:
-        logger.info("Snapshot training skipped: no effective training samples available.")
-        return None
-    effective_train_n, val_start, val_end = split_indices
-
-    val_count = max(0, val_end - val_start)
-
-    if not snapshot_dataset.chunks:
-        logger.info("Snapshot training skipped: no chunk files found.")
-        return None
-
-    first_chunk = snapshot_dataset.chunks[0]
-    x_shape = get_chunk_x_shape(first_chunk)
-    if len(x_shape) != 5:
-        raise ValueError("Snapshot input tensors must have rank 5")
-    input_shape = tuple(int(d) for d in x_shape[1:])
-
-    long_term_features = None
-    long_term_input_dim: Optional[int] = None
-    if is_long_term_enabled(config):
-        cadence_seconds = int(config["data"]["time_range"]["cadence_seconds"])
-        long_term_features = compute_long_term_features_for_dataset(
-            config,
-            snapshot_dataset,
-            cadence_seconds=cadence_seconds,
-        )
-        if long_term_features is None:
-            raise ConfigError("Long-term features enabled but computation returned None")
-        if long_term_features.shape[0] != n_samples:
-            raise ConfigError(
-                "Long-term feature rows do not match snapshot dataset sample count: "
-                f"features={long_term_features.shape[0]}, samples={n_samples}"
-            )
-        long_term_input_dim = int(long_term_features.shape[1])
-
-    _emit_hpo_phase_memory_probe(
-        config,
-        "after_long_term_features",
-        {
-            "long_term_enabled": bool(long_term_features is not None),
-            "long_term_dim": int(long_term_input_dim or 0),
-        },
-    )
-
-    context = resolve_snapshot_context(config)
-    manifest = load_or_create_manifest(context, config)
-
-    normalization_cfg = config["preprocessing"]["normalization"]
-    fit_on_train_only = bool(normalization_cfg["fit_on_train_only"])
-
-    train_stats = _get_normalization_stats(
-        config,
-        context,
-        manifest,
-        snapshot_dataset,
-        0,
-        effective_train_n,
-        "train",
-    )
-
-    mask_start, mask_count = get_mask_channel_info(config)
-
-    if fit_on_train_only or val_count <= 0:
-        val_stats = train_stats
-    else:
-        val_stats = _get_normalization_stats(
-            config,
-            context,
-            manifest,
-            snapshot_dataset,
-            val_start,
-            val_end,
-            "val",
-        )
-
-    _emit_hpo_phase_memory_probe(
-        config,
-        "after_normalization_stats",
-        {
-            "fit_on_train_only": bool(fit_on_train_only),
-            "val_count": int(val_count),
-        },
-    )
-
-    num_classes = int(output_cfg["num_classes"])
-    balanced_train_indices = _resolve_undersampled_train_indices(
+    result = _fit_snapshot_model_once_result(
         config,
         snapshot_dataset,
-        train_end=effective_train_n,
-        batch_size=generator_batch_size,
-        num_classes=num_classes,
-    )
-    effective_train_used_n = int(balanced_train_indices.shape[0]) if balanced_train_indices is not None else int(
-        effective_train_n
+        model=None,
+        epoch_step_offset=0,
+        dist_ctx=dist_ctx,
+        phase_memory_probe=phase_memory_probe,
     )
 
-    # Compute class weights for imbalanced label handling if configured.
-    # Class weights are computed from training data only to avoid data leakage.
-    class_weights_up: Optional[Dict[int, float]] = None
-    class_weights_down: Optional[Dict[int, float]] = None
-
-    if use_class_weights:
-        if balanced_train_indices is not None:
-            train_label_dist = compute_label_distribution_for_indices(
-                snapshot_dataset,
-                indices=balanced_train_indices,
-                num_classes=num_classes,
-            )
-        else:
-            # Try to load cached label stats from manifest first
-            train_label_dist = load_label_stats_from_manifest(manifest, "train")
-
-            if train_label_dist is None:
-                # Compute label distribution by streaming through training data
-                logger.info(
-                    "Computing label distribution for class weights (train samples 0 to %s)...",
-                    effective_train_n,
-                )
-                train_label_dist = compute_label_distribution(
-                    snapshot_dataset,
-                    start_index=0,
-                    end_index=effective_train_n,
-                    num_classes=num_classes,
-                )
-                # Cache in manifest for future runs
-                save_label_stats_to_manifest(context, manifest, train_label_dist, "train")
-
-        # Compute class weights from label counts
-        class_weights_up = compute_class_weights_from_counts(
-            train_label_dist.up_counts,
-            num_classes,
-        )
-        class_weights_down = compute_class_weights_from_counts(
-            train_label_dist.down_counts,
-            num_classes,
-        )
-
-        logger.info(
-            "Class weights computed for two-head outputs: up_weights=%s, down_weights=%s",
-            {c: round(w, 4) for c, w in sorted(class_weights_up.items())},
-            {c: round(w, 4) for c, w in sorted(class_weights_down.items())},
-        )
-
-        # Log class weights to MLFlow when a run is active.
-        mlflow = get_mlflow_if_active()
-        if mlflow is not None:
-            try:
-                for c, w in class_weights_up.items():
-                    mlflow.log_metric(f"class_weight_up_{c}", float(w))
-                for c, w in class_weights_down.items():
-                    mlflow.log_metric(f"class_weight_down_{c}", float(w))
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to log class weights to MLFlow: %s", exc)
-
-    # Build or load model based on fine-tuning configuration.
-    # When distributed training is enabled, model must be built/compiled
-    # inside strategy.scope() so variables are mirrored across replicas.
-    strategy_scope = dist_ctx.scope() if dist_ctx is not None else contextlib.nullcontext()
-
-    fine_tuning_cfg = training_cfg["fine_tuning"]
-    fine_tuning_enabled = bool(fine_tuning_cfg["enabled"])
-
-    with strategy_scope:
-        if fine_tuning_enabled:
-            from .fine_tuning import (
-                FineTuningError,
-                load_model_from_registry,
-                load_model_from_run,
-                prepare_fine_tuning,
-            )
-
-            use_registry = bool(fine_tuning_cfg["use_model_registry"])
-
-            if use_registry:
-                registry_name = fine_tuning_cfg["registry_name"]
-                if not registry_name:
-                    raise ConfigError(
-                        "training.fine_tuning.registry_name is required when use_model_registry is true"
-                    )
-                stage = str(fine_tuning_cfg["base_model_stage"])
-                logger.info(
-                    "Fine-tuning enabled: loading model from registry. name=%s, stage=%s",
-                    registry_name,
-                    stage,
-                )
-                try:
-                    model = load_model_from_registry(registry_name, stage=stage)
-                except FineTuningError as exc:
-                    raise ConfigError(f"Failed to load base model for fine-tuning: {exc}") from exc
-            else:
-                run_id = fine_tuning_cfg["base_model_run_id"]
-                if not run_id:
-                    raise ConfigError(
-                        "training.fine_tuning.base_model_run_id is required when fine_tuning.enabled is true "
-                        "and use_model_registry is false"
-                    )
-                logger.info("Fine-tuning enabled: loading model from MLflow run. run_id=%s", run_id)
-                try:
-                    model = load_model_from_run(run_id)
-                except FineTuningError as exc:
-                    raise ConfigError(f"Failed to load base model for fine-tuning: {exc}") from exc
-
-            # Prepare the model for fine-tuning (freeze layers, adjust LR)
-            try:
-                model = prepare_fine_tuning(
-                    config,
-                    model,
-                    input_shape=input_shape,
-                    long_term_input_dim=long_term_input_dim,
-                )
-            except FineTuningError as exc:
-                raise ConfigError(f"Failed to prepare model for fine-tuning: {exc}") from exc
-
-            logger.info(
-                "Model prepared for fine-tuning: freeze_layers=%s, lr_factor=%s",
-                fine_tuning_cfg["freeze_layers"],
-                fine_tuning_cfg["learning_rate_factor"],
-            )
-        else:
-            from models.cnn_lstm_multiclass import build_cnn_lstm_model
-
-            model = build_cnn_lstm_model(
-                config,
-                input_shape=input_shape,
-                long_term_input_dim=long_term_input_dim,
-            )
-
-    if long_term_features is not None:
-        try:
-            input_count = len(getattr(model, "inputs", []))
-        except Exception as exc:  # noqa: BLE001
-            raise ConfigError(f"Failed to inspect model inputs for long-term features: {exc}") from exc
-        if input_count != 2:
-            raise ConfigError(
-                "Long-term features are enabled but model does not expose two inputs. "
-                "Disable model.long_term or rebuild the base model with dual inputs."
-            )
-    else:
-        try:
-            input_count = len(getattr(model, "inputs", []))
-        except Exception:
-            input_count = 1
-        if input_count == 2:
-            raise ConfigError(
-                "Model expects long-term inputs but model.long_term is disabled. "
-                "Enable model.long_term and rebuild the snapshot dataset."
-            )
-
-    # Log model complexity metrics to MLFlow when a run is active.
-    mlflow = get_mlflow_if_active()
-    if mlflow is not None:
-        try:
-            total_params = int(model.count_params())
-            trainable_params = int(
-                sum(int(np.prod(w.shape)) for w in getattr(model, "trainable_weights", []))
-            )
-            non_trainable_params = int(
-                sum(int(np.prod(w.shape)) for w in getattr(model, "non_trainable_weights", []))
-            )
-
-            approx_flops = float(2 * total_params)
-
-            metrics = {
-                "model_total_params": float(total_params),
-                "model_trainable_params": float(trainable_params),
-                "model_non_trainable_params": float(non_trainable_params),
-                "model_approx_flops": approx_flops,
-            }
-
-            for name, value in metrics.items():
-                try:
-                    mlflow.log_metric(name, float(value))
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "Failed to log MLFlow model complexity metric %s: %s",
-                        name,
-                        exc,
-                    )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to compute or log model complexity metrics: %s", exc)
-
-    callbacks = create_callbacks(config)
-
-    # Helper to create a fresh generator (needed by tf.data.Dataset.from_generator)
-    def _make_train_gen() -> Iterator[Tuple[Any, ...]]:
-        if balanced_train_indices is not None:
-            gen, _ = build_training_generator_for_indices(
-                dataset=snapshot_dataset,
-                indices=balanced_train_indices,
-                batch_size=generator_batch_size,
-                num_classes=num_classes,
-                normalization=train_stats,
-                sample_weight_cfg=training_cfg["sample_weighting"],
-                mask_start=mask_start,
-                mask_count=mask_count,
-                class_weights_up=class_weights_up,
-                class_weights_down=class_weights_down,
-            )
-        else:
-            gen, _ = build_training_generator(
-                dataset=snapshot_dataset,
-                start_index=0,
-                end_index=effective_train_n,
-                batch_size=generator_batch_size,
-                num_classes=num_classes,
-                normalization=train_stats,
-                sample_weight_cfg=training_cfg["sample_weighting"],
-                mask_start=mask_start,
-                mask_count=mask_count,
-                class_weights_up=class_weights_up,
-                class_weights_down=class_weights_down,
-            )
-        if long_term_features is not None:
-            if balanced_train_indices is not None:
-                gen = wrap_generator_with_long_term_for_indices(
-                    gen,
-                    long_term_features,
-                    indices=balanced_train_indices,
-                )
-            else:
-                gen = wrap_generator_with_long_term(
-                    gen,
-                    long_term_features,
-                    start_index=0,
-                    end_index=effective_train_n,
-                )
-        return gen
-
-    if balanced_train_indices is not None:
-        train_steps = int(effective_train_used_n) // int(generator_batch_size)
-    else:
-        # Compute steps from a throwaway call (same as build_training_generator returns)
-        _, train_steps = build_training_generator(
-            dataset=snapshot_dataset,
-            start_index=0,
-            end_index=effective_train_n,
-            batch_size=generator_batch_size,
-            num_classes=num_classes,
-            normalization=train_stats,
-            sample_weight_cfg=training_cfg["sample_weighting"],
-            mask_start=mask_start,
-            mask_count=mask_count,
-            class_weights_up=class_weights_up,
-            class_weights_down=class_weights_down,
-        )
-
-    if dist_ctx is not None:
-        global_batch_size = generator_batch_size
-        train_data: Any = wrap_generator_as_dataset(
-            generator_factory=_make_train_gen,
-            input_shape=input_shape,
-            num_classes=num_classes,
-            long_term_dim=long_term_input_dim,
-            global_batch_size=global_batch_size,
-            steps_per_epoch=train_steps,
-            distributed_ctx=dist_ctx,
-        )
-        logger.info(
-            "Distributed training: per_replica_batch=%d, global_batch=%d, replicas=%d",
-            batch_size,
-            global_batch_size,
-            dist_ctx.num_replicas,
-        )
-    else:
-        train_data = _make_train_gen()
-
-    first_batch_probe_cb = _create_first_batch_probe_callback(config)
-    if first_batch_probe_cb is not None:
-        callbacks.append(first_batch_probe_cb)
-
-    writer = None
-    try:
-        from observability.run_state import get_run_state_writer
-
-        writer = get_run_state_writer()
-    except Exception:
-        writer = None
-
-    if writer is not None and epochs > 0 and train_steps > 0:
-        try:
-            from observability.training_progress import create_training_progress_callback
-
-            progress_cb = create_training_progress_callback(writer, epochs=epochs, steps_per_epoch=train_steps)
-        except Exception:
-            progress_cb = None
-        if progress_cb is not None:
-            callbacks.append(progress_cb)
-
-    fit_kwargs: Dict[str, Any] = {
-        "x": train_data,
-        "epochs": epochs,
-        "steps_per_epoch": train_steps,
-        "callbacks": callbacks,
-        "verbose": 1,
-    }
-
-    if val_count > 0:
-        def _make_val_gen() -> Iterator[Tuple[Any, ...]]:
-            gen, _ = build_training_generator(
-                dataset=snapshot_dataset,
-                start_index=val_start,
-                end_index=val_end,
-                batch_size=generator_batch_size,
-                num_classes=num_classes,
-                normalization=val_stats,
-                sample_weight_cfg=None,
-                mask_start=mask_start,
-                mask_count=mask_count,
-                class_weights_up=None,
-                class_weights_down=None,
-            )
-            if long_term_features is not None:
-                gen = wrap_generator_with_long_term(
-                    gen, long_term_features, start_index=val_start, end_index=val_end,
-                )
-            return gen
-
-        _, val_steps = build_training_generator(
-            dataset=snapshot_dataset,
-            start_index=val_start,
-            end_index=val_end,
-            batch_size=generator_batch_size,
-            num_classes=num_classes,
-            normalization=val_stats,
-            sample_weight_cfg=None,
-            mask_start=mask_start,
-            mask_count=mask_count,
-            class_weights_up=None,
-            class_weights_down=None,
-        )
-
-        if dist_ctx is not None:
-            val_data: Any = wrap_generator_as_dataset(
-                generator_factory=_make_val_gen,
-                input_shape=input_shape,
-                num_classes=num_classes,
-                long_term_dim=long_term_input_dim,
-                global_batch_size=generator_batch_size,
-                steps_per_epoch=val_steps,
-                distributed_ctx=dist_ctx,
-            )
-        else:
-            val_data = _make_val_gen()
-
-        fit_kwargs["validation_data"] = val_data
-        fit_kwargs["validation_steps"] = val_steps
-
-    _emit_hpo_phase_memory_probe(
-        config,
-        "before_first_fit_batch",
-        {
-            "train_steps": int(train_steps),
-            "epochs": int(epochs),
-        },
-    )
-
-    history = model.fit(**fit_kwargs)
-
-    hpo_metric_value = _extract_hpo_metric_from_history(config, history)
-    if hpo_metric_value is not None:
-        config["_hpo_last_metric"] = hpo_metric_value
-
-    final_loss = None
-    if hasattr(history, "history") and "loss" in history.history:
-        loss_values = history.history.get("loss") or []
-        if loss_values:
-            final_loss = loss_values[-1]
-
-    logger.info(
-        "Snapshot training completed. effective_train_n=%s, used_train_n=%s, final_loss=%s",
-        int(effective_train_n),
-        int(effective_train_used_n),
-        final_loss,
-    )
+    if result.model is None:
+        return result
 
     mlflow = get_mlflow_if_active()
     if mlflow is not None:
-        if hasattr(history, "history") and isinstance(history.history, dict):
-            for metric_name, values in history.history.items():
-                try:
-                    series = list(values)  # type: ignore[arg-type]
-                except TypeError:
-                    continue
-                for step, value in enumerate(series):
-                    try:
-                        mlflow.log_metric(metric_name, float(value), step=step)
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "Failed to log MLFlow metric %s at step %s: %s",
-                            metric_name,
-                            step,
-                            exc,
-                        )
-
+        context = resolve_snapshot_context(config)
         try:
             mlflow.log_param("snapshot_dir", context.snapshot_dir)
             mlflow.log_param("snapshot_config_hash", context.config_hash)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to log snapshot metadata to MLFlow: %s", exc)
 
-    # Conditionally log the trained model to MLFlow using the modern Keras format.
     mlflow_cfg = config["mlflow"]
     artifact_logging_cfg = mlflow_cfg["artifact_logging"]
-    log_trained_model = bool(artifact_logging_cfg["trained_model"])
-
-    if log_trained_model:
+    if bool(artifact_logging_cfg["trained_model"]):
         if get_mlflow_if_active() is None:
             logger.debug("Skipping MLFlow model logging: no active run.")
         else:
-            signature = None
-            try:
-                from mlflow.models import infer_signature  # type: ignore[import]
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Failed to import MLFlow infer_signature for model logging: %s",
-                    exc,
-                )
-            else:
-                try:
-                    max_signature_samples = 8
-                    sample_n = int(min(int(effective_train_n), int(max_signature_samples)))
-
-                    # When distributed, ensure signature sample batch can be evenly
-                    # partitioned across replicas to avoid empty per-replica batches.
-                    replica_count = int(getattr(dist_ctx, "num_replicas", 1) or 1)
-                    if replica_count > 1:
-                        if sample_n < replica_count:
-                            sample_n = 0
-                        else:
-                            sample_n = int(sample_n - (sample_n % replica_count))
-                            if sample_n <= 0:
-                                sample_n = 0
-
-                    if sample_n > 0:
-                        sample_gen, _ = build_training_generator(
-                            dataset=snapshot_dataset,
-                            start_index=0,
-                            end_index=sample_n,
-                            batch_size=sample_n,
-                            num_classes=int(output_cfg["num_classes"]),
-                            normalization=train_stats,
-                            sample_weight_cfg=None,
-                            mask_start=mask_start,
-                            mask_count=mask_count,
-                        )
-                        if long_term_features is not None:
-                            sample_gen = wrap_generator_with_long_term(
-                                sample_gen,
-                                long_term_features,
-                                start_index=0,
-                                end_index=sample_n,
-                            )
-                        batch = next(iter(sample_gen))
-                        x_sample = batch[0]
-                        y_pred = model.predict(x_sample, verbose=0)
-                        signature = infer_signature(x_sample, y_pred)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "Failed to infer MLFlow model signature from snapshot training data: %s",
-                        exc,
-                    )
-
-            model_registry_cfg = mlflow_cfg["model_registry"]
-            register_enabled = bool(model_registry_cfg["register_model"])
-            model_name = ""
-            if register_enabled:
-                try:
-                    model_name_pattern = model_registry_cfg["model_name_pattern"]
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "MLFlow model registry is enabled but mlflow.model_registry.model_name_pattern is missing or invalid: %s",
-                        exc,
-                    )
-                    register_enabled = False
-                else:
-                    try:
-                        data_cfg = config["data"]
-                        asset_pairs_cfg = data_cfg["asset_pairs"]
-                        target_asset = str(asset_pairs_cfg["target_asset"])
-                        architecture_name = str(model_cfg["architecture"])
-                        model_name = model_name_pattern.format(asset=target_asset, model=architecture_name)
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "Failed to prepare model name for MLFlow model registry: %s",
-                            exc,
-                        )
-                        register_enabled = False
-
             logger.info("Logging trained model to MLFlow using mlflow.tensorflow.log_model.")
-            if register_enabled:
-                log_keras_model_and_register_if_enabled(
-                    model,
-                    model_name=model_name,
-                    register_enabled=True,
-                    artifact_path="model",
-                    signature=signature,
-                )
-            else:
-                log_keras_model_to_active_run(
-                    model,
-                    artifact_path="model",
-                    signature=signature,
-                )
+            log_keras_model_to_active_run(result.model, artifact_path="model", signature=None)
 
-    return model
+    return result
+
+
+def _run_snapshot_training_pipeline(config: Dict[str, Any]) -> Optional[Any]:
+    return _run_snapshot_training_pipeline_result(config).model
+
+
+def run_training_pipeline_result(
+    config: Dict[str, Any],
+    data_object: Optional[Dict[str, Any]],
+    *,
+    phase_memory_probe: Optional[Callable[[str, Optional[Dict[str, Any]]], Any]] = None,
+) -> PipelineResult:
+    snapshot_cfg = config["snapshot"]
+    if bool(snapshot_cfg["enabled"]):
+        return _run_snapshot_training_pipeline_result(config, phase_memory_probe=phase_memory_probe)
+
+    raise ConfigError(
+        "Legacy in-memory training pipeline is disabled. Set snapshot.enabled=true to use the snapshot pipeline."
+    )
 
 
 def run_training_pipeline(config: Dict[str, Any], data_object: Optional[Dict[str, Any]]) -> Optional[Any]:
     """Execute the training pipeline."""
 
-    snapshot_cfg = config["snapshot"]
-    if bool(snapshot_cfg["enabled"]):
-        return _run_snapshot_training_pipeline(config)
-
-    raise ConfigError(
-        "Legacy in-memory training pipeline is disabled. Set snapshot.enabled=true to use the snapshot pipeline."
-    )
+    return run_training_pipeline_result(config, data_object).model
 
 
 def pre_build_snapshots(config: Dict[str, Any]) -> None:
@@ -2209,4 +1820,9 @@ def pre_build_snapshots(config: Dict[str, Any]) -> None:
     logger.info("Snapshot pre-build complete; all chunks cached on disk.")
 
 
-__all__ = ["pre_build_snapshots", "run_training_pipeline"]
+__all__ = [
+    "pre_build_snapshots",
+    "resolve_sequential_windows",
+    "run_training_pipeline",
+    "run_training_pipeline_result",
+]
