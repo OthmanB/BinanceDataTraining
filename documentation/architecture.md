@@ -173,7 +173,8 @@ observability/server.py
      ├── GET  /healthz          → JSON health status (no auth)
      ├── GET  /                  → HTMX Dashboard
      ├── GET  /metrics           → Prometheus metrics
-     ├── GET  /api/run           → JSON run state
+     ├── GET  /api/run-state     → JSON run state (primary)
+     ├── GET  /api/run           → JSON run state (legacy alias)
      ├── GET  /api/logs          → JSON log tail
      ├── GET  /ui/*              → HTMX fragments
      ├── POST /ui/start          → Start training run
