@@ -65,9 +65,11 @@ hyperparameter_optimization:
       headroom_fraction: 1.0
       persistence_enabled: true
   search_space:
-    cnn_filters_1: [32, 160]
-    cnn_filters_2: [64, 320]
-    lstm_units: [64, 256]
+    cnn:
+      - filters: [32, 160]
+      - filters: [64, 320]
+    lstm:
+      - units: [64, 256]
     learning_rate: [0.0003, 0.0012]
     batch_size: [24, 24]
 

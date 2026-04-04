@@ -138,7 +138,7 @@ targets:  # Defines what future event the model predicts and how labels are cons
 # Preprocessing Configuration
 preprocessing:  # Controls normalization, feature engineering, and dataset splitting.
   normalization:
-    method: "min_max"        # Scaling method for numerical features: "min_max", "standard", or "robust".
+    method: "min_max"        # Scaling method for numerical features: "min_max" or "standard".
     per_asset: true           # When true, fit separate normalizers per asset rather than a global one.
     fit_on_train_only: true   # When true, compute normalization statistics on the training split only and reuse for val/test.
 

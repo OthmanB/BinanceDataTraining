@@ -31,9 +31,11 @@ hyperparameter_optimization:
   trial_model_logging:
     enabled: false
   search_space:
-    cnn_filters_1: [32, 64]
-    cnn_filters_2: [64, 128]
-    lstm_units: [64, 96]
+    cnn:
+      - filters: [32, 64]
+      - filters: [64, 128]
+    lstm:
+      - units: [64, 96]
     learning_rate: [0.0005, 0.001]
     batch_size: [8, 16]
 
