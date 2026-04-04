@@ -1,4 +1,5 @@
 import unittest
+from typing import Any
 
 import numpy as np
 
@@ -8,7 +9,7 @@ from preprocessing.snapshot_sequence_builder import (
 )
 
 
-def _build_config() -> dict:
+def _build_config() -> dict[str, Any]:
     return {
         "data": {
             "time_range": {
@@ -69,6 +70,39 @@ class TestSnapshotSequenceBuilder(unittest.TestCase):
                 channels=1,
             )
 
+    def test_build_top_of_book_sequence_tensor_rejects_empty_anchor_indices_with_samples(self) -> None:
+        config = _build_config()
+
+        with self.assertRaises(ValueError) as ctx:
+            build_top_of_book_sequence_tensor(
+                config,
+                snapshot_features=[[1.0, 1.0, 2.0, 2.0]],
+                anchor_indices=[],
+                sample_indices=[0],
+                height=2,
+                width=2,
+                channels=1,
+            )
+
+        self.assertIn("anchor_indices must not be empty", str(ctx.exception))
+
+    def test_build_top_of_book_sequence_tensor_reports_non_numeric_feature_context(self) -> None:
+        config = _build_config()
+
+        with self.assertRaises(ValueError) as ctx:
+            build_top_of_book_sequence_tensor(
+                config,
+                snapshot_features=[[1.0, 10.0, 2.0, 20.0], ["bad", 30.0, 4.0, 40.0]],
+                anchor_indices=[1],
+                sample_indices=[0],
+                height=2,
+                width=2,
+                channels=1,
+            )
+
+        self.assertIn("sample_out_idx=0", str(ctx.exception))
+        self.assertIn("anchor_idx=1", str(ctx.exception))
+
     def test_build_hybrid_depth_sequence_tensor_empty_sample_indices(self) -> None:
         config = _build_config()
         depth_data = [
@@ -89,6 +123,34 @@ class TestSnapshotSequenceBuilder(unittest.TestCase):
 
         self.assertEqual(x.shape, (0, 2, 4, 4, 1))
 
+    def test_build_hybrid_depth_sequence_tensor_happy_path(self) -> None:
+        config = _build_config()
+        depth_data = [
+            {
+                "bid_prices": np.array([100.0, 99.0, 98.0, 97.0]),
+                "bid_quantities": np.array([1.0, 1.0, 1.0, 1.0]),
+                "ask_prices": np.array([101.0, 102.0, 103.0, 104.0]),
+                "ask_quantities": np.array([2.0, 2.0, 2.0, 2.0]),
+            },
+            {
+                "bid_prices": np.array([110.0, 109.0, 108.0, 107.0]),
+                "bid_quantities": np.array([3.0, 3.0, 3.0, 3.0]),
+                "ask_prices": np.array([111.0, 112.0, 113.0, 114.0]),
+                "ask_quantities": np.array([4.0, 4.0, 4.0, 4.0]),
+            },
+        ]
+
+        x = build_hybrid_depth_sequence_tensor(
+            config,
+            snapshot_depth_data=depth_data,
+            anchor_indices=[1],
+            sample_indices=[0],
+        )
+
+        self.assertEqual(x.shape, (1, 2, 4, 4, 1))
+        self.assertEqual(float(x[0, 0, 0, 0, 0]), 100.0)
+        self.assertEqual(float(x[0, 1, 0, 0, 0]), 110.0)
+
     def test_build_hybrid_depth_sequence_tensor_rejects_empty_depth_data(self) -> None:
         config = _build_config()
         with self.assertRaises(ValueError):
@@ -98,6 +160,27 @@ class TestSnapshotSequenceBuilder(unittest.TestCase):
                 anchor_indices=[0],
                 sample_indices=[0],
             )
+
+    def test_build_hybrid_depth_sequence_tensor_rejects_empty_anchor_indices_with_samples(self) -> None:
+        config = _build_config()
+        depth_data = [
+            {
+                "bid_prices": np.array([100.0, 99.0, 98.0, 97.0]),
+                "bid_quantities": np.array([1.0, 1.0, 1.0, 1.0]),
+                "ask_prices": np.array([101.0, 102.0, 103.0, 104.0]),
+                "ask_quantities": np.array([1.0, 1.0, 1.0, 1.0]),
+            }
+        ]
+
+        with self.assertRaises(ValueError) as ctx:
+            build_hybrid_depth_sequence_tensor(
+                config,
+                snapshot_depth_data=depth_data,
+                anchor_indices=[],
+                sample_indices=[0],
+            )
+
+        self.assertIn("anchor_indices must not be empty", str(ctx.exception))
 
 
 if __name__ == "__main__":
