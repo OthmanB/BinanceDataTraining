@@ -14,6 +14,7 @@ from observability import run_state as run_state_module
 from observability.run_state import RunStateWriter, _resolve_sqlite_path, load_run_state
 from observability.server import (
     ServerConfig,
+    _allowed_configs,
     _heartbeat_age_seconds,
     _is_run_state_stale,
     _read_gpu_stats,
@@ -260,6 +261,13 @@ class TestRunStatePathDiagnostics(unittest.TestCase):
         self.assertEqual(len(warnings), 2)
         self.assertIn("Run-state path mismatch", warnings[0])
         self.assertIn("Run-log path mismatch", warnings[1])
+
+    def test_allowed_configs_accepts_absolute_glob_under_config_root(self) -> None:
+        absolute_glob = str((Path("config").resolve() / "e2e_trial_*.yaml"))
+
+        allowed = _allowed_configs(absolute_glob)
+
+        self.assertIn("config/e2e_trial_13_snapshot_hpo_trial.yaml", allowed)
 
 
 if __name__ == "__main__":

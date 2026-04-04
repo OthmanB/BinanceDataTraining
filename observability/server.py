@@ -23,6 +23,7 @@ import argparse
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
+import glob
 import html
 import json
 import logging
@@ -568,7 +569,19 @@ def _is_run_state_stale(state: Dict[str, Any], *, threshold_seconds: float = 30.
 
 
 def _allowed_configs(glob_pattern: str) -> List[str]:
-    return sorted(str(p) for p in Path().glob(glob_pattern))
+    pattern = str(glob_pattern).strip()
+    if not pattern:
+        return []
+
+    matches = [Path(match).expanduser().resolve() for match in glob.glob(pattern, recursive=True)]
+    normalized: List[str] = []
+    for match in matches:
+        try:
+            rel = match.relative_to(_CONFIG_ROOT).as_posix()
+            normalized.append(f"config/{rel}")
+        except ValueError:
+            normalized.append(str(match))
+    return sorted(set(normalized))
 
 
 _MODULE_DIR = Path(__file__).resolve().parent  # observability/ directory
@@ -2063,8 +2076,13 @@ def _render_ui_page(_config: ServerConfig) -> str:
         <div class="card" id="hpo-card" hx-get="/ui/hpo" hx-trigger="load, every 5s"></div>
       </div>
       <div id="tab-config" class="tab-panel">
-        <div id="config-panel" hx-get="/ui/config" hx-trigger="load" hx-swap="outerHTML"></div>
-        <div id="run-control" hx-get="/ui/run-control" hx-trigger="load, every 5s" style="margin-top:16px"></div>
+        <div id="config-panel" hx-get="/ui/config" hx-trigger="load" hx-swap="outerHTML">
+          <span class="htmx-indicator">Loading configuration...</span>
+        </div>
+        <div id="run-control" hx-get="/ui/run-control" hx-trigger="load, every 5s" style="margin-top:16px">
+          <span class="htmx-indicator">Starting...</span>
+          <span class="htmx-indicator">Stopping...</span>
+        </div>
       </div>
       <div id="tab-logs" class="tab-panel">
         <div class="card">
@@ -2639,7 +2657,7 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
                 remainder = int(secs) % 60
                 return f"{minutes}m{remainder:02d}s"
 
-            def _fmt_metric(v: Any) -> str:
+            def _fmt_metric_history(v: Any) -> str:
                 if v is None:
                     return "-"
                 try:
@@ -2669,8 +2687,8 @@ class ObservabilityHandler(BaseHTTPRequestHandler):
                     f'<td style="padding:6px 8px">{_fmt_ts(run.get("start_time"))}</td>'
                     f'<td style="padding:6px 8px">{_fmt_dur(run.get("start_time"), run.get("end_time"))}</td>'
                     f'<td style="padding:6px 8px">{_escape_text(run.get("total_epochs") or "-")}</td>'
-                    f'<td style="padding:6px 8px">{_fmt_metric(run.get("final_loss"))}</td>'
-                    f'<td style="padding:6px 8px">{_fmt_metric(run.get("final_val_loss"))}</td>'
+                    f'<td style="padding:6px 8px">{_fmt_metric_history(run.get("final_loss"))}</td>'
+                    f'<td style="padding:6px 8px">{_fmt_metric_history(run.get("final_val_loss"))}</td>'
                     f'</tr>'
                 )
             body += '</tbody></table></div>'

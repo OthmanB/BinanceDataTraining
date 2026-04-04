@@ -82,8 +82,11 @@
         btn.classList.add("active");
       }
       if (window.htmx) {
-        panel.querySelectorAll('[hx-trigger*="every"]').forEach(function (el) {
-          window.htmx.trigger(el, "load");
+        panel.querySelectorAll("[hx-get]").forEach(function (el) {
+          var trigger = el.getAttribute("hx-trigger") || "";
+          if (trigger.indexOf("load") !== -1 || trigger.indexOf("every") !== -1) {
+            window.htmx.trigger(el, "load");
+          }
         });
       }
     }
@@ -509,7 +512,9 @@
   document.body.addEventListener("htmx:beforeRequest", function (event) {
     var target = event.target;
     var panel = target.closest(".tab-panel");
-    if (panel && !panel.classList.contains("active")) {
+    var trigger = target.getAttribute("hx-trigger") || "";
+    var isPeriodicRefresh = trigger.indexOf("every") !== -1;
+    if (panel && !panel.classList.contains("active") && isPeriodicRefresh) {
       event.preventDefault();
     }
   });

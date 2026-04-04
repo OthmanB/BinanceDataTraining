@@ -10,16 +10,27 @@ Provides:
 All fixtures handle deterministic server startup with health checks and
 reliable teardown after test completion.
 """
+import logging
 import os
+from pathlib import Path
+import socket
 import subprocess
 import sys
 import time
-import logging
-from pathlib import Path
-from typing import Generator, Tuple
+from collections.abc import Generator
+from typing import TYPE_CHECKING, Any
 
 import pytest
-from playwright.sync_api import sync_playwright, Browser, BrowserContext, Page
+
+if TYPE_CHECKING:
+    from playwright.sync_api import Browser, BrowserContext, Page
+else:
+    Browser = Any
+    BrowserContext = Any
+    Page = Any
+
+playwright_sync_api = pytest.importorskip("playwright.sync_api", reason="Playwright not installed")
+sync_playwright = playwright_sync_api.sync_playwright
 
 
 # Logging setup
@@ -36,7 +47,7 @@ SERVER_SHUTDOWN_TIMEOUT_S = 5
 
 
 @pytest.fixture(scope="session")
-def auth_credentials() -> Tuple[str, str]:
+def auth_credentials() -> tuple[str, str]:
     """Return Basic Auth credentials (user, password) for observability server.
     
     Reads from environment variables OBSERVABILITY_USER and OBSERVABILITY_PASSWORD.
@@ -51,7 +62,26 @@ def auth_credentials() -> Tuple[str, str]:
 
 
 @pytest.fixture(scope="session")
-def base_url() -> str:
+def server_host() -> str:
+    return os.environ.get("OBSERVABILITY_HOST", DEFAULT_HOST)
+
+
+def _pick_free_port(host: str) -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind((host, 0))
+        return int(sock.getsockname()[1])
+
+
+@pytest.fixture(scope="session")
+def server_port(server_host: str) -> int:
+    env_port = os.environ.get("OBSERVABILITY_PORT")
+    if env_port:
+        return int(env_port)
+    return _pick_free_port(server_host)
+
+
+@pytest.fixture(scope="session")
+def base_url(server_host: str, server_port: int) -> str:
     """Return base URL for observability server.
     
     Reads host/port from config/observability.yaml defaults.
@@ -60,13 +90,16 @@ def base_url() -> str:
     Returns:
         str: Base URL (e.g., "http://127.0.0.1:8008")
     """
-    host = os.environ.get("OBSERVABILITY_HOST", DEFAULT_HOST)
-    port = int(os.environ.get("OBSERVABILITY_PORT", DEFAULT_PORT))
-    return f"http://{host}:{port}"
+    return f"http://{server_host}:{server_port}"
 
 
 @pytest.fixture(scope="session")
-def observability_server(base_url: str, auth_credentials: Tuple[str, str]) -> Generator[subprocess.Popen, None, None]:
+def observability_server(
+    base_url: str,
+    auth_credentials: tuple[str, str],
+    server_host: str,
+    server_port: int,
+) -> Generator[subprocess.Popen[str], None, None]:
     """Start observability server as subprocess, wait for readiness, yield process, teardown.
     
     Server startup:
@@ -97,6 +130,8 @@ def observability_server(base_url: str, auth_credentials: Tuple[str, str]) -> Ge
     env = os.environ.copy()
     env["OBSERVABILITY_USER"] = user
     env["OBSERVABILITY_PASSWORD"] = password
+    env["OBSERVABILITY_HOST"] = server_host
+    env["OBSERVABILITY_PORT"] = str(server_port)
     
     # Start server
     cmd = [
@@ -200,8 +235,8 @@ def browser(playwright_browser: Browser) -> Generator[Browser, None, None]:
 def browser_context(
     playwright_browser: Browser,
     base_url: str,
-    auth_credentials: Tuple[str, str],
-    observability_server: subprocess.Popen
+    auth_credentials: tuple[str, str],
+    observability_server: subprocess.Popen[str],
 ) -> Generator[BrowserContext, None, None]:
     """Create authenticated browser context with Basic Auth for each test.
     
