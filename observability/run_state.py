@@ -16,6 +16,56 @@ logger = logging.getLogger(__name__)
 
 _WRITER: Optional["RunStateWriter"] = None
 
+# TTL cache for load_run_state() to reduce sqlite reads
+_RUN_STATE_CACHE: Dict[str, Dict[str, Any]] = {}
+_RUN_STATE_CACHE_TIME: Dict[str, float] = {}
+_RUN_STATE_CACHE_LOCK = threading.Lock()
+
+
+def _get_run_state_cache_ttl() -> float:
+    """Get configurable TTL for run state cache (default 2.0 seconds)."""
+    env_val = os.environ.get("RUN_STATE_CACHE_TTL_SECONDS")
+    if env_val is not None:
+        try:
+            return max(0.0, float(env_val))
+        except ValueError:
+            logger.warning("Invalid RUN_STATE_CACHE_TTL_SECONDS=%r, using default 2.0", env_val)
+    return 2.0
+
+
+class _WriterRegistry:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._writer: Optional["RunStateWriter"] = None
+
+    def get(self) -> Optional["RunStateWriter"]:
+        with self._lock:
+            return self._writer
+
+    def clear(self) -> None:
+        global _WRITER
+        with self._lock:
+            self._writer = None
+            _WRITER = None
+
+    def get_or_create(self, path: str) -> Optional["RunStateWriter"]:
+        global _WRITER
+        with self._lock:
+            if self._writer is None:
+                try:
+                    self._writer = RunStateWriter(path)
+                except ValueError as exc:
+                    logger.warning("Run-state writer disabled due to invalid RUN_STATE_PATH %r: %s", path, exc)
+                    return None
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Run-state writer failed to initialize for %r: %s", path, exc)
+                    return None
+            _WRITER = self._writer
+            return self._writer
+
+
+_WRITER_REGISTRY = _WriterRegistry()
+
 _STAGE_ORDER: Dict[str, int] = {
     "idle": 0,
     "initializing": 1,
@@ -439,26 +489,41 @@ def _resolve_sqlite_path(path: str) -> Path:
     return Path(sqlite_file).expanduser().resolve()
 
 
+def resolve_sqlite_path(path: str) -> Path:
+    return _resolve_sqlite_path(path)
+
+
 def get_run_state_writer() -> Optional[RunStateWriter]:
     """Return the shared run state writer if configured via RUN_STATE_PATH."""
     global _WRITER
     path = os.environ.get("RUN_STATE_PATH") or os.environ.get("OBSERVABILITY_RUN_STATE_PATH")
     if not path:
         return None
-    if _WRITER is None:
-        try:
-            _WRITER = RunStateWriter(path)
-        except ValueError as exc:
-            logger.warning("Run-state writer disabled due to invalid RUN_STATE_PATH %r: %s", path, exc)
-            return None
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Run-state writer failed to initialize for %r: %s", path, exc)
-            return None
-    return _WRITER
+    if _WRITER is None and _WRITER_REGISTRY.get() is not None:
+        _WRITER_REGISTRY.clear()
+    if _WRITER is not None:
+        return _WRITER
+    return _WRITER_REGISTRY.get_or_create(path)
+
+
+def clear_run_state_writer() -> None:
+    _WRITER_REGISTRY.clear()
+    with _RUN_STATE_CACHE_LOCK:
+        _RUN_STATE_CACHE.clear()
+        _RUN_STATE_CACHE_TIME.clear()
 
 
 def load_run_state(path: str) -> Optional[Dict[str, Any]]:
     """Load run state JSON payload from sqlite if available."""
+    now = time.time()
+    normalized_path = str(path).strip()
+    cache_ttl = _get_run_state_cache_ttl()
+    
+    with _RUN_STATE_CACHE_LOCK:
+        cached_time = _RUN_STATE_CACHE_TIME.get(normalized_path, 0.0)
+        if normalized_path in _RUN_STATE_CACHE and (now - cached_time) < cache_ttl:
+            return dict(_RUN_STATE_CACHE[normalized_path])
+    
     try:
         path_obj = _resolve_sqlite_path(path)
     except ValueError as exc:
@@ -475,7 +540,13 @@ def load_run_state(path: str) -> Optional[Dict[str, Any]]:
             payload = row[0]
             if not isinstance(payload, str):
                 return None
-            return json.loads(payload)
+            parsed = json.loads(payload)
+            
+            with _RUN_STATE_CACHE_LOCK:
+                _RUN_STATE_CACHE[normalized_path] = dict(parsed)
+                _RUN_STATE_CACHE_TIME[normalized_path] = now
+            
+            return parsed
         finally:
             conn.close()
     except Exception as exc:  # noqa: BLE001
@@ -525,8 +596,9 @@ def load_run_history(path: str, *, limit: int = 50) -> List[Dict[str, Any]]:
 __all__ = [
     "RunState",
     "RunStateWriter",
+    "clear_run_state_writer",
     "get_run_state_writer",
     "load_run_state",
     "load_run_history",
-    "_resolve_sqlite_path",
+    "resolve_sqlite_path",
 ]
