@@ -65,6 +65,20 @@ class TestObservabilitySqliteRunState(unittest.TestCase):
         self.assertEqual(state.get("run_state_path"), db_uri)
         self.assertEqual(state.get("run_log_path"), str(run_log_path))
 
+    def test_writer_start_prefers_explicit_run_log_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_uri = f"sqlite:///{tmp_dir}/run_state.db"
+            explicit_run_log_path = Path(tmp_dir) / "explicit.log"
+            env_run_log_path = Path(tmp_dir) / "env.log"
+            with mock.patch.dict(os.environ, {"RUN_LOG_PATH": str(env_run_log_path)}, clear=False):
+                writer = RunStateWriter(db_uri)
+                writer.start(run_id="run-explicit", run_log_path=str(explicit_run_log_path))
+            state = load_run_state(db_uri)
+
+        self.assertIsInstance(state, dict)
+        assert state is not None
+        self.assertEqual(state.get("run_log_path"), str(explicit_run_log_path))
+
     def test_writer_updates_hpo_wave_memory_and_watchdog(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             db_uri = f"sqlite:///{tmp_dir}/run_state.db"
@@ -163,7 +177,7 @@ class TestObservabilityServerConfigValidation(unittest.TestCase):
                         'host: "127.0.0.1"',
                         "port: 8008",
                         'run_state_path: "tmp/observability/run_state.json"',
-                        'run_log_path: "tmp/observability/run.log"',
+                        'run_log_path: "tmp/dashboard/run.log"',
                     ]
                 ),
                 encoding="utf-8",

@@ -21,7 +21,7 @@ port: 8008
 # RUN_STATE_PATH or OBSERVABILITY_RUN_STATE_PATH to point at the same SQLite file.
 # Use absolute paths in production; relative paths are resolved from repo root.
 run_state_path: "sqlite:///tmp/observability/run_state.db"
-run_log_path: "tmp/observability/run.log"
+run_log_path: "tmp/dashboard/run.log"
 
 # When true, enables starting/stopping `main.py` runs from the UI.
 allow_run_control: false

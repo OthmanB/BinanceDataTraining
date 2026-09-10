@@ -205,12 +205,12 @@ class RunStateWriter:
         finally:
             conn.close()
 
-    def start(self, run_id: Optional[str] = None) -> None:
+    def start(self, run_id: Optional[str] = None, run_log_path: Optional[str] = None) -> None:
         with self._lock:
             now = time.time()
             self._state.run_process_pid = int(os.getpid())
             self._state.run_state_path = self._raw_path
-            self._state.run_log_path = os.environ.get("RUN_LOG_PATH")
+            self._state.run_log_path = run_log_path if run_log_path is not None else os.environ.get("RUN_LOG_PATH")
             self._state.start_time = now
             self._state.updated_time = now
             self._state.heartbeat_time = now

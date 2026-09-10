@@ -313,7 +313,7 @@ def main() -> int:
             logger.warning("Failed to initialize run-state writer; continuing without writer: %s", exc)
     if writer is not None:
         try:
-            writer.start()
+            writer.start(run_log_path=run_log_path)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to start run-state writer: %s", exc)
 
